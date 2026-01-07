@@ -191,11 +191,8 @@ async def scrape_options(symbol: str, date: str):
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-background-networking")
-    options.add_argument("--disable-sync")
-    options.add_argument("--disable-translate")
-    options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("--single-process")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--remote-debugging-port=0")
     
     # Anti-detection flags
     options.add_argument("--disable-blink-features=AutomationControlled")

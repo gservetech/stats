@@ -174,19 +174,36 @@ async def scrape_options(symbol: str, date: str):
             print(f"[INFO] Detected Expirations API call: {resp_url[:80]}...")
             captured_requests["expirations"] = (params.get("requestId"), resp_url)
 
-    # Configure Chrome with better stealth options
+    # Configure Chrome for Docker/Server environment
     options = ChromiumOptions()
-    # Run headed (non-headless) for better success with anti-bot detection
-    # Uncomment headless if needed, but may fail on Barchart
-    # options.add_argument("--headless=new")
+    
+    # REQUIRED for Docker: Run in headless mode
+    options.add_argument("--headless=new")
+    
+    # REQUIRED for Docker: Disable sandbox (needed when running as root)
     options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
+    
+    # REQUIRED for Docker: Use /dev/shm workaround
     options.add_argument("--disable-dev-shm-usage")
+    
+    # Performance and stability flags
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-translate")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--single-process")
     options.add_argument("--window-size=1920,1080")
+    
+    # Anti-detection flags
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    print("[INFO] Starting browser...")
+    print("[INFO] Starting browser (headless mode)...")
     async with Chrome(options=options) as browser:
         tab = await browser.start()
         

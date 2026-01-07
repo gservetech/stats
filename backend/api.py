@@ -177,6 +177,9 @@ async def scrape_options(symbol: str, date: str):
     # Configure Chrome for Docker/Server environment
     options = ChromiumOptions()
     
+    # Set Chrome binary path explicitly for Docker
+    options.binary_location = "/usr/bin/google-chrome"
+    
     # REQUIRED for Docker: Run in headless mode
     options.add_argument("--headless=new")
     
@@ -199,6 +202,7 @@ async def scrape_options(symbol: str, date: str):
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     print("[INFO] Starting browser (headless mode)...")
+    print(f"[INFO] Chrome binary: {options.binary_location}")
     async with Chrome(options=options) as browser:
         tab = await browser.start()
         

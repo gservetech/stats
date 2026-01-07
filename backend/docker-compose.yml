@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  barchart-api:
+    build: .
+    container_name: barchart-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    environment:
+      - TZ=UTC
+    # Chrome needs these for headless mode
+    shm_size: '2gb'
+    security_opt:
+      - seccomp:unconfined

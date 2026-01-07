@@ -1,0 +1,5 @@
+pydoll
+pandas
+fastapi
+uvicorn[standard]
+python-multipart

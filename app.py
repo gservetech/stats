@@ -1,555 +1,864 @@
 """
-Yahoo Finance Stock Dashboard - Streamlit Application
-Real-time stock data scraping and visualization dashboard.
+Barchart Stock Options Dashboard - Streamlit Application
+Real-time options data visualization using Barchart's internal API.
 
 Features:
-- Real-time stock price tracking
-- Options straddle data display
-- Interactive charts and visualizations
-- Auto-refresh every minute
-- Historical data tracking
+- Real-time options chain data from Barchart
+- Side-by-side Calls/Puts straddle view
+- Options volume and open interest charts
+- Implied volatility analysis
+- Barchart-inspired UI design
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import asyncio
 import time
 import re
+import requests
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
-import hashlib
 
 # Cache TTL in seconds (5 minutes = 300 seconds)
 CACHE_TTL = 300
 
+# Barchart API Configuration
+BARCHART_BASE_URL = "https://www.barchart.com"
+BARCHART_OPTIONS_API = "https://www.barchart.com/proxies/core-api/v1/options/get"
+BARCHART_EXPIRATIONS_API = "https://www.barchart.com/proxies/core-api/v1/options-expirations/get"
+BARCHART_QUOTE_API = "https://www.barchart.com/proxies/core-api/v1/quotes/get"
+
+# Browser-like headers (same as scraping script would capture)
+BARCHART_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.barchart.com/stocks/quotes/AAPL/options",
+    "Origin": "https://www.barchart.com",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
+
 # Page configuration
 st.set_page_config(
-    page_title="Yahoo Finance Dashboard",
-    page_icon="📈",
+    page_title="Barchart Options Dashboard",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for premium design
+# Barchart-inspired CSS styling (green theme)
 st.markdown("""
 <style>
-    /* Main container styling */
+    /* Import Google Font */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    
+    * {
+        font-family: 'Inter', sans-serif;
+    }
+    
+    /* Main container - Barchart dark theme */
     .main {
-        background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%);
+        background: #1a1d21;
     }
     
-    /* Header styling */
-    .dashboard-header {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        padding: 2rem;
-        border-radius: 15px;
-        margin-bottom: 2rem;
-        box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
+    .stApp {
+        background: linear-gradient(180deg, #1a1d21 0%, #0d0f11 100%);
     }
     
-    .dashboard-header h1 {
+    /* Barchart Header styling */
+    .barchart-header {
+        background: linear-gradient(90deg, #00875a 0%, #00a86b 100%);
+        padding: 1.5rem 2rem;
+        border-radius: 0;
+        margin: -1rem -1rem 1.5rem -1rem;
+        box-shadow: 0 4px 20px rgba(0, 135, 90, 0.3);
+    }
+    
+    .barchart-header h1 {
         color: white;
-        font-size: 2.5rem;
+        font-size: 1.8rem;
         font-weight: 700;
         margin: 0;
-        text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        display: flex;
+        align-items: center;
+        gap: 12px;
     }
     
-    .dashboard-header p {
-        color: rgba(255,255,255,0.9);
-        margin-top: 0.5rem;
+    .barchart-header p {
+        color: rgba(255,255,255,0.85);
+        margin-top: 0.3rem;
+        font-size: 0.95rem;
     }
     
-    /* Metric cards */
+    /* Ticker display box */
+    .ticker-box {
+        background: linear-gradient(145deg, #252a30 0%, #1e2328 100%);
+        border: 1px solid #3d4450;
+        border-radius: 8px;
+        padding: 1.2rem;
+        margin-bottom: 1rem;
+    }
+    
+    .ticker-symbol {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #00d775;
+    }
+    
+    .ticker-name {
+        color: #9ca3af;
+        font-size: 0.9rem;
+        margin-top: 4px;
+    }
+    
+    .ticker-price {
+        font-size: 1.8rem;
+        font-weight: 600;
+        color: white;
+    }
+    
+    .price-up {
+        color: #00d775 !important;
+    }
+    
+    .price-down {
+        color: #ff4757 !important;
+    }
+    
+    /* Metric cards - Barchart style */
     .metric-card {
-        background: linear-gradient(145deg, #1e1e3f 0%, #2d2d5a 100%);
-        border-radius: 15px;
-        padding: 1.5rem;
-        border: 1px solid rgba(255,255,255,0.1);
-        box-shadow: 0 8px 32px rgba(0,0,0,0.3);
-        transition: transform 0.3s ease, box-shadow 0.3s ease;
-    }
-    
-    .metric-card:hover {
-        transform: translateY(-5px);
-        box-shadow: 0 15px 40px rgba(102, 126, 234, 0.2);
+        background: linear-gradient(145deg, #252a30 0%, #1e2328 100%);
+        border: 1px solid #3d4450;
+        border-radius: 8px;
+        padding: 1rem;
+        text-align: center;
     }
     
     .metric-value {
-        font-size: 2rem;
-        font-weight: 700;
-        color: #667eea;
+        font-size: 1.4rem;
+        font-weight: 600;
+        color: white;
     }
     
     .metric-label {
-        color: rgba(255,255,255,0.7);
-        font-size: 0.9rem;
+        color: #9ca3af;
+        font-size: 0.75rem;
         text-transform: uppercase;
-        letter-spacing: 1px;
+        letter-spacing: 0.5px;
+        margin-top: 4px;
     }
     
-    .positive {
-        color: #00d4aa !important;
+    /* Options table styling */
+    .options-table {
+        background: #1e2328;
+        border-radius: 8px;
+        overflow: hidden;
     }
     
-    .negative {
-        color: #ff6b6b !important;
+    /* Call options - Green theme */
+    .call-header {
+        background: linear-gradient(90deg, #00875a 0%, #00a86b 100%);
+        color: white;
+        padding: 0.8rem;
+        font-weight: 600;
+        text-align: center;
     }
     
-    /* Table styling */
-    .dataframe {
-        background: rgba(30, 30, 63, 0.8) !important;
-        border-radius: 10px !important;
+    /* Put options - Red theme */
+    .put-header {
+        background: linear-gradient(90deg, #dc3545 0%, #ff4757 100%);
+        color: white;
+        padding: 0.8rem;
+        font-weight: 600;
+        text-align: center;
     }
     
-    /* Sidebar styling */
-    .css-1d391kg {
-        background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%);
+    /* Strike price column */
+    .strike-header {
+        background: #3d4450;
+        color: white;
+        padding: 0.8rem;
+        font-weight: 600;
+        text-align: center;
     }
     
-    /* Status indicators */
+    /* Status indicator */
     .status-live {
         display: inline-flex;
         align-items: center;
         gap: 8px;
-        padding: 0.5rem 1rem;
-        background: rgba(0, 212, 170, 0.2);
-        border: 1px solid #00d4aa;
-        border-radius: 20px;
-        color: #00d4aa;
+        padding: 0.4rem 0.8rem;
+        background: rgba(0, 215, 117, 0.15);
+        border: 1px solid #00d775;
+        border-radius: 15px;
+        color: #00d775;
         font-weight: 600;
+        font-size: 0.8rem;
     }
     
     .pulse {
-        width: 10px;
-        height: 10px;
-        background: #00d4aa;
+        width: 8px;
+        height: 8px;
+        background: #00d775;
         border-radius: 50%;
         animation: pulse 2s infinite;
     }
     
     @keyframes pulse {
-        0% { box-shadow: 0 0 0 0 rgba(0, 212, 170, 0.7); }
-        70% { box-shadow: 0 0 0 10px rgba(0, 212, 170, 0); }
-        100% { box-shadow: 0 0 0 0 rgba(0, 212, 170, 0); }
+        0% { box-shadow: 0 0 0 0 rgba(0, 215, 117, 0.7); }
+        70% { box-shadow: 0 0 0 8px rgba(0, 215, 117, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(0, 215, 117, 0); }
     }
     
-    /* Chart container */
-    .chart-container {
-        background: rgba(30, 30, 63, 0.6);
-        border-radius: 15px;
-        padding: 1.5rem;
-        border: 1px solid rgba(255,255,255,0.1);
-        margin-bottom: 1.5rem;
+    /* Sidebar styling */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #1e2328 0%, #15181c 100%);
+        border-right: 1px solid #3d4450;
+    }
+    
+    section[data-testid="stSidebar"] .stTextInput > div > div > input {
+        background: #252a30;
+        border: 1px solid #3d4450;
+        color: white;
     }
     
     /* Button styling */
     .stButton > button {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(90deg, #00875a 0%, #00a86b 100%);
         color: white;
         border: none;
-        border-radius: 10px;
-        padding: 0.75rem 2rem;
+        border-radius: 6px;
+        padding: 0.6rem 1.5rem;
         font-weight: 600;
         transition: all 0.3s ease;
     }
     
     .stButton > button:hover {
         transform: translateY(-2px);
-        box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        box-shadow: 0 4px 15px rgba(0, 135, 90, 0.4);
+    }
+    
+    /* Tab styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0;
+        background: #252a30;
+        border-radius: 8px 8px 0 0;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        background: transparent;
+        color: #9ca3af;
+        border-radius: 0;
+        padding: 12px 24px;
+        font-weight: 500;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background: #00875a;
+        color: white;
+    }
+    
+    /* DataFrame styling */
+    .stDataFrame {
+        border-radius: 8px;
+        overflow: hidden;
     }
     
     /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     
-    /* Tab styling */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
+    /* Expander styling */
+    .streamlit-expanderHeader {
+        background: #252a30;
+        border-radius: 8px;
     }
     
-    .stTabs [data-baseweb="tab"] {
-        background: rgba(30, 30, 63, 0.6);
-        border-radius: 10px 10px 0 0;
-        padding: 10px 20px;
-        color: white;
+    /* Info box styling */
+    .info-box {
+        background: rgba(0, 135, 90, 0.1);
+        border: 1px solid #00875a;
+        border-radius: 8px;
+        padding: 1rem;
+        color: #00d775;
     }
     
-    .stTabs [aria-selected="true"] {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+    .warning-box {
+        background: rgba(255, 71, 87, 0.1);
+        border: 1px solid #ff4757;
+        border-radius: 8px;
+        padding: 1rem;
+        color: #ff6b6b;
     }
 </style>
 """, unsafe_allow_html=True)
 
 
-# Initialize session state
-if 'stock_data_history' not in st.session_state:
-    st.session_state.stock_data_history = {}
-if 'options_data' not in st.session_state:
-    st.session_state.options_data = None
-if 'last_update' not in st.session_state:
-    st.session_state.last_update = None
-if 'ticker_list' not in st.session_state:
-    st.session_state.ticker_list = ['AAPL', 'GOOGL', 'MSFT', 'TSLA', 'AMZN']
+# ========== HELPER FUNCTIONS (from scraping script) ==========
+
+def _to_float(val, default=None):
+    """Convert value to float, handling various formats."""
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if s in ("", "N/A", "na", "None", "-"):
+        return default
+    s = re.sub(r"[^\d\.\-]", "", s)
+    if s in ("", "-", "."):
+        return default
+    try:
+        return float(s)
+    except:
+        return default
+
+
+def _to_int(val, default=0):
+    """Convert value to int."""
+    f = _to_float(val, None)
+    return int(round(f)) if f is not None else default
+
+
+def _fmt_price(x):
+    """Format price for display."""
+    if x is None:
+        return ""
+    return f"{x:,.2f}"
+
+
+def _fmt_int(x):
+    """Format integer for display."""
+    if x is None:
+        return ""
+    return f"{int(x):,}"
+
+
+def _fmt_iv(val):
+    """Format implied volatility."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, (int, float)):
+        return f"{val * 100:.2f}%" if val <= 10 else f"{val:.2f}%"
+    return str(val)
+
+
+def _pick(option_obj):
+    """Extract and format option data (same as scraping script)."""
+    if not option_obj:
+        return {k: "" for k in ["Latest", "Bid", "Ask", "Change", "Volume", "Open Int", "IV", "Last Trade"]}
+    
+    raw = option_obj.get("raw") or {}
+    latest = _to_float(option_obj.get("lastPrice"), raw.get("lastPrice"))
+    bid = _to_float(option_obj.get("bidPrice"), raw.get("bidPrice"))
+    ask = _to_float(option_obj.get("askPrice"), raw.get("askPrice"))
+    volume = _to_int(option_obj.get("volume"), raw.get("volume"))
+    oi = _to_int(option_obj.get("openInterest"), raw.get("openInterest"))
+    iv_val = option_obj.get("volatility") or raw.get("volatility")
+    
+    return {
+        "Latest": _fmt_price(latest),
+        "Bid": _fmt_price(bid),
+        "Ask": _fmt_price(ask),
+        "Change": str(option_obj.get("priceChange") or ""),
+        "Volume": _fmt_int(volume),
+        "Open Int": _fmt_int(oi),
+        "IV": _fmt_iv(iv_val),
+        "Last Trade": str(option_obj.get("tradeTime") or ""),
+        "raw_latest": latest,
+        "raw_volume": volume,
+        "raw_oi": oi,
+        "raw_iv": _to_float(iv_val, 0)
+    }
+
+
+# ========== BARCHART API FUNCTIONS ==========
+
+def get_barchart_session(ticker: str) -> requests.Session:
+    """Create a session with cookies by visiting Barchart page first."""
+    session = requests.Session()
+    session.headers.update(BARCHART_HEADERS)
+    
+    try:
+        # Visit the options page to get cookies (like the browser would)
+        page_url = f"{BARCHART_BASE_URL}/stocks/quotes/{ticker}/options"
+        session.headers['Referer'] = page_url
+        response = session.get(page_url, timeout=15)
+        
+        if response.status_code == 200:
+            # Extract XSRF token from cookies if present
+            if 'XSRF-TOKEN' in session.cookies:
+                token = session.cookies['XSRF-TOKEN']
+                session.headers['X-XSRF-TOKEN'] = token
+    except Exception as e:
+        pass  # Continue without cookies
+    
+    return session
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def get_stock_data(ticker: str) -> dict:
-    """Fetch real-time stock data using yfinance with caching and retry logic."""
-    import time as time_module
+def fetch_barchart_expirations(ticker: str) -> list:
+    """Fetch available expiration dates from Barchart API."""
+    try:
+        session = get_barchart_session(ticker)
+        
+        params = {
+            "symbol": ticker,
+            "fields": "expirationDate,optionsCount,callsVolume,putsVolume,callsOpenInterest,putsOpenInterest"
+        }
+        
+        response = session.get(BARCHART_EXPIRATIONS_API, params=params, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            expirations = []
+            exp_details = []
+            
+            if data.get("data"):
+                for exp in data["data"]:
+                    exp_date = exp.get("expirationDate")
+                    if exp_date:
+                        expirations.append(exp_date)
+                        exp_details.append({
+                            "date": exp_date,
+                            "optionsCount": exp.get("optionsCount", 0),
+                            "callsVolume": _to_int(exp.get("callsVolume", 0)),
+                            "putsVolume": _to_int(exp.get("putsVolume", 0)),
+                            "callsOI": _to_int(exp.get("callsOpenInterest", 0)),
+                            "putsOI": _to_int(exp.get("putsOpenInterest", 0)),
+                        })
+            
+            return expirations, exp_details
+    except Exception as e:
+        st.warning(f"Could not fetch expirations: {e}")
     
-    max_retries = 3
-    retry_delay = 2  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            stock = yf.Ticker(ticker)
-            info = stock.info
-            
-            # Check if we got valid data
-            if not info or info.get('regularMarketPrice') is None and info.get('currentPrice') is None:
-                if attempt < max_retries - 1:
-                    time_module.sleep(retry_delay * (attempt + 1))
-                    continue
-                return None
-            
-            hist = stock.history(period="5d", interval="1m")
-            
-            # Get current price and changes
-            current_price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
-            prev_close = info.get('previousClose', current_price)
-            change = current_price - prev_close
-            change_pct = (change / prev_close * 100) if prev_close else 0
-            
-            return {
-                'ticker': ticker,
-                'name': info.get('shortName', ticker),
-                'price': current_price,
-                'change': change,
-                'change_pct': change_pct,
-                'open': info.get('open', 0),
-                'high': info.get('dayHigh', 0),
-                'low': info.get('dayLow', 0),
-                'volume': info.get('volume', 0),
-                'market_cap': info.get('marketCap', 0),
-                'pe_ratio': info.get('trailingPE', 0),
-                'week_52_high': info.get('fiftyTwoWeekHigh', 0),
-                'week_52_low': info.get('fiftyTwoWeekLow', 0),
-                'history': hist,
-                'timestamp': datetime.now()
-            }
-        except Exception as e:
-            error_msg = str(e).lower()
-            if 'rate' in error_msg or 'too many' in error_msg or '429' in error_msg:
-                if attempt < max_retries - 1:
-                    time_module.sleep(retry_delay * (attempt + 1))
-                    continue
-            st.error(f"Error fetching data for {ticker}: {e}")
-            return None
+    return [], []
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_barchart_options(ticker: str, expiration: str = None) -> dict:
+    """
+    Fetch options data from Barchart API.
+    This mimics the same API call that the browser makes.
+    """
+    try:
+        session = get_barchart_session(ticker)
+        
+        # Build params similar to what browser sends
+        params = {
+            "symbol": ticker,
+            "fields": "strikePrice,optionType,lastPrice,bidPrice,askPrice,priceChange,percentChange,volume,openInterest,volatility,tradeTime,daysToExpiration,symbolCode",
+            "groupBy": "optionType",
+            "raw": "1",
+            "meta": "field.shortName,field.type,field.description"
+        }
+        
+        if expiration:
+            params["expirationDate"] = expiration
+        
+        response = session.get(BARCHART_OPTIONS_API, params=params, timeout=15)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.warning(f"Barchart API returned status {response.status_code}")
+    except Exception as e:
+        st.warning(f"Error fetching options: {e}")
     
     return None
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def get_options_data(ticker: str) -> tuple:
-    """Fetch options chain data using yfinance with caching and retry logic."""
-    import time as time_module
+def fetch_barchart_quote(ticker: str) -> dict:
+    """Fetch stock quote from Barchart."""
+    try:
+        session = get_barchart_session(ticker)
+        
+        params = {
+            "symbol": ticker,
+            "fields": "symbol,symbolName,lastPrice,priceChange,percentChange,open,high,low,previousClose,volume,tradeTime,averageVolume,fiftyTwoWkHigh,fiftyTwoWkLow"
+        }
+        
+        response = session.get(BARCHART_QUOTE_API, params=params, timeout=15)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("data"):
+                quote = data["data"][0] if isinstance(data["data"], list) else data["data"]
+                raw = quote.get("raw", {})
+                
+                return {
+                    'symbol': ticker,
+                    'name': quote.get('symbolName', ticker),
+                    'lastPrice': _to_float(quote.get('lastPrice'), raw.get('lastPrice', 0)),
+                    'priceChange': _to_float(quote.get('priceChange'), raw.get('priceChange', 0)),
+                    'percentChange': _to_float(quote.get('percentChange'), raw.get('percentChange', 0)),
+                    'open': _to_float(quote.get('open'), raw.get('open', 0)),
+                    'high': _to_float(quote.get('high'), raw.get('high', 0)),
+                    'low': _to_float(quote.get('low'), raw.get('low', 0)),
+                    'previousClose': _to_float(quote.get('previousClose'), raw.get('previousClose', 0)),
+                    'volume': _to_int(quote.get('volume'), raw.get('volume', 0)),
+                    'avgVolume': _to_int(quote.get('averageVolume'), raw.get('averageVolume', 0)),
+                    'week52High': _to_float(quote.get('fiftyTwoWkHigh'), raw.get('fiftyTwoWkHigh', 0)),
+                    'week52Low': _to_float(quote.get('fiftyTwoWkLow'), raw.get('fiftyTwoWkLow', 0)),
+                    'tradeTime': quote.get('tradeTime', ''),
+                }
+    except Exception as e:
+        st.warning(f"Error fetching quote: {e}")
     
-    max_retries = 3
-    retry_delay = 2  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            stock = yf.Ticker(ticker)
-            
-            # Get available expiration dates
-            expirations = stock.options
-            
-            if not expirations:
-                return None, None, []
-            
-            # Get the nearest expiration
-            nearest_exp = expirations[0]
-            opt = stock.option_chain(nearest_exp)
-            
-            calls_df = opt.calls.copy()
-            puts_df = opt.puts.copy()
-            
-            return calls_df, puts_df, expirations
-        except Exception as e:
-            error_msg = str(e).lower()
-            if 'rate' in error_msg or 'too many' in error_msg or '429' in error_msg:
-                if attempt < max_retries - 1:
-                    time_module.sleep(retry_delay * (attempt + 1))
-                    continue
-            st.error(f"Error fetching options for {ticker}: {e}")
-            return None, None, []
-    
-    return None, None, []
+    return None
 
 
-def create_price_chart(data: dict, ticker: str) -> go.Figure:
-    """Create an interactive price chart with volume."""
-    if data is None or data.get('history') is None or len(data['history']) == 0:
-        fig = go.Figure()
-        fig.add_annotation(text="No data available", xref="paper", yref="paper", x=0.5, y=0.5)
-        return fig
+def process_options_data(options_json: dict) -> tuple:
+    """
+    Process Barchart options JSON into straddle format (same as scraping script).
+    Returns calls_df, puts_df, straddle_df
+    """
+    if not options_json or not options_json.get("data"):
+        return None, None, None
     
-    hist = data['history']
+    data = options_json.get("data", {})
+    rows = []
+    calls_list = []
+    puts_list = []
     
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.7, 0.3]
-    )
+    # Handle different data structures from Barchart
+    strike_items = {}
     
-    # Candlestick chart
-    fig.add_trace(
-        go.Candlestick(
-            x=hist.index,
-            open=hist['Open'],
-            high=hist['High'],
-            low=hist['Low'],
-            close=hist['Close'],
-            name='Price',
-            increasing_line_color='#00d4aa',
-            decreasing_line_color='#ff6b6b'
-        ),
-        row=1, col=1
-    )
+    if isinstance(data, dict):
+        if "Call" in data or "Put" in data:
+            # Standard grouped format
+            for opt_type in ["Call", "Put"]:
+                for item in data.get(opt_type, []):
+                    strike = item.get("strikePrice")
+                    if strike not in strike_items:
+                        strike_items[strike] = []
+                    strike_items[strike].append(item)
+        else:
+            # SBS format - keys are strike prices
+            strike_items = data
+    elif isinstance(data, list):
+        # Flat list format
+        for item in data:
+            strike = item.get("strikePrice")
+            if strike not in strike_items:
+                strike_items[strike] = []
+            strike_items[strike].append(item)
     
-    # Volume bars
-    colors = ['#00d4aa' if close >= open_ else '#ff6b6b' 
-              for close, open_ in zip(hist['Close'], hist['Open'])]
+    # Build straddle rows
+    for strike_str, items in strike_items.items():
+        if not isinstance(items, list):
+            items = [items]
+        
+        call_obj = next((i for i in items if i.get("optionType") == "Call"), None)
+        put_obj = next((i for i in items if i.get("optionType") == "Put"), None)
+        
+        c_data = _pick(call_obj)
+        p_data = _pick(put_obj)
+        strike_num = _to_float(strike_str, 0)
+        
+        # Straddle row
+        row = {
+            "Call Latest": c_data["Latest"],
+            "Call Bid": c_data["Bid"],
+            "Call Ask": c_data["Ask"],
+            "Call Change": c_data["Change"],
+            "Call Volume": c_data["Volume"],
+            "Call OI": c_data["Open Int"],
+            "Call IV": c_data["IV"],
+            "Strike": strike_num,
+            "Put Latest": p_data["Latest"],
+            "Put Bid": p_data["Bid"],
+            "Put Ask": p_data["Ask"],
+            "Put Change": p_data["Change"],
+            "Put Volume": p_data["Volume"],
+            "Put OI": p_data["Open Int"],
+            "Put IV": p_data["IV"],
+        }
+        rows.append((strike_num, row))
+        
+        # Individual calls/puts for charts
+        if call_obj:
+            calls_list.append({
+                'strike': strike_num,
+                'lastPrice': c_data['raw_latest'],
+                'volume': c_data['raw_volume'],
+                'openInterest': c_data['raw_oi'],
+                'iv': c_data['raw_iv'],
+            })
+        if put_obj:
+            puts_list.append({
+                'strike': strike_num,
+                'lastPrice': p_data['raw_latest'],
+                'volume': p_data['raw_volume'],
+                'openInterest': p_data['raw_oi'],
+                'iv': p_data['raw_iv'],
+            })
     
-    fig.add_trace(
-        go.Bar(
-            x=hist.index,
-            y=hist['Volume'],
-            name='Volume',
-            marker_color=colors,
-            opacity=0.7
-        ),
-        row=2, col=1
-    )
+    # Sort by strike and create DataFrames
+    rows.sort(key=lambda x: x[0])
+    straddle_df = pd.DataFrame([r for _, r in rows])
     
-    fig.update_layout(
-        title=f'{ticker} - Real-Time Price Chart',
-        template='plotly_dark',
-        paper_bgcolor='rgba(30, 30, 63, 0.8)',
-        plot_bgcolor='rgba(30, 30, 63, 0.8)',
-        font=dict(color='white'),
-        xaxis_rangeslider_visible=False,
-        height=500,
-        showlegend=False,
-        margin=dict(l=50, r=50, t=50, b=50)
-    )
+    calls_df = pd.DataFrame(calls_list).sort_values('strike') if calls_list else None
+    puts_df = pd.DataFrame(puts_list).sort_values('strike') if puts_list else None
     
-    fig.update_xaxes(gridcolor='rgba(255,255,255,0.1)')
-    fig.update_yaxes(gridcolor='rgba(255,255,255,0.1)')
-    
-    return fig
+    return calls_df, puts_df, straddle_df
 
 
-def create_options_chart(calls_df: pd.DataFrame, puts_df: pd.DataFrame, ticker: str) -> go.Figure:
-    """Create options visualization chart."""
-    if calls_df is None or puts_df is None:
-        fig = go.Figure()
-        fig.add_annotation(text="No options data available", xref="paper", yref="paper", x=0.5, y=0.5)
-        return fig
-    
+# ========== CHART FUNCTIONS ==========
+
+def create_oi_chart(calls_df: pd.DataFrame, puts_df: pd.DataFrame, ticker: str) -> go.Figure:
+    """Create Open Interest chart (Barchart style)."""
     fig = make_subplots(
         rows=1, cols=2,
-        subplot_titles=('Calls Open Interest', 'Puts Open Interest'),
+        subplot_titles=('📈 Calls Open Interest', '📉 Puts Open Interest'),
         horizontal_spacing=0.1
     )
     
-    # Calls
-    fig.add_trace(
-        go.Bar(
-            x=calls_df['strike'],
-            y=calls_df['openInterest'],
-            name='Calls OI',
-            marker_color='#00d4aa',
-            opacity=0.8
-        ),
-        row=1, col=1
-    )
+    if calls_df is not None and len(calls_df) > 0:
+        fig.add_trace(
+            go.Bar(
+                x=calls_df['strike'],
+                y=calls_df['openInterest'],
+                name='Calls OI',
+                marker_color='#00d775',
+                opacity=0.85
+            ),
+            row=1, col=1
+        )
     
-    # Puts
-    fig.add_trace(
-        go.Bar(
-            x=puts_df['strike'],
-            y=puts_df['openInterest'],
-            name='Puts OI',
-            marker_color='#ff6b6b',
-            opacity=0.8
-        ),
-        row=1, col=2
-    )
+    if puts_df is not None and len(puts_df) > 0:
+        fig.add_trace(
+            go.Bar(
+                x=puts_df['strike'],
+                y=puts_df['openInterest'],
+                name='Puts OI',
+                marker_color='#ff4757',
+                opacity=0.85
+            ),
+            row=1, col=2
+        )
     
     fig.update_layout(
         title=f'{ticker} Options - Open Interest by Strike',
         template='plotly_dark',
-        paper_bgcolor='rgba(30, 30, 63, 0.8)',
-        plot_bgcolor='rgba(30, 30, 63, 0.8)',
-        font=dict(color='white'),
+        paper_bgcolor='#1e2328',
+        plot_bgcolor='#1e2328',
+        font=dict(color='white', family='Inter'),
         height=400,
-        showlegend=True,
+        showlegend=False,
         margin=dict(l=50, r=50, t=80, b=50)
     )
     
-    fig.update_xaxes(title_text="Strike Price", gridcolor='rgba(255,255,255,0.1)')
-    fig.update_yaxes(title_text="Open Interest", gridcolor='rgba(255,255,255,0.1)')
+    fig.update_xaxes(title_text="Strike Price", gridcolor='#3d4450')
+    fig.update_yaxes(title_text="Open Interest", gridcolor='#3d4450')
     
     return fig
 
 
-def create_volatility_smile(calls_df: pd.DataFrame, puts_df: pd.DataFrame, ticker: str) -> go.Figure:
-    """Create volatility smile chart."""
-    if calls_df is None or puts_df is None:
-        fig = go.Figure()
-        fig.add_annotation(text="No data available", xref="paper", yref="paper", x=0.5, y=0.5)
-        return fig
-    
+def create_volume_chart(calls_df: pd.DataFrame, puts_df: pd.DataFrame, ticker: str) -> go.Figure:
+    """Create Volume chart (Barchart style)."""
     fig = go.Figure()
     
-    # Filter valid IV data
-    calls_valid = calls_df[calls_df['impliedVolatility'] > 0]
-    puts_valid = puts_df[puts_df['impliedVolatility'] > 0]
-    
-    if len(calls_valid) > 0:
+    if calls_df is not None and len(calls_df) > 0:
         fig.add_trace(
-            go.Scatter(
-                x=calls_valid['strike'],
-                y=calls_valid['impliedVolatility'] * 100,
-                mode='lines+markers',
-                name='Calls IV',
-                line=dict(color='#00d4aa', width=3),
-                marker=dict(size=8)
+            go.Bar(
+                x=calls_df['strike'],
+                y=calls_df['volume'],
+                name='Calls Volume',
+                marker_color='#00d775',
+                opacity=0.8
             )
         )
     
-    if len(puts_valid) > 0:
+    if puts_df is not None and len(puts_df) > 0:
         fig.add_trace(
-            go.Scatter(
-                x=puts_valid['strike'],
-                y=puts_valid['impliedVolatility'] * 100,
-                mode='lines+markers',
-                name='Puts IV',
-                line=dict(color='#ff6b6b', width=3),
-                marker=dict(size=8)
+            go.Bar(
+                x=puts_df['strike'],
+                y=puts_df['volume'],
+                name='Puts Volume',
+                marker_color='#ff4757',
+                opacity=0.8
             )
         )
     
     fig.update_layout(
-        title=f'{ticker} - Implied Volatility Smile',
-        xaxis_title='Strike Price',
-        yaxis_title='Implied Volatility (%)',
+        title=f'{ticker} Options Volume by Strike',
+        barmode='group',
         template='plotly_dark',
-        paper_bgcolor='rgba(30, 30, 63, 0.8)',
-        plot_bgcolor='rgba(30, 30, 63, 0.8)',
-        font=dict(color='white'),
+        paper_bgcolor='#1e2328',
+        plot_bgcolor='#1e2328',
+        font=dict(color='white', family='Inter'),
         height=350,
-        margin=dict(l=50, r=50, t=50, b=50)
+        margin=dict(l=50, r=50, t=50, b=50),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     
-    fig.update_xaxes(gridcolor='rgba(255,255,255,0.1)')
-    fig.update_yaxes(gridcolor='rgba(255,255,255,0.1)')
+    fig.update_xaxes(title_text="Strike Price", gridcolor='#3d4450')
+    fig.update_yaxes(title_text="Volume", gridcolor='#3d4450')
     
     return fig
 
 
-def create_straddle_table(calls_df: pd.DataFrame, puts_df: pd.DataFrame) -> pd.DataFrame:
-    """Create a combined straddle view table."""
+def create_iv_smile_chart(calls_df: pd.DataFrame, puts_df: pd.DataFrame, ticker: str) -> go.Figure:
+    """Create Implied Volatility Smile chart."""
+    fig = go.Figure()
+    
+    if calls_df is not None and len(calls_df) > 0:
+        valid_calls = calls_df[calls_df['iv'] > 0]
+        if len(valid_calls) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=valid_calls['strike'],
+                    y=valid_calls['iv'] * 100 if valid_calls['iv'].max() <= 10 else valid_calls['iv'],
+                    mode='lines+markers',
+                    name='Calls IV',
+                    line=dict(color='#00d775', width=3),
+                    marker=dict(size=8)
+                )
+            )
+    
+    if puts_df is not None and len(puts_df) > 0:
+        valid_puts = puts_df[puts_df['iv'] > 0]
+        if len(valid_puts) > 0:
+            fig.add_trace(
+                go.Scatter(
+                    x=valid_puts['strike'],
+                    y=valid_puts['iv'] * 100 if valid_puts['iv'].max() <= 10 else valid_puts['iv'],
+                    mode='lines+markers',
+                    name='Puts IV',
+                    line=dict(color='#ff4757', width=3),
+                    marker=dict(size=8)
+                )
+            )
+    
+    fig.update_layout(
+        title=f'{ticker} Implied Volatility Smile',
+        xaxis_title='Strike Price',
+        yaxis_title='Implied Volatility (%)',
+        template='plotly_dark',
+        paper_bgcolor='#1e2328',
+        plot_bgcolor='#1e2328',
+        font=dict(color='white', family='Inter'),
+        height=350,
+        margin=dict(l=50, r=50, t=50, b=50),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    fig.update_xaxes(gridcolor='#3d4450')
+    fig.update_yaxes(gridcolor='#3d4450')
+    
+    return fig
+
+
+def create_put_call_ratio_gauge(calls_df: pd.DataFrame, puts_df: pd.DataFrame) -> go.Figure:
+    """Create Put/Call ratio gauge chart."""
     if calls_df is None or puts_df is None:
-        return pd.DataFrame()
+        return None
     
-    # Merge on strike price
-    calls_subset = calls_df[['strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']].copy()
-    calls_subset.columns = ['Strike', 'Call Last', 'Call Bid', 'Call Ask', 'Call Vol', 'Call OI', 'Call IV']
+    total_call_oi = calls_df['openInterest'].sum() if len(calls_df) > 0 else 0
+    total_put_oi = puts_df['openInterest'].sum() if len(puts_df) > 0 else 0
     
-    puts_subset = puts_df[['strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']].copy()
-    puts_subset.columns = ['Strike', 'Put Last', 'Put Bid', 'Put Ask', 'Put Vol', 'Put OI', 'Put IV']
+    pc_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
     
-    straddle = pd.merge(calls_subset, puts_subset, on='Strike', how='outer')
-    straddle = straddle.sort_values('Strike')
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number+delta",
+        value=pc_ratio,
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title={'text': "Put/Call Ratio", 'font': {'size': 18, 'color': 'white'}},
+        gauge={
+            'axis': {'range': [0, 2], 'tickwidth': 1, 'tickcolor': "white"},
+            'bar': {'color': "#00d775" if pc_ratio < 1 else "#ff4757"},
+            'bgcolor': "#3d4450",
+            'borderwidth': 2,
+            'bordercolor': "#3d4450",
+            'steps': [
+                {'range': [0, 0.7], 'color': 'rgba(0, 215, 117, 0.3)'},
+                {'range': [0.7, 1.3], 'color': 'rgba(255, 193, 7, 0.3)'},
+                {'range': [1.3, 2], 'color': 'rgba(255, 71, 87, 0.3)'}
+            ],
+            'threshold': {
+                'line': {'color': "white", 'width': 4},
+                'thickness': 0.75,
+                'value': 1
+            }
+        },
+        number={'font': {'color': 'white'}}
+    ))
     
-    # Format IV as percentage
-    straddle['Call IV'] = (straddle['Call IV'] * 100).round(2).astype(str) + '%'
-    straddle['Put IV'] = (straddle['Put IV'] * 100).round(2).astype(str) + '%'
+    fig.update_layout(
+        paper_bgcolor='#1e2328',
+        font={'color': "white", 'family': 'Inter'},
+        height=250,
+        margin=dict(l=30, r=30, t=50, b=30)
+    )
     
-    return straddle
+    return fig
 
 
-def format_number(num):
-    """Format large numbers for display."""
-    if num is None or pd.isna(num):
-        return "N/A"
-    if num >= 1e12:
-        return f"${num/1e12:.2f}T"
-    elif num >= 1e9:
-        return f"${num/1e9:.2f}B"
-    elif num >= 1e6:
-        return f"${num/1e6:.2f}M"
-    elif num >= 1e3:
-        return f"${num/1e3:.2f}K"
-    else:
-        return f"${num:.2f}"
-
+# ========== MAIN APPLICATION ==========
 
 def main():
-    # Auto-refresh every 5 minutes (300000 milliseconds) to avoid rate limiting
-    count = st_autorefresh(interval=300000, limit=None, key="stock_refresh")
+    # Auto-refresh every 5 minutes
+    count = st_autorefresh(interval=300000, limit=None, key="barchart_refresh")
     
     # Header
     st.markdown("""
-    <div class="dashboard-header">
-        <h1>📈 Yahoo Finance Dashboard</h1>
-        <p>Real-time stock data, options analysis, and market visualizations</p>
+    <div class="barchart-header">
+        <h1>📊 Barchart Options Dashboard</h1>
+        <p>Real-time options chain data and analysis</p>
     </div>
     """, unsafe_allow_html=True)
     
     # Sidebar
     with st.sidebar:
-        st.markdown("## ⚙️ Settings")
+        st.markdown("## 🔍 Symbol Lookup")
         
-        # Ticker input
         ticker_input = st.text_input(
-            "Enter Stock Ticker",
+            "Enter Stock Symbol",
             value="AAPL",
-            help="Enter a stock ticker symbol (e.g., AAPL, GOOGL, MSFT)"
+            help="Enter any US stock ticker symbol"
         )
         ticker = ticker_input.upper().strip()
         
         st.markdown("---")
         
-        # Quick ticker buttons
-        st.markdown("### 🔥 Popular Tickers")
-        popular_tickers = ['AAPL', 'GOOGL', 'MSFT', 'TSLA', 'AMZN', 'NVDA', 'META']
+        st.markdown("### 🔥 Popular Symbols")
+        popular = ['AAPL', 'TSLA', 'NVDA', 'AMZN', 'GOOGL', 'MSFT', 'META', 'SPY', 'QQQ']
         
         cols = st.columns(3)
-        for i, t in enumerate(popular_tickers):
+        for i, t in enumerate(popular):
             with cols[i % 3]:
-                if st.button(t, key=f"btn_{t}", use_container_width=True):
+                if st.button(t, key=f"pop_{t}", use_container_width=True):
                     ticker = t
         
         st.markdown("---")
         
-        # Manual refresh button
-        if st.button("🔄 Refresh Now", use_container_width=True):
-            st.rerun()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Refresh", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
+        with col2:
+            if st.button("🗑️ Clear", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
         
         st.markdown("---")
         
-        # Status indicator
+        # Status
         st.markdown("""
         <div class="status-live">
             <div class="pulse"></div>
@@ -558,194 +867,199 @@ def main():
         """, unsafe_allow_html=True)
         
         st.markdown(f"**Last Update:** {datetime.now().strftime('%H:%M:%S')}")
-        st.markdown(f"**Refresh Count:** {count}")
+        st.markdown(f"**Data Source:** Barchart.com")
     
     # Main content
     if ticker:
-        # Fetch data
-        with st.spinner(f"Fetching data for {ticker}..."):
-            stock_data = get_stock_data(ticker)
-            calls_df, puts_df, expirations = get_options_data(ticker)
+        # Fetch quote data
+        with st.spinner(f"Loading {ticker} data from Barchart..."):
+            quote = fetch_barchart_quote(ticker)
+            expirations, exp_details = fetch_barchart_expirations(ticker)
         
-        if stock_data:
-            # Key Metrics Row
-            st.markdown("### 📊 Key Metrics")
-            
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
+        if quote:
+            # Quote display
+            col1, col2, col3 = st.columns([2, 2, 3])
             
             with col1:
-                change_class = "positive" if stock_data['change'] >= 0 else "negative"
-                change_symbol = "▲" if stock_data['change'] >= 0 else "▼"
-                st.metric(
-                    label="Current Price",
-                    value=f"${stock_data['price']:.2f}",
-                    delta=f"{change_symbol} {abs(stock_data['change']):.2f} ({abs(stock_data['change_pct']):.2f}%)"
-                )
+                price_class = "price-up" if quote['priceChange'] >= 0 else "price-down"
+                change_symbol = "▲" if quote['priceChange'] >= 0 else "▼"
+                
+                st.markdown(f"""
+                <div class="ticker-box">
+                    <div class="ticker-symbol">{ticker}</div>
+                    <div class="ticker-name">{quote['name']}</div>
+                    <div class="ticker-price {price_class}">${quote['lastPrice']:,.2f}</div>
+                    <div class="{price_class}">{change_symbol} {abs(quote['priceChange']):,.2f} ({abs(quote['percentChange']):,.2f}%)</div>
+                </div>
+                """, unsafe_allow_html=True)
             
             with col2:
-                st.metric(label="Open", value=f"${stock_data['open']:.2f}")
+                st.markdown("""<div class="metric-card">""", unsafe_allow_html=True)
+                st.metric("Open", f"${quote['open']:,.2f}")
+                st.metric("High", f"${quote['high']:,.2f}")
+                st.metric("Low", f"${quote['low']:,.2f}")
+                st.markdown("""</div>""", unsafe_allow_html=True)
             
             with col3:
-                st.metric(label="Day High", value=f"${stock_data['high']:.2f}")
+                mcol1, mcol2, mcol3 = st.columns(3)
+                with mcol1:
+                    st.metric("Volume", f"{quote['volume']:,}")
+                with mcol2:
+                    st.metric("52W High", f"${quote['week52High']:,.2f}")
+                with mcol3:
+                    st.metric("52W Low", f"${quote['week52Low']:,.2f}")
+        
+        st.markdown("---")
+        
+        # Options section
+        if expirations:
+            # Expiration selector
+            st.markdown("### 📅 Expiration Date")
+            selected_exp = st.selectbox(
+                "Select expiration",
+                expirations,
+                format_func=lambda x: x,
+                label_visibility="collapsed"
+            )
             
-            with col4:
-                st.metric(label="Day Low", value=f"${stock_data['low']:.2f}")
+            # Fetch options for selected expiration
+            with st.spinner(f"Loading options chain for {selected_exp}..."):
+                options_json = fetch_barchart_options(ticker, selected_exp)
             
-            with col5:
-                st.metric(label="Volume", value=format_number(stock_data['volume']).replace('$', ''))
-            
-            with col6:
-                st.metric(label="Market Cap", value=format_number(stock_data['market_cap']))
-            
-            st.markdown("---")
-            
-            # Charts Section
-            tab1, tab2, tab3, tab4 = st.tabs(["📈 Price Chart", "🎯 Options Chain", "📊 Options Analysis", "📋 Data Tables"])
-            
-            with tab1:
-                st.markdown("#### Real-Time Price Chart")
-                price_chart = create_price_chart(stock_data, ticker)
-                st.plotly_chart(price_chart, use_container_width=True)
+            if options_json:
+                calls_df, puts_df, straddle_df = process_options_data(options_json)
                 
-                # Additional price stats
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.info(f"📈 **52W High:** ${stock_data['week_52_high']:.2f}")
-                with col2:
-                    st.info(f"📉 **52W Low:** ${stock_data['week_52_low']:.2f}")
-                with col3:
-                    pe = stock_data['pe_ratio']
-                    pe_display = f"{pe:.2f}" if pe and pe > 0 else "N/A"
-                    st.info(f"📊 **P/E Ratio:** {pe_display}")
-            
-            with tab2:
-                st.markdown("#### Options Chain Data")
+                # Tabs
+                tab1, tab2, tab3, tab4 = st.tabs([
+                    "📋 Options Chain",
+                    "📊 Open Interest",
+                    "📈 Volume & IV",
+                    "🎯 Analysis"
+                ])
                 
-                if expirations:
-                    selected_exp = st.selectbox(
-                        "Select Expiration Date",
-                        expirations,
-                        key="exp_select"
-                    )
+                with tab1:
+                    st.markdown("#### Side-by-Side Options Chain (Straddle View)")
                     
-                    # Fetch new options data if expiration changed
-                    if selected_exp:
-                        stock = yf.Ticker(ticker)
-                        opt = stock.option_chain(selected_exp)
-                        calls_df = opt.calls
-                        puts_df = opt.puts
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.markdown("##### 📗 Calls")
-                        if calls_df is not None and len(calls_df) > 0:
-                            display_calls = calls_df[['strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']].copy()
-                            display_calls.columns = ['Strike', 'Last', 'Bid', 'Ask', 'Volume', 'Open Int', 'IV']
-                            display_calls['IV'] = (display_calls['IV'] * 100).round(2).astype(str) + '%'
-                            st.dataframe(display_calls, use_container_width=True, height=400)
-                        else:
-                            st.warning("No calls data available")
-                    
-                    with col2:
-                        st.markdown("##### 📕 Puts")
-                        if puts_df is not None and len(puts_df) > 0:
-                            display_puts = puts_df[['strike', 'lastPrice', 'bid', 'ask', 'volume', 'openInterest', 'impliedVolatility']].copy()
-                            display_puts.columns = ['Strike', 'Last', 'Bid', 'Ask', 'Volume', 'Open Int', 'IV']
-                            display_puts['IV'] = (display_puts['IV'] * 100).round(2).astype(str) + '%'
-                            st.dataframe(display_puts, use_container_width=True, height=400)
-                        else:
-                            st.warning("No puts data available")
-                else:
-                    st.warning(f"No options available for {ticker}")
-            
-            with tab3:
-                st.markdown("#### Options Analysis Charts")
+                    if straddle_df is not None and len(straddle_df) > 0:
+                        # Create colored headers
+                        st.markdown("""
+                        <div style="display: flex; margin-bottom: 0;">
+                            <div style="flex: 1; background: linear-gradient(90deg, #00875a, #00a86b); color: white; padding: 10px; text-align: center; font-weight: 600; border-radius: 8px 0 0 0;">
+                                📈 CALLS
+                            </div>
+                            <div style="flex: 0 0 80px; background: #3d4450; color: white; padding: 10px; text-align: center; font-weight: 600;">
+                                STRIKE
+                            </div>
+                            <div style="flex: 1; background: linear-gradient(90deg, #dc3545, #ff4757); color: white; padding: 10px; text-align: center; font-weight: 600; border-radius: 0 8px 0 0;">
+                                📉 PUTS
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Display the straddle table
+                        st.dataframe(
+                            straddle_df,
+                            use_container_width=True,
+                            height=500,
+                            hide_index=True
+                        )
+                        
+                        # Download button
+                        csv = straddle_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Options Chain (CSV)",
+                            data=csv,
+                            file_name=f"{ticker}_options_{selected_exp}_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv"
+                        )
+                    else:
+                        st.warning("No options data available for this expiration")
                 
-                if calls_df is not None and puts_df is not None:
-                    # Open Interest Chart
-                    oi_chart = create_options_chart(calls_df, puts_df, ticker)
-                    st.plotly_chart(oi_chart, use_container_width=True)
-                    
-                    # Volatility Smile
-                    vol_chart = create_volatility_smile(calls_df, puts_df, ticker)
-                    st.plotly_chart(vol_chart, use_container_width=True)
-                    
-                    # Put/Call Ratio
-                    col1, col2, col3 = st.columns(3)
-                    
-                    total_call_oi = calls_df['openInterest'].sum()
-                    total_put_oi = puts_df['openInterest'].sum()
-                    pc_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-                    
-                    with col1:
-                        st.metric("Total Call OI", f"{total_call_oi:,.0f}")
-                    with col2:
-                        st.metric("Total Put OI", f"{total_put_oi:,.0f}")
-                    with col3:
-                        sentiment = "🐻 Bearish" if pc_ratio > 1 else "🐂 Bullish"
-                        st.metric("Put/Call Ratio", f"{pc_ratio:.3f} ({sentiment})")
-                else:
-                    st.warning("Options data not available for analysis")
-            
-            with tab4:
-                st.markdown("#### 📋 Complete Data Tables")
+                with tab2:
+                    if calls_df is not None and puts_df is not None:
+                        oi_chart = create_oi_chart(calls_df, puts_df, ticker)
+                        st.plotly_chart(oi_chart, use_container_width=True)
+                        
+                        # Summary metrics
+                        col1, col2, col3, col4 = st.columns(4)
+                        total_call_oi = calls_df['openInterest'].sum() if len(calls_df) > 0 else 0
+                        total_put_oi = puts_df['openInterest'].sum() if len(puts_df) > 0 else 0
+                        
+                        with col1:
+                            st.metric("Total Calls OI", f"{total_call_oi:,}")
+                        with col2:
+                            st.metric("Total Puts OI", f"{total_put_oi:,}")
+                        with col3:
+                            pc_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+                            st.metric("P/C Ratio", f"{pc_ratio:.3f}")
+                        with col4:
+                            sentiment = "🐂 Bullish" if pc_ratio < 1 else "🐻 Bearish"
+                            st.metric("Sentiment", sentiment)
+                    else:
+                        st.warning("No data available for charts")
                 
-                # Stock Info Table
-                st.markdown("##### Stock Information")
-                stock_info = {
-                    'Metric': ['Name', 'Ticker', 'Price', 'Change', 'Change %', 'Open', 'High', 'Low', 
-                               'Volume', 'Market Cap', 'P/E Ratio', '52W High', '52W Low'],
-                    'Value': [
-                        stock_data['name'], ticker, f"${stock_data['price']:.2f}",
-                        f"${stock_data['change']:.2f}", f"{stock_data['change_pct']:.2f}%",
-                        f"${stock_data['open']:.2f}", f"${stock_data['high']:.2f}",
-                        f"${stock_data['low']:.2f}", f"{stock_data['volume']:,.0f}",
-                        format_number(stock_data['market_cap']),
-                        f"{stock_data['pe_ratio']:.2f}" if stock_data['pe_ratio'] else "N/A",
-                        f"${stock_data['week_52_high']:.2f}", f"${stock_data['week_52_low']:.2f}"
-                    ]
-                }
-                st.dataframe(pd.DataFrame(stock_info), use_container_width=True, hide_index=True)
+                with tab3:
+                    if calls_df is not None and puts_df is not None:
+                        # Volume chart
+                        vol_chart = create_volume_chart(calls_df, puts_df, ticker)
+                        st.plotly_chart(vol_chart, use_container_width=True)
+                        
+                        st.markdown("---")
+                        
+                        # IV Smile chart
+                        iv_chart = create_iv_smile_chart(calls_df, puts_df, ticker)
+                        st.plotly_chart(iv_chart, use_container_width=True)
+                    else:
+                        st.warning("No data available for charts")
                 
-                st.markdown("---")
-                
-                # Straddle Table
-                st.markdown("##### Straddle View (Calls & Puts Combined)")
-                straddle_df = create_straddle_table(calls_df, puts_df)
-                if len(straddle_df) > 0:
-                    st.dataframe(straddle_df, use_container_width=True, height=400)
-                    
-                    # Download button
-                    csv = straddle_df.to_csv(index=False)
-                    st.download_button(
-                        label="📥 Download Straddle Data (CSV)",
-                        data=csv,
-                        file_name=f"{ticker}_straddle_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv"
-                    )
-                else:
-                    st.warning("No straddle data available")
-                
-                st.markdown("---")
-                
-                # Historical Data
-                st.markdown("##### Recent Price History")
-                if stock_data['history'] is not None and len(stock_data['history']) > 0:
-                    hist_display = stock_data['history'].reset_index()
-                    hist_display = hist_display.tail(50)  # Last 50 records
-                    st.dataframe(hist_display, use_container_width=True, height=300)
-                else:
-                    st.warning("No historical data available")
+                with tab4:
+                    if calls_df is not None and puts_df is not None:
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            # P/C Ratio gauge
+                            gauge_chart = create_put_call_ratio_gauge(calls_df, puts_df)
+                            if gauge_chart:
+                                st.plotly_chart(gauge_chart, use_container_width=True)
+                        
+                        with col2:
+                            # Top strikes by OI
+                            st.markdown("#### 🎯 Top Strikes by Open Interest")
+                            
+                            if len(calls_df) > 0:
+                                top_call_strikes = calls_df.nlargest(5, 'openInterest')[['strike', 'openInterest']]
+                                top_call_strikes.columns = ['Strike', 'Call OI']
+                                
+                            if len(puts_df) > 0:
+                                top_put_strikes = puts_df.nlargest(5, 'openInterest')[['strike', 'openInterest']]
+                                top_put_strikes.columns = ['Strike', 'Put OI']
+                            
+                            st.markdown("**Top Call Strikes:**")
+                            st.dataframe(top_call_strikes, use_container_width=True, hide_index=True)
+                            
+                            st.markdown("**Top Put Strikes:**")
+                            st.dataframe(top_put_strikes, use_container_width=True, hide_index=True)
+                        
+                        # Expiration summary
+                        if exp_details:
+                            st.markdown("---")
+                            st.markdown("#### 📅 All Expirations Summary")
+                            exp_df = pd.DataFrame(exp_details)
+                            exp_df.columns = ['Expiration', 'Options Count', 'Calls Volume', 'Puts Volume', 'Calls OI', 'Puts OI']
+                            st.dataframe(exp_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("No data available for analysis")
+            else:
+                st.error("Could not fetch options data. Barchart may be rate limiting requests.")
         else:
-            st.error(f"Could not fetch data for {ticker}. Please check the ticker symbol.")
+            st.warning(f"No options available for {ticker} or unable to connect to Barchart.")
     
     # Footer
     st.markdown("---")
     st.markdown("""
     <div style="text-align: center; color: rgba(255,255,255,0.5); padding: 1rem;">
-        <p>📊 Yahoo Finance Dashboard | Data updates every minute | Built with Streamlit</p>
-        <p>⚠️ Data provided by Yahoo Finance via yfinance. For informational purposes only.</p>
+        <p>📊 Barchart Options Dashboard | Data from Barchart.com | Built with Streamlit</p>
+        <p style="font-size: 0.8rem;">⚠️ For informational purposes only. Not financial advice.</p>
     </div>
     """, unsafe_allow_html=True)
 

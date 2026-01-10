@@ -1,30 +1,68 @@
 """
 Barchart Options Dashboard - Streamlit Frontend
 Connects to FastAPI backend for options data scraping + Weekly Gamma/GEX summary.
+
+✅ Works BOTH:
+- Local dev (defaults to http://localhost:8000)
+- Streamlit Cloud (uses st.secrets["API_BASE_URL"] or env var API_BASE_URL)
+
+How to set for Streamlit Cloud:
+App → Settings → Secrets
+API_BASE_URL = "https://your-fastapi-backend.example.com"
 """
 
+import os
 import streamlit as st
 import pandas as pd
 import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Page configuration - MUST be first
+
+# -----------------------------
+# Page configuration (MUST be first Streamlit call)
+# -----------------------------
 st.set_page_config(
-    page_title="Barchart Options Dashboard",
+    page_title="stats Dashboard",
     page_icon="📊",
     layout="wide"
 )
 
-# API Configuration
-DEFAULT_API_URL = "http://localhost:8000"
-try:
-    API_BASE_URL = st.secrets.get("API_BASE_URL", DEFAULT_API_URL)
-except Exception:
-    API_BASE_URL = DEFAULT_API_URL
 
+# -----------------------------
+# API Base URL (local + cloud)
+# -----------------------------
+def get_api_base_url() -> str:
+    """
+    Priority:
+    1) Streamlit Secrets: st.secrets["API_BASE_URL"]
+    2) Environment variable: API_BASE_URL
+    3) Local default: http://localhost:8000
+    """
+    # Streamlit Cloud (and local if you create .streamlit/secrets.toml)
+    try:
+        if "API_BASE_URL" in st.secrets:
+            return str(st.secrets["API_BASE_URL"]).rstrip("/")
+    except Exception:
+        pass
+
+    # Env var fallback
+    env_url = os.getenv("API_BASE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+
+    # Local default
+    return "http://localhost:8000"
+
+
+API_BASE_URL = get_api_base_url()
+
+
+# -----------------------------
 # Barchart-inspired dark theme CSS
-st.markdown("""
+# -----------------------------
+st.markdown(
+    """
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     * { font-family: 'Inter', sans-serif; }
@@ -76,10 +114,19 @@ st.markdown("""
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True
+)
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def check_api() -> bool:
+    """
+    Health check endpoint.
+    Expecting backend to expose: GET /health
+    """
     try:
         r = requests.get(f"{API_BASE_URL}/health", timeout=5)
         return r.status_code == 200
@@ -89,6 +136,10 @@ def check_api() -> bool:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_options(symbol: str, date: str):
+    """
+    Calls backend:
+      GET /options?symbol=...&date=...
+    """
     try:
         r = requests.get(
             f"{API_BASE_URL}/options",
@@ -97,11 +148,14 @@ def fetch_options(symbol: str, date: str):
         )
         if r.status_code == 200:
             return {"success": True, "data": r.json()}
+
         try:
             detail = r.json().get("detail", f"HTTP {r.status_code}")
         except Exception:
             detail = f"HTTP {r.status_code}"
+
         return {"success": False, "error": detail, "status_code": r.status_code}
+
     except requests.exceptions.Timeout:
         return {"success": False, "error": "Timeout calling backend.", "status_code": 408}
     except requests.exceptions.ConnectionError:
@@ -114,7 +168,7 @@ def fetch_options(symbol: str, date: str):
 def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, multiplier: int = 100):
     """
     Calls backend:
-      /weekly/summary?symbol=...&date=...&spot=...
+      GET /weekly/summary?symbol=...&date=...&spot=...&r=...&multiplier=...
     """
     try:
         rqs = requests.get(
@@ -124,11 +178,14 @@ def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, m
         )
         if rqs.status_code == 200:
             return {"success": True, "data": rqs.json()}
+
         try:
             detail = rqs.json().get("detail", f"HTTP {rqs.status_code}")
         except Exception:
             detail = f"HTTP {rqs.status_code}"
+
         return {"success": False, "error": detail, "status_code": rqs.status_code}
+
     except requests.exceptions.Timeout:
         return {"success": False, "error": "Timeout calculating weekly summary (backend scraping may be slow).", "status_code": 408}
     except requests.exceptions.ConnectionError:
@@ -183,14 +240,20 @@ def create_top_strikes_chart(df: pd.DataFrame, x_col: str, y_col: str, title: st
     return fig
 
 
+# -----------------------------
+# Main App
+# -----------------------------
 def main():
     # Header
-    st.markdown("""
+    st.markdown(
+        """
     <div class="header">
-        <h1>📊 Barchart Options Dashboard</h1>
+        <h1>📊 Stats Dashboard</h1>
         <p>Options chain + Weekly Gamma / GEX (dealer positioning)</p>
     </div>
-    """, unsafe_allow_html=True)
+    """,
+        unsafe_allow_html=True
+    )
 
     api_ok = check_api()
 
@@ -224,8 +287,16 @@ def main():
 
         st.caption(f"Backend: {API_BASE_URL}")
 
+        # Helpful quick hint if they forgot secrets on cloud
+        if API_BASE_URL.startswith("http://localhost"):
+            st.caption("Tip: On Streamlit Cloud, set API_BASE_URL in Secrets (App → Settings → Secrets).")
+
     if not api_ok:
-        st.error(f"Cannot connect to API at `{API_BASE_URL}`. Start backend: `uvicorn api:app --port 8000 --reload`")
+        st.error(
+            f"Cannot connect to API at `{API_BASE_URL}`.\n\n"
+            f"Local backend example:\n"
+            f"`uvicorn api:app --port 8000 --reload`"
+        )
         return
 
     if fetch_btn or st.session_state.get("last_fetch"):
@@ -267,11 +338,19 @@ def main():
             st.dataframe(df, use_container_width=True, height=520, hide_index=True)
 
         with tab2:
-            bar_fig, line_fig = create_oi_charts(df)
-            st.subheader("📈 Open Interest Comparison")
-            st.plotly_chart(line_fig, use_container_width=True)
-            st.subheader("📊 Open Interest Distribution")
-            st.plotly_chart(bar_fig, use_container_width=True)
+            # Guard for missing expected columns
+            required_cols = {"Strike", "Call OI", "Put OI"}
+            if not required_cols.issubset(set(df.columns)):
+                st.warning(
+                    f"Options data is missing expected columns: {sorted(list(required_cols - set(df.columns)))}.\n\n"
+                    "Make sure backend returns columns named exactly: Strike, Call OI, Put OI"
+                )
+            else:
+                bar_fig, line_fig = create_oi_charts(df)
+                st.subheader("📈 Open Interest Comparison")
+                st.plotly_chart(line_fig, use_container_width=True)
+                st.subheader("📊 Open Interest Distribution")
+                st.plotly_chart(bar_fig, use_container_width=True)
 
         with tab3:
             st.subheader("📌 Weekly Gamma / GEX (Dealer Positioning)")
@@ -290,8 +369,9 @@ def main():
                 st.markdown("**Top Call GEX**")
                 if not top_call.empty:
                     st.dataframe(top_call, use_container_width=True, hide_index=True)
-                    fig = create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX")
-                    st.plotly_chart(fig, use_container_width=True)
+                    if {"strike", "call_gex"}.issubset(top_call.columns):
+                        fig = create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX")
+                        st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("No top call GEX data returned.")
 
@@ -299,8 +379,9 @@ def main():
                 st.markdown("**Top Put GEX**")
                 if not top_put.empty:
                     st.dataframe(top_put, use_container_width=True, hide_index=True)
-                    fig = create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX")
-                    st.plotly_chart(fig, use_container_width=True)
+                    if {"strike", "put_gex"}.issubset(top_put.columns):
+                        fig = create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX")
+                        st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("No top put GEX data returned.")
 
@@ -308,8 +389,9 @@ def main():
                 st.markdown("**Top Net GEX (abs)**")
                 if not top_net.empty:
                     st.dataframe(top_net, use_container_width=True, hide_index=True)
-                    fig = create_top_strikes_chart(top_net, "strike", "net_gex", "Top Net GEX (abs)")
-                    st.plotly_chart(fig, use_container_width=True)
+                    if {"strike", "net_gex"}.issubset(top_net.columns):
+                        fig = create_top_strikes_chart(top_net, "strike", "net_gex", "Top Net GEX (abs)")
+                        st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("No top net GEX data returned.")
 

@@ -58,6 +58,41 @@ API_BASE_URL = get_api_base_url()
 
 
 # -----------------------------
+# Streamlit "width" safe wrappers (future-proof)
+# -----------------------------
+def st_df(df: pd.DataFrame, height=None, hide_index: bool = True):
+    # Only pass height if user gave a real value
+    kwargs = {"width": "stretch", "hide_index": hide_index}
+    if height is not None:
+        kwargs["height"] = int(height)
+
+    try:
+        st.dataframe(df, **kwargs)
+    except TypeError:
+        # older Streamlit fallback
+        if height is None:
+            st.dataframe(df, use_container_width=True, hide_index=hide_index)
+        else:
+            st.dataframe(df, use_container_width=True, height=int(height), hide_index=hide_index)
+
+
+
+def st_plot(fig):
+    try:
+        st.plotly_chart(fig, width="stretch")
+    except TypeError:
+        # older Streamlit
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def st_btn(label: str, disabled: bool = False, key: str | None = None):
+    try:
+        return st.button(label, width="stretch", disabled=disabled, key=key)
+    except TypeError:
+        return st.button(label, use_container_width=True, disabled=disabled, key=key)
+
+
+# -----------------------------
 # Barchart-inspired dark theme CSS
 # -----------------------------
 st.markdown(
@@ -302,22 +337,30 @@ def plot_net_gex_map(gex_df: pd.DataFrame, spot: float, levels: dict):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df["strike"], y=df["net_gex"], mode="lines+markers", name="Net GEX"))
 
-    fig.add_vline(x=spot, line_width=2, line_dash="dash",
-                  annotation_text=f"Spot {spot:g}", annotation_position="top")
+    fig.add_vline(
+        x=spot, line_width=2, line_dash="dash",
+        annotation_text=f"Spot {spot:g}", annotation_position="top"
+    )
 
     for _, row in levels["magnets"].iterrows():
         s = float(row["strike"])
-        fig.add_vline(x=s, line_width=1, line_dash="dot",
-                      annotation_text=f"Magnet {s:g}", annotation_position="bottom")
+        fig.add_vline(
+            x=s, line_width=1, line_dash="dot",
+            annotation_text=f"Magnet {s:g}", annotation_position="bottom"
+        )
 
     lower = levels["gamma_box"]["lower"]
     upper = levels["gamma_box"]["upper"]
     if lower is not None:
-        fig.add_vline(x=lower, line_width=2, line_dash="dash",
-                      annotation_text=f"Lower wall {lower:g}", annotation_position="top left")
+        fig.add_vline(
+            x=lower, line_width=2, line_dash="dash",
+            annotation_text=f"Lower wall {lower:g}", annotation_position="top left"
+        )
     if upper is not None:
-        fig.add_vline(x=upper, line_width=2, line_dash="dash",
-                      annotation_text=f"Upper wall {upper:g}", annotation_position="top right")
+        fig.add_vline(
+            x=upper, line_width=2, line_dash="dash",
+            annotation_text=f"Upper wall {upper:g}", annotation_position="top right"
+        )
 
     fig.update_layout(
         template="plotly_dark",
@@ -334,43 +377,41 @@ def plot_net_gex_map(gex_df: pd.DataFrame, spot: float, levels: dict):
 # -----------------------------
 def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    yfinance sometimes returns MultiIndex columns (Price x Ticker) or duplicate columns.
-    This normalizes to plain columns with at least 'Close'.
+    yfinance may return MultiIndex columns.
+    Normalize to a plain DataFrame containing ONLY 'Close'.
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
     out = df.copy()
 
-    # If columns are MultiIndex, prefer the 'Close' level
+    # If MultiIndex, find a Close-like column
     if isinstance(out.columns, pd.MultiIndex):
-        # Try common forms:
-        # ('Close', 'AAPL') or ('AAPL', 'Close') depending on yfinance version.
         close_col = None
         for col in out.columns:
-            if "Close" in col:
+            # possible forms: ('Close','AAPL') or ('AAPL','Close')
+            if any(str(x).lower() == "close" for x in col):
                 close_col = col
                 break
         if close_col is not None:
             out = pd.DataFrame({"Close": out[close_col]})
         else:
-            # fallback: flatten then hope for Close
+            # flatten then try to find close
             out.columns = ["_".join(map(str, c)).strip() for c in out.columns]
-    else:
-        # ensure Close exists; if there are multiple Close columns, pick the first
-        if "Close" not in out.columns:
-            # sometimes lower-case?
-            for alt in ["close", "Adj Close", "adjclose", "Adj_Close"]:
-                if alt in out.columns:
-                    out["Close"] = out[alt]
-                    break
+
+    # If not MultiIndex, ensure Close exists
+    if "Close" not in out.columns:
+        for alt in ["close", "Adj Close", "adj close", "Adj_Close", "adjclose"]:
+            if alt in out.columns:
+                out["Close"] = out[alt]
+                break
 
     if "Close" not in out.columns:
         return pd.DataFrame()
 
     out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
     out = out.dropna(subset=["Close"])
-    return out
+    return out[["Close"]]
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -420,33 +461,91 @@ def kama(price: pd.Series, er_length: int = 10, fast: int = 2, slow: int = 30) -
     return out
 
 
-def kalman_filter_1d(price: pd.Series, process_var: float = 1e-5, meas_var: float = 1e-2) -> pd.Series:
+def kalman_filter_1d(close, process_var=1e-5, meas_var=1e-2) -> np.ndarray:
     """
-    Robust 1D Kalman filter.
-    Fixes your crash by forcing the input to a 1D float array.
+    Simple 1D Kalman filter for price smoothing.
+    - Accepts Series / list / numpy / DataFrame
+    - Forces STRICT 1D float array to avoid 'sequence' assignment errors.
     """
-    s = pd.Series(price).astype(float).dropna()
-    z = np.asarray(s.values, dtype=float).reshape(-1)  # force 1D
-    n = int(z.shape[0])
+    if isinstance(close, pd.DataFrame):
+        z = close.iloc[:, 0].to_numpy()
+    elif isinstance(close, pd.Series):
+        z = close.to_numpy()
+    else:
+        z = np.asarray(close)
+
+    # STRICT 1D float array
+    z = np.asarray(z, dtype=float).reshape(-1)
+
+    n = int(len(z))
     if n == 0:
-        return pd.Series(dtype=float)
+        return np.array([], dtype=float)
 
     x = np.zeros(n, dtype=float)
-    P = 1.0
-    x[0] = float(z[0])
+    p = np.zeros(n, dtype=float)
 
-    Q = float(process_var)
-    R = float(meas_var)
+    x[0] = float(z[0])
+    p[0] = 1.0
+
+    q = float(process_var)
+    r = float(meas_var)
 
     for k in range(1, n):
         x_pred = x[k - 1]
-        P_pred = P + Q
+        p_pred = p[k - 1] + q
 
-        K = P_pred / (P_pred + R)
+        K = p_pred / (p_pred + r)
         x[k] = x_pred + K * (float(z[k]) - x_pred)
-        P = (1 - K) * P_pred
+        p[k] = (1 - K) * p_pred
 
-    return pd.Series(x, index=s.index)
+    return x
+
+
+def kalman_message(close_series, kalman_series, lookback=20, band_pct=0.003):
+    close = np.asarray(close_series, dtype=float).reshape(-1)
+    kf = np.asarray(kalman_series, dtype=float).reshape(-1)
+
+    n = min(len(close), len(kf))
+    if n < 10:
+        return {"trend": "N/A", "bias": "N/A", "crossings": 0, "msg": "Not enough data for Kalman interpretation."}
+
+    close = close[-n:]
+    kf = kf[-n:]
+
+    lb = min(int(lookback), n - 1)
+    c = close[-lb:]
+    k = kf[-lb:]
+
+    slope = float(k[-1] - k[0])
+
+    band = abs(float(k[-1])) * float(band_pct)
+    diff = float(c[-1] - k[-1])
+    if diff > band:
+        bias = "PRICE ABOVE KALMAN"
+    elif diff < -band:
+        bias = "PRICE BELOW KALMAN"
+    else:
+        bias = "PRICE NEAR KALMAN"
+
+    sign = np.sign(c - k)
+    sign[sign == 0] = 1
+    crossings = int(np.sum(sign[1:] != sign[:-1]))
+
+    if crossings >= max(6, lb // 4):
+        trend = "RANGE / CHOP"
+        msg = f"Kalman says it’s CHOPPY: lots of crossings ({crossings}) → range behavior."
+    else:
+        if slope > 0:
+            trend = "UPTREND"
+            msg = f"Kalman says UPTREND (Kalman rising). {bias}."
+        elif slope < 0:
+            trend = "DOWNTREND"
+            msg = f"Kalman says DOWNTREND (Kalman falling). {bias}."
+        else:
+            trend = "FLAT"
+            msg = f"Kalman says FLAT/neutral. {bias}."
+
+    return {"trend": trend, "bias": bias, "crossings": crossings, "msg": msg}
 
 
 def plot_filters(df_prices: pd.DataFrame, length_md: int, kama_er: int, kama_fast: int, kama_slow: int,
@@ -455,7 +554,10 @@ def plot_filters(df_prices: pd.DataFrame, length_md: int, kama_er: int, kama_fas
 
     md = mcginley_dynamic(close, length=length_md)
     k = kama(close, er_length=kama_er, fast=kama_fast, slow=kama_slow)
-    kf = kalman_filter_1d(close, process_var=kf_q, meas_var=kf_r)
+
+    kf_arr = kalman_filter_1d(close, process_var=kf_q, meas_var=kf_r)
+    # IMPORTANT: give Kalman the SAME index so plotting never crashes
+    kf = pd.Series(kf_arr, index=close.index, name="Kalman")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=close.index, y=close, mode="lines", name="Close"))
@@ -471,7 +573,7 @@ def plot_filters(df_prices: pd.DataFrame, length_md: int, kama_er: int, kama_fas
         yaxis_title="Price",
         hovermode="x unified"
     )
-    return fig
+    return fig, kf
 
 
 # -----------------------------
@@ -482,7 +584,7 @@ def main():
         """
     <div class="header">
         <h1>📊 Stats Dashboard</h1>
-        <p>Options chain + Weekly Gamma / GEX (dealer positioning)</p>
+        <p>Options chain + Weekly Gamma / GEX (dealer positioning) + Filters</p>
     </div>
     """,
         unsafe_allow_html=True
@@ -498,7 +600,7 @@ def main():
         date = st.text_input("Expiration Date", value="2026-01-16", help="Format: YYYY-MM-DD (ex: 2026-01-16)")
         spot = st.number_input("Spot Price (required for Gamma/GEX)", value=260.00, step=0.50)
 
-        fetch_btn = st.button("🔄 Fetch Data", width="stretch", disabled=not api_ok)
+        fetch_btn = st_btn("🔄 Fetch Data", disabled=not api_ok)
 
         st.markdown("---")
         st.markdown("### 🔥 Quick Symbols")
@@ -506,7 +608,7 @@ def main():
         cols = st.columns(3)
         for i, s in enumerate(popular):
             with cols[i % 3]:
-                if st.button(s, key=f"q_{s}", width="stretch"):
+                if st_btn(s, key=f"q_{s}"):
                     st.session_state["symbol_override"] = s
 
         if "symbol_override" in st.session_state:
@@ -519,7 +621,6 @@ def main():
             st.markdown('<div class="status-error">✗ API Offline</div>', unsafe_allow_html=True)
 
         st.caption(f"Backend: {API_BASE_URL}")
-
         if API_BASE_URL.startswith("http://localhost"):
             st.caption("Tip: On Streamlit Cloud, set API_BASE_URL in Secrets (App → Settings → Secrets).")
 
@@ -561,24 +662,26 @@ def main():
 
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}** expiring **{date}**")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters"])
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters"]
+        )
 
         with tab1:
-            st.dataframe(df, width="stretch", height=520, hide_index=True)
+            st_df(df, height=520)
 
         with tab2:
             required_cols = {"Strike", "Call OI", "Put OI"}
             if not required_cols.issubset(set(df.columns)):
                 st.warning(
                     f"Options data is missing expected columns: {sorted(list(required_cols - set(df.columns)))}.\n\n"
-                    "Make sure backend returns columns named exactly: Strike, Call OI, Put OI"
+                    "Backend must return: Strike, Call OI, Put OI"
                 )
             else:
                 bar_fig, line_fig = create_oi_charts(df)
                 st.subheader("📈 Open Interest Comparison")
-                st.plotly_chart(line_fig, width="stretch")
+                st_plot(line_fig)
                 st.subheader("📊 Open Interest Distribution")
-                st.plotly_chart(bar_fig, width="stretch")
+                st_plot(bar_fig)
 
         with tab3:
             st.subheader("📌 Weekly Gamma / GEX (Dealer Positioning)")
@@ -596,34 +699,31 @@ def main():
             with colA:
                 st.markdown("**Top Call GEX**")
                 if not top_call.empty:
-                    st.dataframe(top_call, width="stretch", hide_index=True)
+                    st_df(top_call)
                     if {"strike", "call_gex"}.issubset(top_call.columns):
-                        fig = create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX")
-                        st.plotly_chart(fig, width="stretch")
+                        st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"))
                 else:
                     st.info("No top call GEX data returned.")
 
             with colB:
                 st.markdown("**Top Put GEX**")
                 if not top_put.empty:
-                    st.dataframe(top_put, width="stretch", hide_index=True)
+                    st_df(top_put)
                     if {"strike", "put_gex"}.issubset(top_put.columns):
-                        fig = create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX")
-                        st.plotly_chart(fig, width="stretch")
+                        st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"))
                 else:
                     st.info("No top put GEX data returned.")
 
             with colC:
                 st.markdown("**Top Net GEX (abs)**")
                 if not top_net.empty:
-                    st.dataframe(top_net, width="stretch", hide_index=True)
+                    st_df(top_net)
                     if {"strike", "net_gex"}.issubset(top_net.columns):
-                        fig = create_top_strikes_chart(top_net, "strike", "net_gex", "Top Net GEX (abs)")
-                        st.plotly_chart(fig, width="stretch")
+                        st_plot(create_top_strikes_chart(top_net, "strike", "net_gex", "Top Net GEX (abs)"))
                 else:
                     st.info("No top net GEX data returned.")
 
-            st.caption("Note: GEX is an approximation from IV + OI using Black-Scholes gamma; for educational analysis.")
+            st.caption("Note: GEX is an approximation from IV + OI using Black-Scholes gamma; educational only.")
 
         with tab4:
             st.subheader("🧭 Gamma Map (Magnets / Walls / Box)")
@@ -652,40 +752,7 @@ def main():
                         cB.metric("Lower Wall", f"{lower:g}" if lower is not None else "N/A")
                         cC.metric("Upper Wall", f"{upper:g}" if upper is not None else "N/A")
 
-                        t1, t2, t3 = st.columns(3)
-
-                        with t1:
-                            st.markdown("### 🧲 Magnets (Top Net GEX abs)")
-                            m = levels["magnets"].copy()
-                            m["net_gex"] = pd.to_numeric(m["net_gex"], errors="coerce").fillna(0.0).map(lambda x: f"{x:,.0f}")
-                            st.dataframe(m, width="stretch", hide_index=True)
-
-                        with t2:
-                            st.markdown("### 🧱 Call Walls (Top Call GEX)")
-                            cw = levels["call_walls"].copy()
-                            cw["call_gex"] = pd.to_numeric(cw["call_gex"], errors="coerce").fillna(0.0).map(lambda x: f"{x:,.0f}")
-                            st.dataframe(cw, width="stretch", hide_index=True)
-
-                        with t3:
-                            st.markdown("### 🧱 Put Walls (Top Put GEX)")
-                            pw = levels["put_walls"].copy()
-                            pw["put_gex"] = pd.to_numeric(pw["put_gex"], errors="coerce").fillna(0.0).map(lambda x: f"{x:,.0f}")
-                            st.dataframe(pw, width="stretch", hide_index=True)
-
-                        fig = plot_net_gex_map(gex_df, spot=spot, levels=levels)
-                        st.plotly_chart(fig, width="stretch")
-
-                        st.markdown("### 📌 Scenario Read (auto)")
-                        main_mag = float(levels["magnets"].iloc[0]["strike"]) if not levels["magnets"].empty else None
-                        next_mags = [float(x) for x in levels["magnets"]["strike"].iloc[1:4].tolist()] if len(levels["magnets"]) > 1 else []
-                        box_str = f"[{lower:g}, {upper:g}]" if (lower is not None and upper is not None) else "N/A"
-
-                        st.write(f"- **Spot**: {spot:g}")
-                        st.write(f"- **Main magnet**: {main_mag:g}" if main_mag is not None else "- **Main magnet**: N/A")
-                        if next_mags:
-                            st.write(f"- **Next magnets**: {', '.join([str(int(x)) if float(x).is_integer() else str(x) for x in next_mags])}")
-                        st.write(f"- **Gamma box (nearest walls)**: {box_str}")
-                        st.write("- If price is inside the box, expect more **pin / range** behavior. If it breaks beyond a wall, watch for **faster moves**.")
+                        st_plot(plot_net_gex_map(gex_df, spot=spot, levels=levels))
 
             st.markdown("---")
             st.subheader("📈 Noise Filters (McGinley / KAMA / Kalman)")
@@ -716,8 +783,12 @@ def main():
             if px.empty or "Close" not in px.columns:
                 st.error("No price data returned. Try a different symbol/period/interval.")
             else:
-                fig2 = plot_filters(px, int(length_md), int(kama_er), int(kama_fast), int(kama_slow), float(kf_q), float(kf_r))
-                st.plotly_chart(fig2, width="stretch")
+                fig2, kf_series = plot_filters(px, int(length_md), int(kama_er), int(kama_fast), int(kama_slow), float(kf_q), float(kf_r))
+                st_plot(fig2)
+
+                # ✅ Kalman “what it says” message
+                km = kalman_message(px["Close"].values, kf_series.values, lookback=20, band_pct=0.003)
+                st.info(f"**Kalman Read:** {km['msg']}  \nTrend: **{km['trend']}**, Bias: **{km['bias']}**, Crossings(20): **{km['crossings']}**")
 
                 st.caption("Tip: McGinley adapts to speed, KAMA adapts via Efficiency Ratio, Kalman adapts via Q/R confidence.")
 
@@ -725,7 +796,7 @@ def main():
         st.info("👆 Enter symbol/date/spot and click **Fetch Data**.")
 
     st.markdown("---")
-    st.caption("📊 Stats Dashboard |  | For educational purposes only")
+    st.caption("📊 Stats Dashboard | For educational purposes only")
 
 
 if __name__ == "__main__":

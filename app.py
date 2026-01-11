@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Barchart Options Dashboard - Streamlit Frontend
 Connects to FastAPI backend for options data scraping + Weekly Gamma/GEX summary + Gamma Map + Noise Filters.
@@ -21,12 +22,23 @@ import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+
+# -----------------------------
+# Page configuration (MUST be the first Streamlit call)
+# -----------------------------
+st.set_page_config(
+    page_title="Stats Dashboard",
+    page_icon="📊",
+    layout="wide"
+)
+
 # ---------------- Yahoo Finance Spot Helper ----------------
 # Uses Yahoo Finance quote endpoint (via yfinance if installed, else direct HTTP).
 try:
     import yfinance as yf  # optional
 except Exception:
     yf = None
+
 
 def get_spot_from_yahoo(symbol: str) -> float | None:
     """
@@ -71,22 +83,92 @@ def get_spot_from_yahoo(symbol: str) -> float | None:
         pass
 
     return None
+
+
 import yfinance as yf
 
 
-# -----------------------------
-# Page configuration (MUST be first Streamlit call)
-# -----------------------------
-st.set_page_config(
-    page_title="stats Dashboard",
-    page_icon="📊",
-    layout="wide"
-)
+def get_price_history_from_yahoo(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame | None:
+    """
+    Fetch historical prices for charts (moving averages + Fibonacci).
+
+    Returns a DataFrame with columns: ['Date', 'Close'].
+
+    Fallback order:
+      1) yfinance (if installed)
+      2) Yahoo public chart endpoint (no yfinance)
+      3) Stooq daily CSV (often works when Yahoo is blocked)
+
+    Note: Fib needs a daily close time series (not just spot).
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+
+    # 1) yfinance
+    if yf is not None:
+        try:
+            t = yf.Ticker(symbol)
+            hist = t.history(period=period, interval=interval)
+            if hist is not None and not hist.empty:
+                dfh = hist.reset_index()
+                if "Date" not in dfh.columns and "Datetime" in dfh.columns:
+                    dfh.rename(columns={"Datetime": "Date"}, inplace=True)
+                if "Close" in dfh.columns:
+                    dfh = dfh[["Date", "Close"]].copy()
+                    dfh["Close"] = pd.to_numeric(dfh["Close"], errors="coerce")
+                    dfh = dfh.dropna(subset=["Close"])
+                    if not dfh.empty:
+                        return dfh
+        except Exception:
+            pass
+
+    # 2) Yahoo chart endpoint (no yfinance)
+    try:
+        import requests
+
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        params = {"range": period, "interval": interval}
+        r = requests.get(url, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        j = r.json()
+
+        result = j.get("chart", {}).get("result")
+        if result:
+            r0 = result[0]
+            ts = r0.get("timestamp", [])
+            closes = r0.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            if ts and closes:
+                dfh = pd.DataFrame({"Date": pd.to_datetime(ts, unit="s"), "Close": closes})
+                dfh["Close"] = pd.to_numeric(dfh["Close"], errors="coerce")
+                dfh = dfh.dropna(subset=["Close"]).sort_values("Date")
+                if not dfh.empty:
+                    return dfh
+    except Exception:
+        pass
+
+    # 3) Stooq daily CSV fallback
+    try:
+        import requests
+        sym = symbol.lower()
+        # Stooq uses aapl.us for US stocks
+        stooq_symbol = f"{sym}.us"
+        url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
+        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200 and "Date" in r.text and "Close" in r.text:
+            from io import StringIO
+            dfh = pd.read_csv(StringIO(r.text))
+            if "Date" in dfh.columns and "Close" in dfh.columns:
+                dfh["Date"] = pd.to_datetime(dfh["Date"], errors="coerce")
+                dfh["Close"] = pd.to_numeric(dfh["Close"], errors="coerce")
+                dfh = dfh.dropna(subset=["Date", "Close"]).sort_values("Date")
+                if not dfh.empty:
+                    return dfh[["Date", "Close"]]
+    except Exception:
+        pass
+
+    return None
 
 
-# -----------------------------
-# API Base URL (local + cloud)
-# -----------------------------
 def get_api_base_url() -> str:
     """
     Priority:
@@ -108,8 +190,6 @@ def get_api_base_url() -> str:
 
 
 API_BASE_URL = get_api_base_url()
-
-
 # -----------------------------
 # Streamlit "width" safe wrappers (future-proof)
 # -----------------------------
@@ -144,7 +224,6 @@ def st_df(df: pd.DataFrame, height=None, hide_index: bool = True):
             st.dataframe(df, use_container_width=True, hide_index=hide_index)
         else:
             st.dataframe(df, use_container_width=True, height=int(height), hide_index=hide_index)
-
 
 
 def st_plot(fig):
@@ -217,6 +296,81 @@ st.markdown(
 
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+
+/* ---- Responsive typography (mobile + desktop) ---- */
+html, body, [class*="css"]  {
+  font-size: 16px;
+}
+
+/* Make headers/labels easier to read */
+h1, h2, h3, h4 { letter-spacing: 0.2px; }
+
+/* Desktop: bump overall size */
+@media (min-width: 992px) {
+  html, body, [class*="css"] { font-size: 18px; }
+  .header h1 { font-size: 2.2rem !important; }
+  .header p  { font-size: 1.05rem !important; }
+}
+
+/* Mobile: keep compact, prevent overflow */
+@media (max-width: 600px) {
+  .header { padding: 1rem 1rem !important; }
+  .header h1 { font-size: 1.5rem !important; }
+  .header p { font-size: 0.9rem !important; }
+  .stButton > button { padding: 0.6rem 0.8rem !important; }
+}
+
+/* Bigger metric cards readability */
+div[data-testid="stMetric"] > div {
+  padding: 10px 12px;
+}
+div[data-testid="stMetricLabel"] p {
+  font-size: 0.95rem !important;
+}
+div[data-testid="stMetricValue"] {
+  font-size: 1.6rem !important;
+}
+
+/* Dataframes: increase font on desktop, allow horizontal scroll on mobile */
+div[data-testid="stDataFrame"] { border-radius: 10px; }
+@media (min-width: 992px) {
+  div[data-testid="stDataFrame"] * { font-size: 0.95rem !important; }
+}
+@media (max-width: 600px) {
+  div[data-testid="stDataFrame"] { overflow-x: auto; }
+}
+
+
+    /* 🚀 FORCE FULL WIDTH ON DESKTOP (override Streamlit default max-width) */
+    [data-testid="stAppViewContainer"] .main .block-container,
+    section.main > div.block-container,
+    .block-container {
+        max-width: 100% !important;
+        padding-left: 2.5rem !important;
+        padding-right: 2.5rem !important;
+    }
+
+    /* Make charts & dataframes stretch to container */
+    [data-testid="stPlotlyChart"] > div,
+    [data-testid="stDataFrame"] > div {
+        width: 100% !important;
+    }
+
+    /* Desktop font sizing (fix "too small" look) */
+    @media (min-width: 1200px) {
+        html, body, [class*="css"] { font-size: 18px !important; }
+    }
+
+    /* Mobile: tighter padding + slightly smaller font */
+    @media (max-width: 768px) {
+        [data-testid="stAppViewContainer"] .main .block-container,
+        section.main > div.block-container,
+        .block-container {
+            padding-left: 1rem !important;
+            padding-right: 1rem !important;
+        }
+        html, body, [class*="css"] { font-size: 15px !important; }
+    }
 </style>
 """,
     unsafe_allow_html=True
@@ -282,7 +436,8 @@ def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, m
         return {"success": False, "error": detail, "status_code": rqs.status_code}
 
     except requests.exceptions.Timeout:
-        return {"success": False, "error": "Timeout calculating weekly summary (backend scraping may be slow).", "status_code": 408}
+        return {"success": False, "error": "Timeout calculating weekly summary (backend scraping may be slow).",
+                "status_code": 408}
     except requests.exceptions.ConnectionError:
         return {"success": False, "error": "Cannot connect to backend.", "status_code": 503}
     except Exception as e:
@@ -340,8 +495,10 @@ def create_oi_charts(df: pd.DataFrame):
     bar_fig.update_yaxes(title_text="Open Interest")
 
     line_fig = go.Figure()
-    line_fig.add_trace(go.Scatter(x=df_sorted["strike_num"], y=df_sorted["call_oi"], mode="lines+markers", name="Call OI"))
-    line_fig.add_trace(go.Scatter(x=df_sorted["strike_num"], y=df_sorted["put_oi"], mode="lines+markers", name="Put OI"))
+    line_fig.add_trace(
+        go.Scatter(x=df_sorted["strike_num"], y=df_sorted["call_oi"], mode="lines+markers", name="Call OI"))
+    line_fig.add_trace(
+        go.Scatter(x=df_sorted["strike_num"], y=df_sorted["put_oi"], mode="lines+markers", name="Put OI"))
     line_fig.update_layout(
         title="📊 Call vs Put Open Interest by Strike",
         template="plotly_dark",
@@ -398,15 +555,16 @@ def _to_float_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s.astype(str).str.replace(",", "").str.replace("%", ""), errors="coerce")
 
 
-
 # -----------------------------
 # Black-Scholes Greeks (fallback if backend doesn't provide greeks)
 # -----------------------------
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
+
 def _norm_pdf(x: float) -> float:
     return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
+
 
 def _bs_greeks(S: float, K: float, T: float, sigma: float, r: float, q: float = 0.0):
     """
@@ -433,7 +591,7 @@ def _bs_greeks(S: float, K: float, T: float, sigma: float, r: float, q: float = 
     disc_r = math.exp(-r * T)
 
     call_delta = disc_q * Nd1
-    put_delta  = disc_q * (Nd1 - 1.0)
+    put_delta = disc_q * (Nd1 - 1.0)
 
     gamma = (disc_q * pdf_d1) / (S * sigma * sqrtT)
 
@@ -443,11 +601,76 @@ def _bs_greeks(S: float, K: float, T: float, sigma: float, r: float, q: float = 
 
     # Theta: per year. Convert to per day by /365
     call_theta_y = -(S * disc_q * pdf_d1 * sigma) / (2.0 * sqrtT) - r * K * disc_r * Nd2 + q * S * disc_q * Nd1
-    put_theta_y  = -(S * disc_q * pdf_d1 * sigma) / (2.0 * sqrtT) + r * K * disc_r * Nmd2 - q * S * disc_q * Nmd1
+    put_theta_y = -(S * disc_q * pdf_d1 * sigma) / (2.0 * sqrtT) + r * K * disc_r * Nmd2 - q * S * disc_q * Nmd1
     call_theta_d = call_theta_y / 365.0
-    put_theta_d  = put_theta_y / 365.0
+    put_theta_d = put_theta_y / 365.0
 
     return call_delta, put_delta, gamma, vega_per_1pct, call_theta_d, put_theta_d
+
+
+# -----------------------------
+# Spot move matrix + Fibonacci helpers
+# -----------------------------
+def _build_spot_move_matrix(spot: float, call_delta: float, put_delta: float, gamma: float) -> pd.DataFrame:
+    """Delta+Gamma approximation of option price change for a set of spot moves."""
+    moves = [-20, -15, -10, -7.5, -5, -3, -2, -1, 0, 1, 2, 3, 5, 7.5, 10, 15, 20]
+    rows = []
+    for dS in moves:
+        call_chg = (call_delta * dS) + 0.5 * gamma * (dS ** 2)
+        put_chg = (put_delta * dS) + 0.5 * gamma * (dS ** 2)
+        rows.append({
+            "Spot Move ($)": dS,
+            "New Spot": spot + dS,
+            "Call Δ+Γ Est. Change": call_chg,
+            "Put Δ+Γ Est. Change": put_chg,
+        })
+    return pd.DataFrame(rows)
+
+
+def _swing_high_low_from_history(hist_df: pd.DataFrame, lookback_days: int):
+    """Return (low, high) from the last N rows of daily history."""
+    try:
+        sub = hist_df.tail(int(lookback_days)).copy()
+        if sub.empty:
+            return None
+        # Prefer High/Low columns if present, else Close range
+        if "Low" in sub.columns and "High" in sub.columns:
+            lo = float(sub["Low"].min())
+            hi = float(sub["High"].max())
+        else:
+            lo = float(sub["Close"].min())
+            hi = float(sub["Close"].max())
+        if lo == hi:
+            return None
+        return lo, hi
+    except Exception:
+        return None
+
+
+def _fib_levels_from_swing(swing_low: float, swing_high: float):
+    """Return (retracements, extensions) dicts for a swing."""
+    lo, hi = float(swing_low), float(swing_high)
+    rng = hi - lo
+    if rng == 0:
+        return None
+
+    retr = {
+        "0% (Low)": lo,
+        "23.6%": hi - 0.236 * rng,
+        "38.2%": hi - 0.382 * rng,
+        "50.0%": hi - 0.500 * rng,
+        "61.8%": hi - 0.618 * rng,
+        "78.6%": hi - 0.786 * rng,
+        "100% (High)": hi,
+    }
+    ext = {
+        "Upper 127.2%": hi + 0.272 * rng,
+        "Upper 161.8%": hi + 0.618 * rng,
+        "Lower -27.2%": lo - 0.272 * rng,
+        "Lower -61.8%": lo - 0.618 * rng,
+    }
+    return retr, ext
+
 
 def plot_iv_and_greeks(df: pd.DataFrame, spot: float, T: float | None = None, r: float = 0.041, q: float = 0.004):
     """
@@ -458,10 +681,24 @@ def plot_iv_and_greeks(df: pd.DataFrame, spot: float, T: float | None = None, r:
     """
     d = df.copy()
 
-    if "Strike" not in d.columns:
+    # Strike column can be named differently depending on the source/export.
+    # Try to find a reasonable strike column (e.g. "Strike", "Strike Price", etc.).
+    strike_col = None
+    for c in d.columns:
+        if re.search(r"strike", str(c), flags=re.IGNORECASE):
+            strike_col = c
+            break
+    if strike_col is None:
+        # fallback: choose the first mostly-numeric column
+        for c in d.columns:
+            s = _to_float_series(d[c])
+            if s.notna().mean() > 0.6:
+                strike_col = c
+                break
+    if strike_col is None:
         return None, None, {}
 
-    d["strike_num"] = _to_float_series(d["Strike"])
+    d["strike_num"] = _to_float_series(d[strike_col])
     d = d.dropna(subset=["strike_num"]).sort_values("strike_num")
 
     # --- IV
@@ -473,12 +710,15 @@ def plot_iv_and_greeks(df: pd.DataFrame, spot: float, T: float | None = None, r:
         fig_iv = go.Figure()
         if call_iv_col:
             d["call_iv"] = _to_float_series(d[call_iv_col])
-            fig_iv.add_trace(go.Scatter(x=d["strike_num"], y=d["call_iv"], mode="lines+markers", name=f"Call IV ({call_iv_col})"))
+            fig_iv.add_trace(
+                go.Scatter(x=d["strike_num"], y=d["call_iv"], mode="lines+markers", name=f"Call IV ({call_iv_col})"))
         if put_iv_col:
             d["put_iv"] = _to_float_series(d[put_iv_col])
-            fig_iv.add_trace(go.Scatter(x=d["strike_num"], y=d["put_iv"], mode="lines+markers", name=f"Put IV ({put_iv_col})"))
+            fig_iv.add_trace(
+                go.Scatter(x=d["strike_num"], y=d["put_iv"], mode="lines+markers", name=f"Put IV ({put_iv_col})"))
 
-        fig_iv.add_vline(x=float(spot), line_width=2, line_dash="dash", annotation_text="Spot", annotation_position="top")
+        fig_iv.add_vline(x=float(spot), line_width=2, line_dash="dash", annotation_text="Spot",
+                         annotation_position="top")
         fig_iv.update_layout(
             template="plotly_dark",
             height=420,
@@ -530,8 +770,8 @@ def plot_iv_and_greeks(df: pd.DataFrame, spot: float, T: float | None = None, r:
         q_val = float(q)
 
         # Use call IV for call greeks and put IV for put greeks (common in chains)
-        call_sig = d.get("call_iv", pd.Series([float('nan')]*len(d))).apply(_iv_to_sigma)
-        put_sig  = d.get("put_iv",  pd.Series([float('nan')]*len(d))).apply(_iv_to_sigma)
+        call_sig = d.get("call_iv", pd.Series([float('nan')] * len(d))).apply(_iv_to_sigma)
+        put_sig = d.get("put_iv", pd.Series([float('nan')] * len(d))).apply(_iv_to_sigma)
 
         call_delta = []
         put_delta = []
@@ -563,23 +803,25 @@ def plot_iv_and_greeks(df: pd.DataFrame, spot: float, T: float | None = None, r:
             put_vega.append(vg2)
             put_theta.append(th_p2)
         d["Call Delta"] = pd.Series(call_delta, index=d.index)
-        d["Put Delta"]  = pd.Series(put_delta, index=d.index)
+        d["Put Delta"] = pd.Series(put_delta, index=d.index)
         d["Call Gamma"] = pd.Series(call_gamma, index=d.index)
-        d["Put Gamma"]  = pd.Series(put_gamma, index=d.index)
-        d["Call Vega"]  = pd.Series(call_vega, index=d.index)
-        d["Put Vega"]   = pd.Series(put_vega, index=d.index)
+        d["Put Gamma"] = pd.Series(put_gamma, index=d.index)
+        d["Call Vega"] = pd.Series(call_vega, index=d.index)
+        d["Put Vega"] = pd.Series(put_vega, index=d.index)
         d["Call Theta"] = pd.Series(call_theta, index=d.index)
-        d["Put Theta"]  = pd.Series(put_theta, index=d.index)
+        d["Put Theta"] = pd.Series(put_theta, index=d.index)
 
         # Build greeks plot from computed columns
         fig_g = go.Figure()
-        for name in ["Call Delta", "Put Delta", "Call Gamma", "Put Gamma", "Call Vega", "Put Vega", "Call Theta", "Put Theta"]:
+        for name in ["Call Delta", "Put Delta", "Call Gamma", "Put Gamma", "Call Vega", "Put Vega", "Call Theta",
+                     "Put Theta"]:
             fig_g.add_trace(go.Scatter(x=d["strike_num"], y=_to_float_series(d[name]), mode="lines", name=name))
         any_greek = True
 
     fig_greeks = None
     if any_greek:
-        fig_g.add_vline(x=float(spot), line_width=2, line_dash="dash", annotation_text="Spot", annotation_position="top")
+        fig_g.add_vline(x=float(spot), line_width=2, line_dash="dash", annotation_text="Spot",
+                        annotation_position="top")
         fig_g.update_layout(
             template="plotly_dark",
             height=520,
@@ -747,7 +989,7 @@ def plot_net_gex_map(gex_df: pd.DataFrame, spot: float, levels: dict):
 # -----------------------------
 # Noise Filters (McGinley / KAMA / Kalman)
 # -----------------------------
-def _normalize_yf_df(df: pd.DataFrame | None) -> pd.DataFrame:
+def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     yfinance may return MultiIndex columns.
     Normalize to a plain DataFrame containing ONLY 'Close'.
@@ -1015,7 +1257,6 @@ def kalman_message(close_series, kalman_series, lookback: int = 20, band_pct: fl
     }
 
 
-
 def plot_filters(df_prices: pd.DataFrame, length_md: int, kama_er: int, kama_fast: int, kama_slow: int,
                  kf_q: float, kf_r: float):
     close = df_prices["Close"].astype(float)
@@ -1066,7 +1307,15 @@ def main():
 
         symbol = st.text_input("Symbol", value="AAPL").upper().strip()
         date = st.text_input("Expiration Date", value="2026-01-16", help="Format: YYYY-MM-DD (ex: 2026-01-16)")
-        spot = st.number_input("Spot Price (required for Gamma/GEX)", value=260.00, step=0.50)
+        spot_input = st.number_input("Spot Price (manual fallback)", value=260.00, step=0.50)
+        use_yahoo_spot = st.checkbox("Use live Yahoo spot (recommended)", value=True)
+        yahoo_spot = get_spot_from_yahoo(symbol) if use_yahoo_spot else None
+        if yahoo_spot is not None:
+            st.caption(f"Yahoo spot: {float(yahoo_spot):,.2f}")
+        else:
+            if use_yahoo_spot:
+                st.caption("Yahoo spot: unavailable (using manual spot).")
+        spot = float(yahoo_spot) if yahoo_spot is not None else float(spot_input)
 
         fetch_btn = st_btn("🔄 Fetch Data", disabled=not api_ok)
 
@@ -1128,6 +1377,43 @@ def main():
         top_put = pd.DataFrame(top.get("put_gex", []) or [])
         top_net = pd.DataFrame(top.get("net_gex_abs", []) or [])
 
+        # ---------------- PRICE + MOVING AVERAGES ----------------
+        hist_df = None
+        with st.expander("📈 Price + Moving Averages (15/20/30/45/60 days)", expanded=True):
+            hist_df = get_price_history_from_yahoo(symbol, period="6mo", interval="1d")
+            if hist_df is None or hist_df.empty:
+                st.info("Price history unavailable from Yahoo (moving averages not shown).")
+            else:
+                hist_df = hist_df.sort_values("Date").reset_index(drop=True)
+                for w_ in [15, 20, 30, 45, 60]:
+                    hist_df[f"MA{w_}"] = hist_df["Close"].rolling(window=w_, min_periods=1).mean()
+
+                fig_px = go.Figure()
+                fig_px.add_trace(go.Scatter(x=hist_df["Date"], y=hist_df["Close"], name="Close"))
+                for w_ in [15, 20, 30, 45, 60]:
+                    fig_px.add_trace(go.Scatter(x=hist_df["Date"], y=hist_df[f"MA{w_}"], name=f"MA{w_}"))
+
+                # Mark the spot used by the app (Yahoo/manual)
+                try:
+                    fig_px.add_hline(y=float(spot), line_dash="dot", annotation_text="Spot used",
+                                     annotation_position="top left")
+                except Exception:
+                    pass
+
+                fig_px.update_layout(
+                    height=420,
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    xaxis_title="Date",
+                    yaxis_title="Price",
+                    legend_title="Series",
+                )
+                st_plot(fig_px)
+
+                st.caption(
+                    "Moving averages smooth price action: shorter MAs react faster (15/20), longer MAs react slower (45/60). "
+                    "Crossovers and slope help label short-term vs long-term trend."
+                )
+
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}** expiring **{date}**")
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs(
@@ -1156,7 +1442,8 @@ def main():
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Put/Call Ratio (OI)", f"{(pcr.get('oi') or 0):.3f}" if pcr.get("oi") is not None else "N/A")
-            c2.metric("Put/Call Ratio (Volume)", f"{(pcr.get('volume') or 0):.3f}" if pcr.get("volume") is not None else "N/A")
+            c2.metric("Put/Call Ratio (Volume)",
+                      f"{(pcr.get('volume') or 0):.3f}" if pcr.get("volume") is not None else "N/A")
             c3.metric("Total Net GEX", f"{(totals.get('net_gex') or 0):,.0f}")
             c4.metric("Spot Used", f"{float(w.get('spot') or spot):,.2f}")
 
@@ -1286,7 +1573,7 @@ def main():
             else:
                 # --- Greeks inputs (used only if backend doesn't provide greeks)
                 with st.expander('Greek Inputs (Black-Scholes fallback)', expanded=False):
-                    # If your backend doesn't provide greeks, we can compute them from IV using Black–Scholes.
+                    # If your backend doesn't provide greeks, we can compute them from IV using Black-Scholes.
                     # Inputs:
                     #   r = risk-free rate (annual)
                     #   q = dividend yield (annual; 0 if you want to ignore dividends)
@@ -1318,16 +1605,40 @@ def main():
                         else:
                             st.caption("Yahoo spot unavailable (network/blocked). Falling back to backend/override spot.")
 
+                spot_for_greeks = None
                 # priority: manual override > yahoo > backend spot
                 if spot_override and float(spot_override) > 0:
-                    _spot_for_greeks = float(spot_override)
+                    spot_for_greeks = float(spot_override)
                 elif yahoo_spot and float(yahoo_spot) > 0:
-                    _spot_for_greeks = float(yahoo_spot)
+                    spot_for_greeks = float(yahoo_spot)
                 else:
-                    _spot_for_greeks = float(spot)
+                    spot_for_greeks = float(spot)
 
 
-                _spot_for_greeks = float(spot_override) if spot_override and float(spot_override) > 0 else float(spot)
+                    spot_override_val = float(spot_override) if spot_override and float(spot_override) > 0 else None
+                    yahoo_spot_val = float(yahoo_spot) if yahoo_spot and float(yahoo_spot) > 0 else None
+                    backend_spot_val = float(spot) if spot is not None and str(spot).strip() != '' else None
+
+                    if spot_override_val is not None:
+                        spot_source = 'Override'
+                    elif yahoo_spot_val is not None:
+                        spot_source = 'Yahoo'
+                    elif backend_spot_val is not None:
+                        spot_source = 'Backend'
+                    else:
+                        spot_source = 'Fallback'
+
+                    st.markdown('#### Spot used for Greeks')
+                    st.write({
+                        'Override': spot_override_val,
+                        'Yahoo': yahoo_spot_val,
+                        'Backend': backend_spot_val,
+                        'Using': spot_source,
+                        'Spot used (S)': float(spot_for_greeks) if spot_for_greeks is not None else None,
+                    })
+                    if use_yahoo_spot and spot_source != 'Yahoo':
+                        st.warning('Yahoo spot was enabled but unavailable, so Greeks are using a fallback spot. Install yfinance or allow Yahoo endpoints if blocked.')
+
                 # Assume equity options expire at market close (4:00pm local) on the selected expiry date
                 _now_ts = pd.Timestamp.now()
                 _exp_ts = pd.Timestamp(date) + pd.Timedelta(hours=16)
@@ -1337,7 +1648,7 @@ def main():
                 else:
                     T = max(float((_exp_ts - _now_ts).total_seconds()) / (365.0 * 24 * 3600), 1e-6)
 
-                fig_iv, fig_greeks, atm = plot_iv_and_greeks(df, spot=_spot_for_greeks, T=T, r=float(r_in), q=float(q_in))
+                fig_iv, fig_greeks, atm = plot_iv_and_greeks(df, spot=spot_for_greeks, T=T, r=float(r_in), q=float(q_in))
 
                 if not atm:
                     st.warning("Could not compute ATM snapshot (Strike column missing or invalid).")
@@ -1354,7 +1665,7 @@ def main():
 
                     st.markdown("### 🧠 How to read the Greeks for **this** ATM strike (spot up/down, benefits & risks)")
 
-                    # Pull values if available (from backend or Black–Scholes fallback)
+                    # Pull values if available (from backend or Black-Scholes fallback)
                     spot_used = float(spot_for_greeks) if spot_for_greeks is not None else float("nan")
                     K = float(atm_strike) if atm_strike is not None else float("nan")
 
@@ -1434,12 +1745,73 @@ def main():
                     - ✅ **Benefit**: If IV rises (fear/news), **Vega** can add profit even without a huge spot move.
                     - ⚠️ **Risk**: If spot chops sideways, **Theta** bleeds value day after day.
                     - ⚠️ **Risk**: If IV drops (IV crush), you can lose value even if spot is near your strike.
-                    - ⚠️ **Reminder**: These are **“all else equal”** approximations — in real trading, Δ/Γ/Vega/Θ move together.
+                    - ⚠️ **Reminder**: These are **“all else equal”** approximations - in real trading, Δ/Γ/Vega/Θ move together.
                     """)
 
-                    st.caption("This tab uses backend greeks if provided. If not, it computes greeks from IV using Black–Scholes (your r/q/spot inputs above).")
 
+                    # ---------------- Matrix: multiple spot moves (Delta + Gamma) ----------------
+                    st.subheader("📊 Spot Move Matrix (Delta + Gamma)")
+                    if pd.notna(call_delta) and pd.notna(put_delta) and pd.notna(gamma) and pd.notna(spot_used):
+                        df_matrix = _build_spot_move_matrix(float(spot_used), float(call_delta), float(put_delta), float(gamma))
+                        # Pretty formatting
+                        df_matrix["New Spot"] = df_matrix["New Spot"].map(lambda x: round(float(x), 2))
+                        df_matrix["Call Δ+Γ Est. Change"] = df_matrix["Call Δ+Γ Est. Change"].map(lambda x: round(float(x), 3))
+                        df_matrix["Put Δ+Γ Est. Change"] = df_matrix["Put Δ+Γ Est. Change"].map(lambda x: round(float(x), 3))
+                        st.dataframe(df_matrix, use_container_width=True, height=420)
+                        st.caption("Approximation: Δ and Γ are held constant and IV/time are assumed unchanged. Bigger moves = less accurate.")
+                    else:
+                        st.info("Matrix unavailable (need valid Δ/Γ and spot).")
 
+                    # ---------------- Fibonacci: auto swing ranges from price history ----------------
+                    st.subheader("🧵 Fibonacci Range (auto swing by lookback)")
+
+                    # Fetch daily closes for fib (independent from the MA expander)
+                    hist_fib = get_price_history_from_yahoo(symbol, period="6mo", interval="1d")
+                    if hist_fib is not None and not hist_fib.empty and "Close" in hist_fib.columns:
+                        lookbacks = [15, 20, 30, 45, 60]
+                        fib_rows = []
+                        for lb in lookbacks:
+                            swing = _swing_high_low_from_history(hist_fib, lb)
+                            if not swing:
+                                continue
+                            lo, hi = swing
+                            out = _fib_levels_from_swing(lo, hi)
+                            if not out:
+                                continue
+                            retr, ext = out
+                            fib_rows.append({
+                                "Lookback (days)": lb,
+                                "Swing Low": round(lo, 2),
+                                "Swing High": round(hi, 2),
+                                "Upper 161.8% (End)": round(ext["Upper 161.8%"], 2),
+                                "Lower -61.8% (End)": round(ext["Lower -61.8%"], 2),
+                                "Key Retrace 61.8%": round(retr["61.8%"], 2),
+                                "Key Retrace 38.2%": round(retr["38.2%"], 2),
+                            })
+                        if fib_rows:
+                            fib_df = pd.DataFrame(fib_rows).sort_values("Lookback (days)")
+                            # ---- EOD Fibonacci distances (from latest daily close) ----
+                            try:
+                                eod_close = float(hist_fib.sort_values("Date")["Close"].iloc[-1])
+                            except Exception:
+                                eod_close = None
+
+                            if eod_close is not None:
+                                fib_df["EOD Close"] = eod_close
+                                # dollar and percent distance to the extension "end" levels
+                                fib_df["To Upper 161.8% ($)"] = (fib_df["Upper 161.8% (End)"] - eod_close).round(2)
+                                fib_df["To Upper 161.8% (%)"] = ((fib_df["Upper 161.8% (End)"] / eod_close - 1.0) * 100.0).round(2)
+                                fib_df["To Lower -61.8% ($)"] = (fib_df["Lower -61.8% (End)"] - eod_close).round(2)
+                                fib_df["To Lower -61.8% (%)"] = ((fib_df["Lower -61.8% (End)"] / eod_close - 1.0) * 100.0).round(2)
+
+                            st.dataframe(fib_df, use_container_width=True, height=260)
+                            st.caption("‘End’ levels are common extension targets from the lookback swing (High + 0.618×Range, Low - 0.618×Range). The EOD columns show distance from the latest daily close.")
+                        else:
+                            st.info("Could not compute fib ranges from history.")
+                    else:
+                        st.info("Price history not available - Fibonacci ranges require daily close history (Yahoo/Stooq).")
+
+                st.caption("This tab uses backend greeks if provided. If greeks are missing, it computes greeks from IV using Black-Scholes (your r/q/spot inputs) and then builds a spot-move matrix + Fibonacci ranges.")
                 if fig_iv is not None:
                     st_plot(fig_iv)
                 else:
@@ -1456,17 +1828,14 @@ def main():
                     st.write(
                         f"- 25d Call: strike {skew['call_25d_strike']:g}, Δ={skew['call_25d_delta']:.3f}, IV={skew['call_25d_iv']:.4f}\\n"
                         f"- 25d Put:  strike {skew['put_25d_strike']:g}, Δ={skew['put_25d_delta']:.3f}, IV={skew['put_25d_iv']:.4f}\\n"
-                        f"- **Skew (Call IV − Put IV)**: **{skew['skew_call_minus_put']:.4f}**"
+                        f"- **Skew (Call IV - Put IV)**: **{skew['skew_call_minus_put']:.4f}**"
                     )
                     st.caption("Skew helps you see if downside protection (puts) is getting expensive vs upside calls.")
-
-
     else:
         st.info("👆 Enter symbol/date/spot and click **Fetch Data**.")
 
     st.markdown("---")
     st.caption("📊 Stats Dashboard | For educational purposes only")
-
 
 if __name__ == "__main__":
     main()

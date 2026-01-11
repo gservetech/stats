@@ -747,7 +747,7 @@ def plot_net_gex_map(gex_df: pd.DataFrame, spot: float, levels: dict):
 # -----------------------------
 # Noise Filters (McGinley / KAMA / Kalman)
 # -----------------------------
-def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_yf_df(df: pd.DataFrame | None) -> pd.DataFrame:
     """
     yfinance may return MultiIndex columns.
     Normalize to a plain DataFrame containing ONLY 'Close'.

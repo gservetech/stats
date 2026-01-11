@@ -22,7 +22,6 @@ import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-
 # -----------------------------
 # Page configuration (MUST be the first Streamlit call)
 # -----------------------------
@@ -49,6 +48,94 @@ def get_spot_from_yahoo(symbol: str) -> float | None:
     if not symbol:
         return None
 
+
+def get_today_open_from_yahoo(symbol: str) -> float | None:
+    """
+    Fetch today's regular session OPEN from Yahoo.
+    Returns None if unavailable.
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+
+    # yfinance path
+    if yf is not None:
+        try:
+            t = yf.Ticker(symbol)
+            # fast_info may contain open
+            try:
+                o = t.fast_info.get("open")
+                if o is not None and float(o) > 0:
+                    return float(o)
+            except Exception:
+                pass
+
+            hist = t.history(period="1d", interval="1d")
+            if hist is not None and not hist.empty and "Open" in hist.columns:
+                o = float(hist["Open"].iloc[0])
+                if o > 0:
+                    return o
+        except Exception:
+            pass
+
+    # direct quote endpoint
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+        resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        data = resp.json()
+        result = (data.get("quoteResponse") or {}).get("result") or []
+        if result:
+            v = result[0].get("regularMarketOpen")
+            if v is not None:
+                o = float(v)
+                if o > 0:
+                    return o
+    except Exception:
+        pass
+
+    return None
+
+
+def atr_14_from_history(hist_df: pd.DataFrame) -> float | None:
+    """
+    Compute ATR(14) from a daily OHLC history dataframe returned by get_price_history_from_yahoo.
+    If OHLC is missing, fall back to mean absolute close-to-close move (rough).
+    """
+    if hist_df is None or hist_df.empty:
+        return None
+
+    dfh = hist_df.copy()
+    # Ensure sorting by Date if present
+    if "Date" in dfh.columns:
+        dfh = dfh.sort_values("Date")
+
+    # If we have High/Low/Close, compute True Range
+    if all(c in dfh.columns for c in ["High", "Low", "Close"]):
+        hi = pd.to_numeric(dfh["High"], errors="coerce")
+        lo = pd.to_numeric(dfh["Low"], errors="coerce")
+        cl = pd.to_numeric(dfh["Close"], errors="coerce")
+        prev_cl = cl.shift(1)
+
+        tr = pd.concat([
+            (hi - lo).abs(),
+            (hi - prev_cl).abs(),
+            (lo - prev_cl).abs(),
+        ], axis=1).max(axis=1)
+
+        atr = tr.rolling(14, min_periods=5).mean().iloc[-1]
+        if pd.notna(atr) and float(atr) > 0:
+            return float(atr)
+
+    # Fallback: average absolute close change
+    if "Close" in dfh.columns:
+        cl = pd.to_numeric(dfh["Close"], errors="coerce").dropna()
+        if len(cl) >= 6:
+            atr = cl.diff().abs().rolling(14, min_periods=5).mean().iloc[-1]
+            if pd.notna(atr) and float(atr) > 0:
+                return float(atr)
+
+    return None
     # Try yfinance first (more resilient)
     if yf is not None:
         try:
@@ -90,16 +177,17 @@ import yfinance as yf
 
 def get_price_history_from_yahoo(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame | None:
     """
-    Fetch historical prices for charts (moving averages + Fibonacci).
+    Fetch historical prices for charts (moving averages + Fibonacci + ATR).
 
-    Returns a DataFrame with columns: ['Date', 'Close'].
+    Returns a DataFrame with columns:
+      ['Date', 'Open', 'High', 'Low', 'Close'] (best effort; may fall back to Close-only).
 
     Fallback order:
       1) yfinance (if installed)
       2) Yahoo public chart endpoint (no yfinance)
       3) Stooq daily CSV (often works when Yahoo is blocked)
 
-    Note: Fib needs a daily close time series (not just spot).
+    Note: Fibonacci and ATR need a daily time series (not just spot).
     """
     symbol = (symbol or "").strip().upper()
     if not symbol:
@@ -114,19 +202,22 @@ def get_price_history_from_yahoo(symbol: str, period: str = "6mo", interval: str
                 dfh = hist.reset_index()
                 if "Date" not in dfh.columns and "Datetime" in dfh.columns:
                     dfh.rename(columns={"Datetime": "Date"}, inplace=True)
-                if "Close" in dfh.columns:
-                    dfh = dfh[["Date", "Close"]].copy()
-                    dfh["Close"] = pd.to_numeric(dfh["Close"], errors="coerce")
-                    dfh = dfh.dropna(subset=["Close"])
+
+                # Standardize columns
+                keep = [c for c in ["Date", "Open", "High", "Low", "Close"] if c in dfh.columns]
+                if "Date" in keep and "Close" in keep:
+                    dfh = dfh[keep].copy()
+                    for c in ["Open", "High", "Low", "Close"]:
+                        if c in dfh.columns:
+                            dfh[c] = pd.to_numeric(dfh[c], errors="coerce")
+                    dfh = dfh.dropna(subset=["Date", "Close"])
                     if not dfh.empty:
-                        return dfh
+                        return dfh.sort_values("Date")
         except Exception:
             pass
 
     # 2) Yahoo chart endpoint (no yfinance)
     try:
-        import requests
-
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
         params = {"range": period, "interval": interval}
         r = requests.get(url, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
@@ -136,11 +227,23 @@ def get_price_history_from_yahoo(symbol: str, period: str = "6mo", interval: str
         if result:
             r0 = result[0]
             ts = r0.get("timestamp", [])
-            closes = r0.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+            quote = (r0.get("indicators", {}) or {}).get("quote", [{}])[0] or {}
+            closes = quote.get("close", [])
+            opens = quote.get("open", [])
+            highs = quote.get("high", [])
+            lows = quote.get("low", [])
+
             if ts and closes:
-                dfh = pd.DataFrame({"Date": pd.to_datetime(ts, unit="s"), "Close": closes})
-                dfh["Close"] = pd.to_numeric(dfh["Close"], errors="coerce")
-                dfh = dfh.dropna(subset=["Close"]).sort_values("Date")
+                dfh = pd.DataFrame({
+                    "Date": pd.to_datetime(ts, unit="s"),
+                    "Open": opens if opens else [None] * len(ts),
+                    "High": highs if highs else [None] * len(ts),
+                    "Low": lows if lows else [None] * len(ts),
+                    "Close": closes,
+                })
+                for c in ["Open", "High", "Low", "Close"]:
+                    dfh[c] = pd.to_numeric(dfh[c], errors="coerce")
+                dfh = dfh.dropna(subset=["Date", "Close"]).sort_values("Date")
                 if not dfh.empty:
                     return dfh
     except Exception:
@@ -148,7 +251,6 @@ def get_price_history_from_yahoo(symbol: str, period: str = "6mo", interval: str
 
     # 3) Stooq daily CSV fallback
     try:
-        import requests
         sym = symbol.lower()
         # Stooq uses aapl.us for US stocks
         stooq_symbol = f"{sym}.us"
@@ -157,12 +259,17 @@ def get_price_history_from_yahoo(symbol: str, period: str = "6mo", interval: str
         if r.status_code == 200 and "Date" in r.text and "Close" in r.text:
             from io import StringIO
             dfh = pd.read_csv(StringIO(r.text))
-            if "Date" in dfh.columns and "Close" in dfh.columns:
+            # Stooq columns: Date, Open, High, Low, Close, Volume
+            keep = [c for c in ["Date", "Open", "High", "Low", "Close"] if c in dfh.columns]
+            if "Date" in keep and "Close" in keep:
+                dfh = dfh[keep].copy()
                 dfh["Date"] = pd.to_datetime(dfh["Date"], errors="coerce")
-                dfh["Close"] = pd.to_numeric(dfh["Close"], errors="coerce")
+                for c in ["Open", "High", "Low", "Close"]:
+                    if c in dfh.columns:
+                        dfh[c] = pd.to_numeric(dfh[c], errors="coerce")
                 dfh = dfh.dropna(subset=["Date", "Close"]).sort_values("Date")
                 if not dfh.empty:
-                    return dfh[["Date", "Close"]]
+                    return dfh
     except Exception:
         pass
 
@@ -190,6 +297,8 @@ def get_api_base_url() -> str:
 
 
 API_BASE_URL = get_api_base_url()
+
+
 # -----------------------------
 # Streamlit "width" safe wrappers (future-proof)
 # -----------------------------
@@ -1503,7 +1612,8 @@ def main():
                         upper = levels["gamma_box"]["upper"]
 
                         cA, cB, cC = st.columns(3)
-                        cA.metric("Main Magnet", f"{float(levels['magnets'].iloc[0]['strike']):g}" if not levels["magnets"].empty else "N/A")
+                        cA.metric("Main Magnet", f"{float(levels['magnets'].iloc[0]['strike']):g}" if not levels[
+                            "magnets"].empty else "N/A")
                         cB.metric("Lower Wall", f"{lower:g}" if lower is not None else "N/A")
                         cC.metric("Upper Wall", f"{upper:g}" if upper is not None else "N/A")
 
@@ -1538,7 +1648,8 @@ def main():
             if px.empty or "Close" not in px.columns:
                 st.error("No price data returned. Try a different symbol/period/interval.")
             else:
-                fig2, kf_series = plot_filters(px, int(length_md), int(kama_er), int(kama_fast), int(kama_slow), float(kf_q), float(kf_r))
+                fig2, kf_series = plot_filters(px, int(length_md), int(kama_er), int(kama_fast), int(kama_slow),
+                                               float(kf_q), float(kf_r))
                 st_plot(fig2)
 
                 # ✅ Kalman “what it says” message
@@ -1547,15 +1658,15 @@ def main():
                     f"""
 **Kalman Read:** {km['msg']}
 
-- **Regime:** **{km.get('regime','N/A')}**
-- **Trend:** **{km.get('trend','N/A')}**
-- **Bias:** **{km.get('bias','N/A')}**
-- **Trend strength:** **{km.get('trend_strength','N/A')}**
-- **Structure:** **{km.get('structure','N/A')}**
-- **Chop (crossings/{km.get('lookback',20)}):** **{km.get('crossings','N/A')}**
-- **Confidence:** **{km.get('confidence','N/A')}**
+- **Regime:** **{km.get('regime', 'N/A')}**
+- **Trend:** **{km.get('trend', 'N/A')}**
+- **Bias:** **{km.get('bias', 'N/A')}**
+- **Trend strength:** **{km.get('trend_strength', 'N/A')}**
+- **Structure:** **{km.get('structure', 'N/A')}**
+- **Chop (crossings/{km.get('lookback', 20)}):** **{km.get('crossings', 'N/A')}**
+- **Confidence:** **{km.get('confidence', 'N/A')}**
 
-**Why this label?**{km.get('why','')}
+**Why this label?**{km.get('why', '')}
 
 **Notes:**- "UPTREND + price below Kalman" often = *pullback inside an uptrend* (watch for reclaim).
 - "DOWNTREND + price below Kalman" often = *sell-the-rip* behavior (Kalman acts as resistance).
@@ -1563,7 +1674,8 @@ def main():
 """
                 )
 
-                st.caption("Tip: McGinley adapts to speed, KAMA adapts via Efficiency Ratio, Kalman adapts via Q/R confidence.")
+                st.caption(
+                    "Tip: McGinley adapts to speed, KAMA adapts via Efficiency Ratio, Kalman adapts via Q/R confidence.")
 
         with tab5:
             st.subheader("🧮 Volatility & Greeks (from this expiry chain)")
@@ -1587,7 +1699,8 @@ def main():
                     with col_b:
                         spot_override = st.number_input('Spot override (0 = auto)', value=0.0, step=0.1, format='%.2f')
 
-                    use_trading_days = st.checkbox('Use trading-day year (252) for T (otherwise calendar 365)', value=False)
+                    use_trading_days = st.checkbox('Use trading-day year (252) for T (otherwise calendar 365)',
+                                                   value=False)
 
                     yahoo_spot = None
                     if use_yahoo_spot:
@@ -1603,7 +1716,8 @@ def main():
                         if yahoo_spot:
                             st.caption(f"Yahoo spot for **{symbol}**: **{float(yahoo_spot):.2f}**")
                         else:
-                            st.caption("Yahoo spot unavailable (network/blocked). Falling back to backend/override spot.")
+                            st.caption(
+                                "Yahoo spot unavailable (network/blocked). Falling back to backend/override spot.")
 
                 spot_for_greeks = None
                 # priority: manual override > yahoo > backend spot
@@ -1613,7 +1727,6 @@ def main():
                     spot_for_greeks = float(yahoo_spot)
                 else:
                     spot_for_greeks = float(spot)
-
 
                     spot_override_val = float(spot_override) if spot_override and float(spot_override) > 0 else None
                     yahoo_spot_val = float(yahoo_spot) if yahoo_spot and float(yahoo_spot) > 0 else None
@@ -1637,7 +1750,8 @@ def main():
                         'Spot used (S)': float(spot_for_greeks) if spot_for_greeks is not None else None,
                     })
                     if use_yahoo_spot and spot_source != 'Yahoo':
-                        st.warning('Yahoo spot was enabled but unavailable, so Greeks are using a fallback spot. Install yfinance or allow Yahoo endpoints if blocked.')
+                        st.warning(
+                            'Yahoo spot was enabled but unavailable, so Greeks are using a fallback spot. Install yfinance or allow Yahoo endpoints if blocked.')
 
                 # Assume equity options expire at market close (4:00pm local) on the selected expiry date
                 _now_ts = pd.Timestamp.now()
@@ -1648,7 +1762,8 @@ def main():
                 else:
                     T = max(float((_exp_ts - _now_ts).total_seconds()) / (365.0 * 24 * 3600), 1e-6)
 
-                fig_iv, fig_greeks, atm = plot_iv_and_greeks(df, spot=spot_for_greeks, T=T, r=float(r_in), q=float(q_in))
+                fig_iv, fig_greeks, atm = plot_iv_and_greeks(df, spot=spot_for_greeks, T=T, r=float(r_in),
+                                                             q=float(q_in))
 
                 if not atm:
                     st.warning("Could not compute ATM snapshot (Strike column missing or invalid).")
@@ -1660,7 +1775,8 @@ def main():
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("Call IV", f"{atm.get('Call IV', float('nan')):.4f}" if "Call IV" in atm else "N/A")
                     m2.metric("Put IV", f"{atm.get('Put IV', float('nan')):.4f}" if "Put IV" in atm else "N/A")
-                    m3.metric("Call Delta", f"{atm.get('Call Delta', float('nan')):.3f}" if "Call Delta" in atm else "N/A")
+                    m3.metric("Call Delta",
+                              f"{atm.get('Call Delta', float('nan')):.3f}" if "Call Delta" in atm else "N/A")
                     m4.metric("Put Delta", f"{atm.get('Put Delta', float('nan')):.3f}" if "Put Delta" in atm else "N/A")
 
                     st.markdown("### 🧠 How to read the Greeks for **this** ATM strike (spot up/down, benefits & risks)")
@@ -1670,16 +1786,19 @@ def main():
                     K = float(atm_strike) if atm_strike is not None else float("nan")
 
                     call_delta = float(atm.get("Call Delta", float("nan"))) if isinstance(atm, dict) else float("nan")
-                    put_delta  = float(atm.get("Put Delta",  float("nan"))) if isinstance(atm, dict) else float("nan")
-                    gamma      = float(atm.get("Gamma",      float("nan"))) if isinstance(atm, dict) else float("nan")
-                    vega       = float(atm.get("Vega",       float("nan"))) if isinstance(atm, dict) else float("nan")  # per 1.00 (100%) IV
-                    call_theta = float(atm.get("Call Theta", float("nan"))) if isinstance(atm, dict) else float("nan")  # per year
-                    put_theta  = float(atm.get("Put Theta",  float("nan"))) if isinstance(atm, dict) else float("nan")  # per year
+                    put_delta = float(atm.get("Put Delta", float("nan"))) if isinstance(atm, dict) else float("nan")
+                    gamma = float(atm.get("Gamma", float("nan"))) if isinstance(atm, dict) else float("nan")
+                    vega = float(atm.get("Vega", float("nan"))) if isinstance(atm, dict) else float(
+                        "nan")  # per 1.00 (100%) IV
+                    call_theta = float(atm.get("Call Theta", float("nan"))) if isinstance(atm, dict) else float(
+                        "nan")  # per year
+                    put_theta = float(atm.get("Put Theta", float("nan"))) if isinstance(atm, dict) else float(
+                        "nan")  # per year
 
                     # Common unit conversions
                     vega_per_1pct = vega / 100.0 if pd.notna(vega) else float("nan")
                     call_theta_per_day = call_theta / 365.0 if pd.notna(call_theta) else float("nan")
-                    put_theta_per_day  = put_theta  / 365.0 if pd.notna(put_theta)  else float("nan")
+                    put_theta_per_day = put_theta / 365.0 if pd.notna(put_theta) else float("nan")
 
                     # Scenario helpers (very rough: "all else equal")
                     def _fmt(x, fmt):
@@ -1689,14 +1808,16 @@ def main():
                             return "N/A"
 
                     dS_1 = 1.0
-                    call_move_up_1  = call_delta * dS_1 if pd.notna(call_delta) else float("nan")
-                    put_move_up_1   = put_delta  * dS_1 if pd.notna(put_delta)  else float("nan")
-                    call_move_dn_1  = -call_delta * dS_1 if pd.notna(call_delta) else float("nan")
-                    put_move_dn_1   = -put_delta  * dS_1 if pd.notna(put_delta)  else float("nan")
+                    call_move_up_1 = call_delta * dS_1 if pd.notna(call_delta) else float("nan")
+                    put_move_up_1 = put_delta * dS_1 if pd.notna(put_delta) else float("nan")
+                    call_move_dn_1 = -call_delta * dS_1 if pd.notna(call_delta) else float("nan")
+                    put_move_dn_1 = -put_delta * dS_1 if pd.notna(put_delta) else float("nan")
 
                     # Gamma effect: delta changes by ~ Gamma * ΔS
-                    call_delta_up_1 = call_delta + gamma * dS_1 if (pd.notna(call_delta) and pd.notna(gamma)) else float("nan")
-                    call_delta_dn_1 = call_delta - gamma * dS_1 if (pd.notna(call_delta) and pd.notna(gamma)) else float("nan")
+                    call_delta_up_1 = call_delta + gamma * dS_1 if (
+                                pd.notna(call_delta) and pd.notna(gamma)) else float("nan")
+                    call_delta_dn_1 = call_delta - gamma * dS_1 if (
+                                pd.notna(call_delta) and pd.notna(gamma)) else float("nan")
 
                     # Vega effect: 1% IV move ≈ vega/100
                     iv_bump_1pct = vega_per_1pct if pd.notna(vega_per_1pct) else float("nan")
@@ -1711,7 +1832,7 @@ def main():
                     - Γ (Gamma): `{_fmt(gamma, '.5f')}`
                     - Vega: `{_fmt(vega, '.3f')}` per 1.00 IV  (**≈ `{_fmt(vega_per_1pct, '.3f')}` per +1% IV**)
                     - Call Θ: `{_fmt(call_theta, '.3f')}`/yr (**≈ `{_fmt(call_theta_per_day, '.3f')}` per day**)
-                    - Put  Θ: `{_fmt(put_theta,  '.3f')}`/yr (**≈ `{_fmt(put_theta_per_day,  '.3f')}` per day**)
+                    - Put  Θ: `{_fmt(put_theta, '.3f')}`/yr (**≈ `{_fmt(put_theta_per_day, '.3f')}` per day**)
                     """)
 
                     st.markdown("#### 📈 If spot moves UP or DOWN (rough P/L impact from Δ)")
@@ -1731,7 +1852,8 @@ def main():
                     - **IV +1%** → option changes about **`{_fmt(iv_bump_1pct, '.3f')}`** (all else equal).
                     - **IV -1%** → loses about the same magnitude.
                     """)
-                    st.write("ATM + longer-dated expiries usually have **bigger Vega**, so IV changes can matter a lot.")
+                    st.write(
+                        "ATM + longer-dated expiries usually have **bigger Vega**, so IV changes can matter a lot.")
 
                     st.markdown("#### ⏳ Theta: the daily rent")
                     st.markdown(f"""
@@ -1748,19 +1870,88 @@ def main():
                     - ⚠️ **Reminder**: These are **“all else equal”** approximations - in real trading, Δ/Γ/Vega/Θ move together.
                     """)
 
-
                     # ---------------- Matrix: multiple spot moves (Delta + Gamma) ----------------
                     st.subheader("📊 Spot Move Matrix (Delta + Gamma)")
                     if pd.notna(call_delta) and pd.notna(put_delta) and pd.notna(gamma) and pd.notna(spot_used):
-                        df_matrix = _build_spot_move_matrix(float(spot_used), float(call_delta), float(put_delta), float(gamma))
+                        df_matrix = _build_spot_move_matrix(float(spot_used), float(call_delta), float(put_delta),
+                                                            float(gamma))
                         # Pretty formatting
                         df_matrix["New Spot"] = df_matrix["New Spot"].map(lambda x: round(float(x), 2))
-                        df_matrix["Call Δ+Γ Est. Change"] = df_matrix["Call Δ+Γ Est. Change"].map(lambda x: round(float(x), 3))
-                        df_matrix["Put Δ+Γ Est. Change"] = df_matrix["Put Δ+Γ Est. Change"].map(lambda x: round(float(x), 3))
+                        df_matrix["Call Δ+Γ Est. Change"] = df_matrix["Call Δ+Γ Est. Change"].map(
+                            lambda x: round(float(x), 3))
+                        df_matrix["Put Δ+Γ Est. Change"] = df_matrix["Put Δ+Γ Est. Change"].map(
+                            lambda x: round(float(x), 3))
                         st.dataframe(df_matrix, use_container_width=True, height=420)
-                        st.caption("Approximation: Δ and Γ are held constant and IV/time are assumed unchanged. Bigger moves = less accurate.")
+                        st.caption(
+                            "Approximation: Δ and Γ are held constant and IV/time are assumed unchanged. Bigger moves = less accurate.")
                     else:
                         st.info("Matrix unavailable (need valid Δ/Γ and spot).")
+
+                    # ---------------- EOD Fibonacci Projection (today open -> spot) ----------------
+                    st.subheader("📌 EOD Fibonacci Projection (today open -> current spot)")
+
+                    today_open = get_today_open_from_yahoo(symbol)
+                    if today_open is None or not (today_open > 0):
+                        st.info(
+                            "Today's open not available from Yahoo. EOD projection uses the best available open; if it stays missing, check network or yfinance.")
+                    else:
+                        # Use the same spot used for greeks (spot_used) if available, otherwise fall back to sidebar spot
+                        try:
+                            S_now = float(spot_used) if pd.notna(spot_used) else float(spot)
+                        except Exception:
+                            S_now = float(spot)
+
+                        O = float(today_open)
+                        direction = "UP" if S_now >= O else "DOWN"
+                        impulse = abs(S_now - O)
+
+                        # Multipliers for extension targets
+                        mults = [1.0, 1.272, 1.618]
+
+                        if impulse <= 0:
+                            st.info(
+                                "Impulse is 0 (spot equals open). EOD projection needs movement to project targets.")
+                        else:
+                            rows = []
+                            for mlt in mults:
+                                if direction == "UP":
+                                    upper = S_now + mlt * impulse
+                                    lower = S_now - mlt * impulse
+                                else:
+                                    lower = S_now - mlt * impulse
+                                    upper = S_now + mlt * impulse
+                                rows.append({
+                                    "Band": f"{mlt:.3f}x",
+                                    "Lower": round(lower, 2),
+                                    "Upper": round(upper, 2),
+                                    "Width ($)": round(upper - lower, 2),
+                                })
+
+                            proj_df = pd.DataFrame(rows)
+
+                            c_e1, c_e2, c_e3 = st.columns(3)
+                            c_e1.metric("Today Open", f"{O:,.2f}")
+                            c_e2.metric("Current Spot", f"{S_now:,.2f}")
+                            c_e3.metric("Impulse |S-O|", f"{impulse:,.2f}")
+
+                            st.dataframe(proj_df, use_container_width=True, height=200)
+                            st.caption(
+                                "Interpretation: Uses today's open to measure the current impulse, then projects symmetric extension bands around spot. These are NOT guarantees - they are reference levels.")
+
+                            # ATR check (daily)
+                            hist_for_atr = get_price_history_from_yahoo(symbol, period="3mo", interval="1d")
+                            atr14 = atr_14_from_history(hist_for_atr)
+                            if atr14 is not None:
+                                atr_low = S_now - atr14
+                                atr_high = S_now + atr14
+                                st.markdown("**ATR(14) reality check (daily expected range):**")
+                                st.write({
+                                    "ATR(14)": round(atr14, 2),
+                                    "ATR Low": round(atr_low, 2),
+                                    "ATR High": round(atr_high, 2),
+                                })
+                                st.caption(
+                                    "ATR band is a sanity check: if EOD extension targets are far beyond ATR, they are less likely without a catalyst.")
 
                     # ---------------- Fibonacci: auto swing ranges from price history ----------------
                     st.subheader("🧵 Fibonacci Range (auto swing by lookback)")
@@ -1800,27 +1991,34 @@ def main():
                                 fib_df["EOD Close"] = eod_close
                                 # dollar and percent distance to the extension "end" levels
                                 fib_df["To Upper 161.8% ($)"] = (fib_df["Upper 161.8% (End)"] - eod_close).round(2)
-                                fib_df["To Upper 161.8% (%)"] = ((fib_df["Upper 161.8% (End)"] / eod_close - 1.0) * 100.0).round(2)
+                                fib_df["To Upper 161.8% (%)"] = (
+                                            (fib_df["Upper 161.8% (End)"] / eod_close - 1.0) * 100.0).round(2)
                                 fib_df["To Lower -61.8% ($)"] = (fib_df["Lower -61.8% (End)"] - eod_close).round(2)
-                                fib_df["To Lower -61.8% (%)"] = ((fib_df["Lower -61.8% (End)"] / eod_close - 1.0) * 100.0).round(2)
+                                fib_df["To Lower -61.8% (%)"] = (
+                                            (fib_df["Lower -61.8% (End)"] / eod_close - 1.0) * 100.0).round(2)
 
                             st.dataframe(fib_df, use_container_width=True, height=260)
-                            st.caption("‘End’ levels are common extension targets from the lookback swing (High + 0.618×Range, Low - 0.618×Range). The EOD columns show distance from the latest daily close.")
+                            st.caption(
+                                "‘End’ levels are common extension targets from the lookback swing (High + 0.618×Range, Low - 0.618×Range). The EOD columns show distance from the latest daily close.")
                         else:
                             st.info("Could not compute fib ranges from history.")
                     else:
-                        st.info("Price history not available - Fibonacci ranges require daily close history (Yahoo/Stooq).")
+                        st.info(
+                            "Price history not available - Fibonacci ranges require daily close history (Yahoo/Stooq).")
 
-                st.caption("This tab uses backend greeks if provided. If greeks are missing, it computes greeks from IV using Black-Scholes (your r/q/spot inputs) and then builds a spot-move matrix + Fibonacci ranges.")
+                st.caption(
+                    "This tab uses backend greeks if provided. If greeks are missing, it computes greeks from IV using Black-Scholes (your r/q/spot inputs) and then builds a spot-move matrix + Fibonacci ranges.")
                 if fig_iv is not None:
                     st_plot(fig_iv)
                 else:
-                    st.info("IV columns not found in your backend payload (look for columns like 'Call IV' / 'Put IV').")
+                    st.info(
+                        "IV columns not found in your backend payload (look for columns like 'Call IV' / 'Put IV').")
 
                 if fig_greeks is not None:
                     st_plot(fig_greeks)
                 else:
-                    st.info("Greeks columns not found (Delta/Gamma/Vega/Theta). If you add them to the backend, this tab will auto-plot them.")
+                    st.info(
+                        "Greeks columns not found (Delta/Gamma/Vega/Theta). If you add them to the backend, this tab will auto-plot them.")
 
                 skew = approx_skew_25d(df)
                 if skew:
@@ -1836,6 +2034,7 @@ def main():
 
     st.markdown("---")
     st.caption("📊 Stats Dashboard | For educational purposes only")
+
 
 if __name__ == "__main__":
     main()

@@ -31,6 +31,26 @@ st.set_page_config(
     layout="wide"
 )
 
+
+# ---------------- Streamlit cache wrapper (avoids TokenError on some Streamlit/Python combos) ----------------
+def safe_cache_data(*dargs, **dkwargs):
+    """A defensive wrapper around st.cache_data.
+
+    On some environments (notably Streamlit Cloud with newer Python),
+    Streamlit may fail to introspect source code for caching and raise
+    tokenize.TokenError/inspect errors at import-time. If that happens,
+    we gracefully disable caching instead of crashing the app.
+    """
+
+    def _decorator(func):
+        try:
+            return st.cache_data(*dargs, **dkwargs)(func)
+        except Exception:
+            return func
+
+    return _decorator
+
+
 # ---------------- Yahoo Finance Spot Helper ----------------
 # Uses Yahoo Finance quote endpoint (via yfinance if installed, else direct HTTP).
 try:
@@ -498,7 +518,7 @@ def check_api() -> bool:
         return False
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@safe_cache_data(ttl=300, show_spinner=False)
 def fetch_options(symbol: str, date: str):
     """GET /options?symbol=...&date=..."""
     try:
@@ -525,7 +545,7 @@ def fetch_options(symbol: str, date: str):
         return {"success": False, "error": str(e), "status_code": 500}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@safe_cache_data(ttl=300, show_spinner=False)
 def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, multiplier: int = 100):
     """GET /weekly/summary?symbol=...&date=...&spot=..."""
     try:
@@ -553,7 +573,7 @@ def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, m
         return {"success": False, "error": str(e), "status_code": 500}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@safe_cache_data(ttl=300, show_spinner=False)
 def fetch_weekly_gex(symbol: str, date: str, spot: float, r: float = 0.05, multiplier: int = 100):
     """GET /weekly/gex?symbol=...&date=...&spot=..."""
     try:
@@ -1137,7 +1157,7 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     return out[["Close"]]
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@safe_cache_data(ttl=900, show_spinner=False)
 def fetch_price_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     raw = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
     return _normalize_yf_df(raw)

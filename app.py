@@ -1,3 +1,75 @@
+
+def _pick_first_series(obj):
+    """If obj is a DataFrame (e.g., duplicate columns), return its first column as a Series."""
+    import pandas as pd
+    if isinstance(obj, pd.DataFrame):
+        if obj.shape[1] >= 1:
+            return obj.iloc[:, 0]
+        return pd.Series(dtype="float64")
+    return obj
+
+
+def get_close_series(hist):
+    """
+    Return a 1-D numeric Close Series from many possible yfinance shapes.
+    """
+    import pandas as pd
+    if hist is None:
+        return pd.Series(dtype="float64")
+
+    # Series input
+    if isinstance(hist, pd.Series):
+        s = pd.to_numeric(hist, errors="coerce")
+        return s.dropna()
+
+    h = hist.copy()
+    if getattr(h, "empty", True):
+        return pd.Series(dtype="float64")
+
+    # Normalize column labels
+    try:
+        if not isinstance(h.columns, pd.MultiIndex):
+            h.columns = [str(c).strip() for c in h.columns]
+    except Exception:
+        pass
+
+    # Direct Close
+    if "Close" in getattr(h, "columns", []):
+        s = _pick_first_series(h["Close"])
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        return s
+
+    # Variants
+    for cand in ["Adj Close", "adj close", "close", "AdjClose", "adjclose"]:
+        if cand in getattr(h, "columns", []):
+            s = _pick_first_series(h[cand])
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            return s
+
+    # MultiIndex
+    try:
+        if isinstance(h.columns, pd.MultiIndex):
+            close_cols = [c for c in h.columns if any("close" in str(level).lower() for level in c)]
+            if close_cols:
+                s = _pick_first_series(h[close_cols[0]])
+                s = pd.to_numeric(s, errors="coerce").dropna()
+                return s
+    except Exception:
+        pass
+
+    # Last resort: any column containing 'close'
+    try:
+        close_like = [c for c in h.columns if "close" in str(c).lower()]
+        if close_like:
+            s = _pick_first_series(h[close_like[0]])
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            return s
+    except Exception:
+        pass
+
+    return pd.Series(dtype="float64")
+
+
 # -*- coding: utf-8 -*-
 """
 Barchart Options Dashboard - Streamlit Frontend
@@ -134,7 +206,7 @@ def atr_14_from_history(hist_df: pd.DataFrame) -> float | None:
     if all(c in dfh.columns for c in ["High", "Low", "Close"]):
         hi = pd.to_numeric(dfh["High"], errors="coerce")
         lo = pd.to_numeric(dfh["Low"], errors="coerce")
-        cl = pd.to_numeric(dfh["Close"], errors="coerce")
+        cl = pd.to_numeric(_pick_first_series(dfh['Close']), errors='coerce')
         prev_cl = cl.shift(1)
 
         tr = pd.concat([
@@ -149,7 +221,7 @@ def atr_14_from_history(hist_df: pd.DataFrame) -> float | None:
 
     # Fallback: average absolute close change
     if "Close" in dfh.columns:
-        cl = pd.to_numeric(dfh["Close"], errors="coerce").dropna()
+        cl = pd.to_numeric(_pick_first_series(dfh['Close']), errors='coerce').dropna()
         if len(cl) >= 6:
             atr = cl.diff().abs().rolling(14, min_periods=5).mean().iloc[-1]
             if pd.notna(atr) and float(atr) > 0:
@@ -1152,8 +1224,8 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Close" not in out.columns:
         return pd.DataFrame()
 
-    out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
-    out = out.dropna(subset=["Close"])
+    out["Close"] = pd.to_numeric(_pick_first_series(out['Close']), errors='coerce')
+    out = out
     return out[["Close"]]
 
 
@@ -1417,6 +1489,775 @@ def plot_filters(df_prices: pd.DataFrame, length_md: int, kama_er: int, kama_fas
 # -----------------------------
 # Main App
 # -----------------------------
+# ---------------- PRO EDGE HELPERS (Trend / IV / Vanna / Charm / Levels) ----------------
+
+def _slope(series: pd.Series, lookback: int = 5) -> float:
+    """Simple slope proxy: last - value N bars ago."""
+    try:
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        if len(s) <= lookback:
+            return float("nan")
+        return float(s.iloc[-1] - s.iloc[-1 - lookback])
+    except Exception:
+        return float("nan")
+
+
+def compute_ma_stack_and_regime(hist) -> dict:
+    """
+    Compute MA stacking, slopes, and a trend regime label from DAILY history.
+
+    This version is bulletproof against:
+    - MultiIndex columns (yfinance can return ('Close','AAPL'))
+    - Adj Close only
+    - lowercase close
+    - Series input
+    - weird provider schemas
+
+    It ALWAYS rebuilds a clean DataFrame with a single 'Close' column.
+    """
+    out = {"ok": False, "label": "N/A", "strength": 0, "details": {}}
+
+    if hist is None:
+        return out
+
+    # -----------------------------
+    # 1) Extract a CLOSE series safely
+    # -----------------------------
+    close_series = None
+
+    # If it's already a Series
+    if isinstance(hist, pd.Series):
+        close_series = hist.copy()
+
+    # If it's a DataFrame
+    elif isinstance(hist, pd.DataFrame) and len(hist) > 0:
+        h = hist.copy()
+
+        # Normalize non-multiindex column names (strip spaces)
+        if not isinstance(h.columns, pd.MultiIndex):
+            try:
+                h.columns = [str(c).strip() for c in h.columns]
+            except Exception:
+                pass
+
+        # Case A: normal columns
+        for candidate in ["Close", "Adj Close", "close", "adj close", "AdjClose", "adjclose"]:
+            if candidate in h.columns:
+                close_series = h[candidate]
+                break
+
+        # Case B: MultiIndex columns (e.g. ('Close','AAPL'))
+        if close_series is None and isinstance(h.columns, pd.MultiIndex):
+            # try to find any column whose level-0 name is close/adj close
+            pick = None
+            for c in h.columns:
+                try:
+                    lvl0 = str(c[0]).strip().lower()
+                except Exception:
+                    continue
+                if lvl0 in ("close", "adj close", "adjclose"):
+                    pick = c
+                    break
+            if pick is not None:
+                close_series = h[pick]
+
+        # Case C: last resort: any column containing 'close'
+        if close_series is None:
+            try:
+                close_like = [c for c in h.columns if "close" in str(c).lower()]
+                if close_like:
+                    close_series = h[close_like[0]]
+            except Exception:
+                pass
+
+    # Nothing usable found
+    if close_series is None:
+        out["details"]["error"] = "Could not find a Close series in hist_daily."
+        return out
+
+    # If we got a DF instead of Series (rare), flatten it
+    if isinstance(close_series, pd.DataFrame):
+        if close_series.shape[1] == 0:
+            out["details"]["error"] = "Close selection returned empty DataFrame."
+            return out
+        close_series = close_series.iloc[:, 0]
+
+    # Force numeric + clean
+    close_series = pd.to_numeric(close_series, errors="coerce")
+
+    # -----------------------------
+    # 2) Rebuild clean DataFrame (prevents KeyError forever)
+    # -----------------------------
+    h = pd.DataFrame({"Close": close_series}).dropna()
+
+    # Need enough bars for MA60 at least (and ideally SMA200)
+    if len(h) < 210:
+        out["details"]["error"] = f"Not enough daily bars: {len(h)} (need ~210 for SMA200)."
+        return out
+
+    close = h["Close"]
+
+    # -----------------------------
+    # 3) Moving averages
+    # -----------------------------
+    for w in [20, 50, 200]:
+        h[f"SMA{w}"] = close.rolling(w).mean()
+
+    short_windows = [15, 20, 30, 45, 60]
+    for w in short_windows:
+        h[f"MA{w}"] = close.rolling(w).mean()
+
+    last = h.iloc[-1]
+    c = float(last["Close"])
+
+    sma20 = float(last["SMA20"])
+    sma50 = float(last["SMA50"])
+    sma200 = float(last["SMA200"])
+
+    # slopes over 10 bars
+    def slope(col: str, lookback: int = 10) -> float:
+        a = h[col].iloc[-1]
+        b = h[col].iloc[-lookback - 1]
+        return float(a - b)
+
+    s20 = slope("SMA20")
+    s50 = slope("SMA50")
+    s200 = slope("SMA200")
+
+    up_slopes = sum(1 for v in (s20, s50, s200) if np.isfinite(v) and v > 0)
+    dn_slopes = sum(1 for v in (s20, s50, s200) if np.isfinite(v) and v < 0)
+
+    # stacking (macro)
+    bull_stack = (c > sma20 > sma50 > sma200)
+    bear_stack = (c < sma20 < sma50 < sma200)
+
+    # short stack (weekly-friendly)
+    ma_vals = [float(last[f"MA{w}"]) for w in short_windows]
+
+    def is_desc(vals):
+        return all(vals[i] > vals[i + 1] for i in range(len(vals) - 1))
+
+    def is_asc(vals):
+        return all(vals[i] < vals[i + 1] for i in range(len(vals) - 1))
+
+    short_bull_stack = is_desc(ma_vals)
+    short_bear_stack = is_asc(ma_vals)
+
+    # strength score
+    strength = 0
+    strength += 30 if bull_stack else 0
+    strength += 30 if bear_stack else 0
+    strength += 20 if short_bull_stack else 0
+    strength += 20 if short_bear_stack else 0
+    strength += 15 if up_slopes >= 2 else 0
+    strength += 15 if dn_slopes >= 2 else 0
+    strength += 10 if (c > sma200 and not bear_stack) else 0
+    strength += 10 if (c < sma200 and not bull_stack) else 0
+    strength = int(min(100, strength))
+
+    # label
+    if bull_stack and up_slopes >= 2:
+        label = "STRONG UPTREND 📈"
+    elif bear_stack and dn_slopes >= 2:
+        label = "STRONG DOWNTREND 📉"
+    elif c > sma200:
+        label = "WEAK / CHOPPY UPTREND ⚠️"
+    elif c < sma200:
+        label = "WEAK / CHOPPY DOWNTREND ⚠️"
+    else:
+        label = "NO TREND 😴"
+
+    out["ok"] = True
+    out["label"] = label
+    out["strength"] = strength
+    out["details"] = {
+        "close": c,
+        "SMA20": sma20, "SMA50": sma50, "SMA200": sma200,
+        "slope20_10": s20, "slope50_10": s50, "slope200_10": s200,
+        "bull_stack": bool(bull_stack), "bear_stack": bool(bear_stack),
+        "short_bull_stack": bool(short_bull_stack), "short_bear_stack": bool(short_bear_stack),
+    }
+    return out
+
+    # --- slope over last 10 bars (simple) ---
+    def slope(col: str, lookback: int = 10) -> float:
+        if col not in h.columns or len(h) <= lookback:
+            return float("nan")
+        a = h[col].iloc[-1]
+        b = h[col].iloc[-lookback-1]
+        try:
+            return float(a - b)
+        except Exception:
+            return float("nan")
+
+    s20 = slope("SMA20")
+    s50 = slope("SMA50")
+    s200 = slope("SMA200")
+
+    up_slopes = sum([1 for v in (s20, s50, s200) if pd.notna(v) and v > 0])
+    dn_slopes = sum([1 for v in (s20, s50, s200) if pd.notna(v) and v < 0])
+
+    # --- stacking ---
+    bull_stack = pd.notna(sma20) and pd.notna(sma50) and pd.notna(sma200) and (c > sma20 > sma50 > sma200)
+    bear_stack = pd.notna(sma20) and pd.notna(sma50) and pd.notna(sma200) and (c < sma20 < sma50 < sma200)
+
+    ma_cols = [f"MA{w}" for w in short_windows]
+    ma_vals = [last.get(col, np.nan) for col in ma_cols]
+
+    def is_desc(vals):
+        for i in range(len(vals)-1):
+            if not (pd.notna(vals[i]) and pd.notna(vals[i+1]) and float(vals[i]) > float(vals[i+1])):
+                return False
+        return True
+
+    def is_asc(vals):
+        for i in range(len(vals)-1):
+            if not (pd.notna(vals[i]) and pd.notna(vals[i+1]) and float(vals[i]) < float(vals[i+1])):
+                return False
+        return True
+
+    short_bull_stack = is_desc(ma_vals)
+    short_bear_stack = is_asc(ma_vals)
+
+    # --- strength score (0-100) ---
+    strength = 0
+    strength += 30 if bull_stack else 0
+    strength += 30 if bear_stack else 0
+    strength += 20 if short_bull_stack else 0
+    strength += 20 if short_bear_stack else 0
+    strength += 15 if up_slopes >= 2 else 0
+    strength += 15 if dn_slopes >= 2 else 0
+    # price vs 200 as macro filter
+    strength += 10 if (pd.notna(sma200) and c > sma200 and not bear_stack) else 0
+    strength += 10 if (pd.notna(sma200) and c < sma200 and not bull_stack) else 0
+    strength = int(min(100, strength))
+
+    if bull_stack and up_slopes >= 2:
+        label = "STRONG UPTREND 📈"
+    elif bear_stack and dn_slopes >= 2:
+        label = "STRONG DOWNTREND 📉"
+    elif pd.notna(sma200) and c > sma200:
+        label = "WEAK / CHOPPY UPTREND ⚠️"
+    elif pd.notna(sma200) and c < sma200:
+        label = "WEAK / CHOPPY DOWNTREND ⚠️"
+    else:
+        label = "NO TREND 😴"
+
+    out["ok"] = True
+    out["label"] = label
+    out["strength"] = strength
+    out["details"] = {
+        "close": c,
+        "SMA20": sma20, "SMA50": sma50, "SMA200": sma200,
+        "slope20_10": s20, "slope50_10": s50, "slope200_10": s200,
+        "bull_stack": bool(bull_stack), "bear_stack": bool(bear_stack),
+        "short_bull_stack": bool(short_bull_stack), "short_bear_stack": bool(short_bear_stack),
+    }
+    return out
+
+def realized_vol_annualized(hist: pd.DataFrame, window: int = 20) -> float:
+    """Annualized realized vol using log returns (daily)."""
+    if hist is None or hist.empty or "Close" not in hist.columns or len(hist) < window + 2:
+        return float("nan")
+    h = hist.copy()
+    c = pd.to_numeric(_pick_first_series(h['Close']), errors='coerce').dropna()
+    r = np.log(c / c.shift(1)).dropna()
+    rv = r.rolling(window).std() * math.sqrt(252)
+    try:
+        return float(rv.iloc[-1])
+    except Exception:
+        return float("nan")
+
+
+def iv_proxy_rank(current_iv: float, hist: pd.DataFrame, window: int = 20) -> dict:
+    """
+    IV Rank is hard to do for free without historical option IV series.
+    This returns a *proxy* rank by comparing current IV to the last year's realized vol range.
+    """
+    out = {"ok": False, "iv_proxy_rank": None, "rv_min": None, "rv_max": None, "details": {}}
+
+    if hist is None or hist.empty or not (current_iv and current_iv > 0):
+        return out
+
+    h = hist.copy()
+
+    # Normalize MultiIndex / duplicate columns so we can reliably extract Close as a 1-D series
+    if isinstance(getattr(h, "columns", None), pd.MultiIndex):
+        col_map = {}
+        for col in h.columns:
+            for target in ["Close", "Adj Close", "close", "adj close"]:
+                if target not in col_map and any(str(x).strip().lower() == target.lower() for x in col):
+                    col_map[target] = col
+        for target, tup in col_map.items():
+            try:
+                h[target] = h[tup]
+            except Exception:
+                pass
+
+    close_obj = None
+    for candidate in ["Close", "Adj Close", "close", "adj close", "AdjClose", "adjclose"]:
+        if candidate in h.columns:
+            close_obj = h[candidate]
+            break
+
+    if close_obj is None:
+        out["details"]["error"] = "Close column not found."
+        out["details"]["columns"] = str(list(getattr(h, "columns", [])))
+        return out
+
+    # If selection yields a DataFrame (duplicate column name), take first column
+    if isinstance(close_obj, pd.DataFrame):
+        if close_obj.shape[1] == 0:
+            out["details"]["error"] = "Close selection returned empty DataFrame."
+            return out
+        close_obj = close_obj.iloc[:, 0]
+
+    c = pd.to_numeric(close_obj, errors="coerce").dropna()
+    if c.empty:
+        out["details"]["error"] = "Close series empty after numeric coercion."
+        return out
+
+    r = np.log(c / c.shift(1)).dropna()
+    rv = r.rolling(window).std() * math.sqrt(252)
+    rv = rv.dropna()
+    if rv.empty:
+        return out
+
+    rv_min = float(rv.min())
+    rv_max = float(rv.max())
+    if rv_max == rv_min:
+        rank = 50.0
+    else:
+        rank = 100.0 * (float(current_iv) - rv_min) / (rv_max - rv_min)
+        rank = max(0.0, min(100.0, rank))
+
+    out.update({"ok": True, "iv_proxy_rank": float(rank), "rv_min": rv_min, "rv_max": rv_max})
+    return out
+
+
+def _norm_pdf(x: float) -> float:
+    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
+
+
+def _norm_cdf(x: float) -> float:
+    # Abramowitz & Stegun approximation (good enough for dashboard)
+    t = 1.0 / (1.0 + 0.2316419 * abs(x))
+    d = 0.3989423 * math.exp(-x * x / 2.0)
+    prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + 1.330274 * t))))
+    return 1.0 - prob if x > 0 else prob
+
+
+def bs_delta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return float("nan")
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    if is_call:
+        return _norm_cdf(d1)
+    return _norm_cdf(d1) - 1.0
+
+
+def bs_vanna_charm(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> dict:
+    """
+    Approximate Vanna and Charm for a single option using Black-Scholes.
+    - Vanna: dDelta/dVol (per 1.0 change in vol, e.g. +0.01 = 1 vol point)
+    - Charm: dDelta/dt (per year). We also provide per day.
+    Notes: This is an approximation (equity-style), but good for directional flow intuition.
+    """
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return {"delta": float("nan"), "vanna": float("nan"), "charm_per_year": float("nan"), "charm_per_day": float("nan")}
+
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    pdf = _norm_pdf(d1)
+
+    delta = bs_delta(S, K, T, r, sigma, is_call)
+
+    # Common vanna approximation (per 1.0 vol change). Convert to per 1 vol point by /100 later if needed.
+    vanna = pdf * (1.0 - d1 / (sigma * sqrtT)) / sigma
+
+    # Charm approximation (per year)
+    # Call charm = -pdf * (2rT - d2*sigma*sqrtT) / (2T*sigma*sqrtT)
+    # Put charm  = call charm (same core term) because delta differs by -1
+    charm = -pdf * (2.0 * r * T - d2 * sigma * sqrtT) / (2.0 * T * sigma * sqrtT)
+
+    return {
+        "delta": float(delta),
+        "vanna": float(vanna),
+        "charm_per_year": float(charm),
+        "charm_per_day": float(charm / 365.0),
+    }
+
+
+def compute_key_levels(hist_daily: pd.DataFrame) -> dict:
+    """Prior day + last 5 days (weekly) levels."""
+    out = {'ok': False, 'details': {}}
+    if hist_daily is None or hist_daily.empty:
+        return out
+    h = hist_daily.copy()
+    # Normalize MultiIndex columns from yfinance (e.g., ("Close","AAPL") or ("AAPL","Close"))
+    if isinstance(h.columns, pd.MultiIndex):
+        col_map = {}
+        for col in h.columns:
+            for target in ["Open", "High", "Low", "Close", "Volume"]:
+                if target not in col_map and any(str(x).lower() == target.lower() for x in col):
+                    col_map[target] = col
+        for target, col_tup in col_map.items():
+            try:
+                h[target] = h[col_tup]
+            except Exception:
+                # If assignment fails, skip and let subsequent checks handle missing data
+                pass
+
+    if "Date" not in h.columns:
+        h = h.reset_index().rename(columns={"index": "Date"})
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in h.columns:
+            # Ensure we have a single Series (not a DataFrame) before numeric conversion
+            col_val = h[col]
+            if isinstance(col_val, pd.DataFrame):
+                col_val = col_val.iloc[:, 0]
+            h[col] = pd.to_numeric(col_val, errors="coerce")
+
+    # Ensure we have a usable Close column (handle variants like 'Adj Close', lowercase, or provider-specific names)
+    if "Close" not in h.columns:
+        # Try common alternatives first
+        for candidate in ["Close", "Adj Close", "close", "adj close", "AdjClose", "adjclose"]:
+            if candidate in h.columns:
+                h["Close"] = h[candidate]
+                break
+
+        # Last resort: any column containing the word 'close'
+        if "Close" not in h.columns:
+            try:
+                close_like = [c for c in h.columns if "close" in str(c).lower()]
+                if close_like:
+                    h["Close"] = h[close_like[0]]
+            except Exception:
+                pass
+
+    # If still missing, return a clear error instead of raising KeyError
+    if "Close" not in h.columns:
+        out["details"]["error"] = "Could not find a Close series in hist_daily."
+        return out
+
+    # Ensure Close is a single 1-D Series and numeric, then drop rows without it
+    close_val = h["Close"]
+    # If it's a DataFrame, pick a single sensible column
+    if isinstance(close_val, pd.DataFrame):
+        if close_val.shape[1] == 1:
+            close_val = close_val.iloc[:, 0]
+        else:
+            # Prefer numeric dtype columns when available
+            try:
+                numeric_cols = close_val.select_dtypes(include=["number"]).columns.tolist()
+                if numeric_cols:
+                    close_val = close_val[numeric_cols[0]]
+                else:
+                    close_val = close_val.iloc[:, 0]
+            except Exception:
+                close_val = close_val.iloc[:, 0]
+
+    # If series elements themselves are sequences (e.g., lists/arrays), try to extract first element
+    if isinstance(close_val, pd.Series):
+        try:
+            if close_val.apply(lambda x: hasattr(x, "__len__") and not isinstance(x, (str, bytes))).any():
+                close_val = close_val.apply(lambda x: x[0] if hasattr(x, "__len__") and not isinstance(x, (str, bytes)) else x)
+        except Exception:
+            pass
+
+    # Coerce to numeric and try to assign the Close column robustly
+    try:
+        numeric_close = pd.to_numeric(close_val, errors="coerce")
+    except Exception as e:
+        out["details"]["error"] = f"Failed to coerce Close to numeric: {e}"
+        return out
+
+    try:
+        # Preferred way: use .loc to set a top-level 'Close' column
+        h.loc[:, "Close"] = numeric_close
+    except Exception:
+        # Fallback: concat a new single-level 'Close' column DataFrame
+        try:
+            h = pd.concat([h.copy(), pd.DataFrame({"Close": numeric_close}, index=h.index)], axis=1)
+        except Exception as e:
+            out["details"]["error"] = f"Could not set Close column in hist_daily: {e}"
+            return out
+
+    # Ensure Close actually exists before calling dropna
+    if "Close" not in h.columns:
+        out["details"]["error"] = "Could not set Close column in hist_daily."
+        out["details"]["columns"] = str(list(h.columns))
+        out["details"]["type"] = str(type(h))
+        return out
+
+    # Safely drop NaNs from Close (catch KeyError if columns are unexpected)
+    try:
+        h = h
+    except KeyError as e:
+        out["details"]["error"] = f"dropna(subset=['Close']) failed: {e}"
+        out["details"]["columns"] = str(list(h.columns))
+        out["details"]["type"] = str(type(h))
+        try:
+            out["details"]["sample"] = h.head(5).to_dict()
+        except Exception:
+            pass
+        return out
+
+    try:
+        h = h.sort_values("Date")
+    except Exception as e:
+        out["details"]["error"] = f"sort_values('Date') failed: {e}"
+        out["details"]["columns"] = str(list(h.columns))
+        return out
+
+    if len(h) < 2:
+        return out
+
+    prev = h.iloc[-2]
+    last5 = h.tail(5)
+
+    out.update({
+        "ok": True,
+        "prev_high": float(prev.get("High", float("nan"))),
+        "prev_low": float(prev.get("Low", float("nan"))),
+        "prev_close": float(prev.get("Close", float("nan"))),
+        "wk_high": float(last5["High"].max()) if "High" in last5.columns else float("nan"),
+        "wk_low": float(last5["Low"].min()) if "Low" in last5.columns else float("nan"),
+    })
+    return out
+
+
+@safe_cache_data(ttl=120, show_spinner=False)
+def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
+    raw = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    df = raw.copy()
+
+    # --- Normalize MultiIndex columns from yfinance (e.g., ("Close","AAPL")) ---
+    if isinstance(df.columns, pd.MultiIndex):
+        col_map = {}
+        for col in df.columns:
+            for target in ["Open", "High", "Low", "Close", "Volume", "Adj Close"]:
+                if target not in col_map and any(str(x).strip().lower() == target.lower() for x in col):
+                    col_map[target] = col
+        for target, tup in col_map.items():
+            try:
+                df[target] = df[tup]
+            except Exception:
+                pass
+
+    df = df.reset_index()
+
+    # Normalize columns to strings
+    try:
+        df.columns = [str(c).strip() for c in df.columns]
+    except Exception:
+        df.columns = [str(c) for c in df.columns]
+
+    # Ensure Close exists (handle variants)
+    if "Close" not in df.columns:
+        for candidate in ["Adj Close", "close", "adj close", "AdjClose", "adjclose"]:
+            if candidate in df.columns:
+                df["Close"] = df[candidate]
+                break
+
+    # Last resort: first column containing 'close'
+    if "Close" not in df.columns:
+        close_like = [c for c in df.columns if "close" in str(c).lower()]
+        if close_like:
+            df["Close"] = df[close_like[0]]
+
+    if "Close" not in df.columns:
+        return pd.DataFrame()
+
+    # Coerce numerics and ensure 1-D Series (not a DataFrame)
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df.columns:
+            v = df[col]
+            if isinstance(v, pd.DataFrame):
+                v = v.iloc[:, 0] if v.shape[1] else pd.Series(dtype=float)
+            df[col] = pd.to_numeric(v, errors="coerce")
+
+    df = df
+    return df
+
+
+def compute_opening_range(intra: pd.DataFrame, minutes: int = 30) -> dict:
+    """Opening range for the most recent session in intraday dataframe."""
+    out = {'ok': False, 'details': {}}
+    if intra is None or intra.empty:
+        return out
+    df = intra.copy()
+    # Find the last session date
+    dt_col = "Datetime" if "Datetime" in df.columns else ("Date" if "Date" in df.columns else df.columns[0])
+    df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+    df = df.dropna(subset=[dt_col, "Close"])
+    df["session_date"] = df[dt_col].dt.date
+    last_day = df["session_date"].max()
+    d = df[df["session_date"] == last_day].copy()
+    if d.empty:
+        return out
+    d = d.sort_values(dt_col)
+
+    # Market open approximation: first bar in dataset
+    start = d.iloc[0][dt_col]
+    end = start + pd.Timedelta(minutes=minutes)
+    or_df = d[(d[dt_col] >= start) & (d[dt_col] < end)]
+    if or_df.empty:
+        return out
+
+    out.update({
+        "ok": True,
+        "session_date": str(last_day),
+        "or_high": float(or_df["High"].max()) if "High" in or_df.columns else float("nan"),
+        "or_low": float(or_df["Low"].min()) if "Low" in or_df.columns else float("nan"),
+        "last_close": float(d.iloc[-1]["Close"]),
+    })
+    return out
+
+
+def _as_1d_series(x):
+    """Ensure a 1-D Series (handles 1-col DataFrame / duplicate-col selection)."""
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] >= 1:
+            x = x.iloc[:, 0]
+        else:
+            return pd.Series(dtype=float)
+    return x if isinstance(x, pd.Series) else pd.Series(x)
+
+
+def structure_label(hist_daily: pd.DataFrame, lookback: int = 40) -> dict:
+    """Simple HH/HL vs LH/LL structure using swing points.
+
+    Robust to:
+      - MultiIndex columns (yfinance)
+      - duplicate column names (Close/High/Low returning a DataFrame)
+      - Close-only inputs (falls back gracefully)
+    """
+    out = {"ok": False, "label": "N/A"}
+    if hist_daily is None or hist_daily.empty:
+        return out
+
+    h = hist_daily.copy()
+
+    # If MultiIndex columns, flatten to strings like "Close AAPL"
+    if isinstance(h.columns, pd.MultiIndex):
+        h.columns = [" ".join([str(v) for v in tup if v is not None]).strip() for tup in h.columns]
+
+    # Strip column labels
+    try:
+        h.columns = [str(c).strip() for c in h.columns]
+    except Exception:
+        pass
+
+    # Remove duplicated column names (prevents h["High"] returning a DataFrame)
+    if getattr(h.columns, "duplicated", None) is not None and h.columns.duplicated().any():
+        h = h.loc[:, ~h.columns.duplicated(keep="first")]
+
+    # If Date not present, try to recover it from index
+    if "Date" not in h.columns:
+        h = h.reset_index().rename(columns={"index": "Date"})
+
+    # Ensure we have required columns; if not, try common alternates
+    if "High" not in h.columns or "Low" not in h.columns or "Close" not in h.columns:
+        # yfinance sometimes uses "Adj Close"
+        if "Close" not in h.columns:
+            for alt in ["Adj Close", "adj close", "close", "Adj_Close", "adjclose"]:
+                if alt in h.columns:
+                    h["Close"] = h[alt]
+                    break
+
+    # Hard requirement: need High/Low/Close for pivots
+    if not all(c in h.columns for c in ["High", "Low", "Close"]):
+        return out
+
+    h = h.sort_values("Date").tail(int(lookback)).reset_index(drop=True)
+
+    # Numeric conversion (force 1-D)
+    for c in ["High", "Low", "Close"]:
+        s = _as_1d_series(h[c])
+        h[c] = pd.to_numeric(s, errors="coerce")
+
+    h = h.dropna(subset=["High", "Low", "Close"])
+    if len(h) < 10:
+        return out
+
+    # Pivot detection
+    win = 2
+    piv_hi = []
+    piv_lo = []
+    for i in range(win, len(h) - win):
+        hi = float(h.loc[i, "High"])
+        lo = float(h.loc[i, "Low"])
+        if hi == float(h["High"].iloc[i-win:i+win+1].max()):
+            piv_hi.append((i, hi))
+        if lo == float(h["Low"].iloc[i-win:i+win+1].min()):
+            piv_lo.append((i, lo))
+
+    piv_hi = piv_hi[-3:]
+    piv_lo = piv_lo[-3:]
+
+    label = "RANGE / UNCLEAR 😴"
+    if len(piv_hi) >= 2 and len(piv_lo) >= 2:
+        hh = piv_hi[-1][1] > piv_hi[-2][1]
+        hl = piv_lo[-1][1] > piv_lo[-2][1]
+        lh = piv_hi[-1][1] < piv_hi[-2][1]
+        ll = piv_lo[-1][1] < piv_lo[-2][1]
+        if hh and hl:
+            label = "BULL STRUCTURE 📈 (HH + HL)"
+        elif lh and ll:
+            label = "BEAR STRUCTURE 📉 (LH + LL)"
+        elif hh and not hl:
+            label = "RISKY UPTREND ⚠️ (HH but no HL)"
+        elif ll and not lh:
+            label = "RISKY DOWNTREND ⚠️ (LL but no LH)"
+
+    out.update({
+        "ok": True,
+        "label": label,
+        "pivot_highs": piv_hi,
+        "pivot_lows": piv_lo,
+    })
+    return out
+
+
+def build_trade_bias(trend_label: str, gex_regime: str, iv_rank_proxy: float | None) -> str:
+    """Simple trade bias text. Educational only."""
+    bias = []
+    if "UPTREND" in trend_label:
+        bias.append("Bias: **Bullish** → favor call spreads / put sells (defined risk).")
+    elif "DOWNTREND" in trend_label:
+        bias.append("Bias: **Bearish** → favor put spreads / call sells (defined risk).")
+    else:
+        bias.append("Bias: **Neutral/Chop** → favor premium-selling structures (iron condor / butterflies) when IV is elevated.")
+
+    if "NEGATIVE" in gex_regime:
+        bias.append("GEX regime: **Negative gamma** → expect faster moves + whipsaws; size smaller, use defined risk.")
+    elif "PIN" in gex_regime:
+        bias.append("GEX regime: **Pin/Mean-revert** → mean-reversion near big strikes can work better than breakouts.")
+
+    if iv_rank_proxy is not None:
+        if iv_rank_proxy >= 70:
+            bias.append("IV is **high** (proxy) → buying naked options is harder; spreads/premium-selling often fit better.")
+        elif iv_rank_proxy <= 30:
+            bias.append("IV is **low** (proxy) → directional option buying can be more reasonable (still manage risk).")
+
+    return "\n".join(bias)
+
+
+def confidence_score(trend_strength: int, structure_ok: bool, vol_ok: bool, gex_ok: bool, or_ok: bool) -> int:
+    score = 0
+    score += min(40, int(trend_strength * 0.4))
+    score += 15 if structure_ok else 0
+    score += 15 if vol_ok else 0
+    score += 20 if gex_ok else 0
+    score += 10 if or_ok else 0
+    return int(min(100, score))
+
 def main():
     st.markdown(
         """
@@ -1545,8 +2386,8 @@ def main():
 
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}** expiring **{date}**")
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(
-            ["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters", "🧮 Volatility & Greeks"]
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+            ["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters", "🧮 Volatility & Greeks", "🏆 Pro Edge"]
         )
 
         with tab1:
@@ -2049,6 +2890,290 @@ def main():
                         f"- **Skew (Call IV - Put IV)**: **{skew['skew_call_minus_put']:.4f}**"
                     )
                     st.caption("Skew helps you see if downside protection (puts) is getting expensive vs upside calls.")
+        with tab6:
+            st.subheader("🏆 Pro Edge (Trend + Volatility + Flow + Levels)")
+
+            st.caption(
+                "This page combines multiple *free* signals (trend, IV, structure, levels, and gamma regime) into a simple checklist + confidence score. "
+                "Educational use only — not financial advice."
+            )
+
+            # ---------------- Resolve spot ----------------
+            try:
+                spot_now = float(spot_override) if spot_override and float(spot_override) > 0 else None
+            except Exception:
+                spot_now = None
+            if spot_now is None:
+                try:
+                    spot_now = float(yahoo_spot) if yahoo_spot and float(yahoo_spot) > 0 else None
+                except Exception:
+                    spot_now = None
+            if spot_now is None:
+                try:
+                    spot_now = float(spot) if spot is not None and str(spot).strip() != "" else None
+                except Exception:
+                    spot_now = None
+
+            if spot_now is None or spot_now <= 0:
+                st.warning("Spot price is not available. Enter a manual spot to unlock all calculations.")
+                st.stop()
+
+            # ---------------- Price history (daily) ----------------
+            if hist_df is None or hist_df.empty:
+                # fallback daily history
+                try:
+                    hist_daily = fetch_price_history(symbol, period="1y", interval="1d")
+                    if "Date" not in hist_daily.columns:
+                        hist_daily = hist_daily.reset_index().rename(columns={"index": "Date"})
+                except Exception:
+                    hist_daily = pd.DataFrame()
+            else:
+                hist_daily = hist_df.copy()
+
+            # Ensure daily OHLCV if available via yfinance (for levels/volume)
+            if hist_daily is not None and not hist_daily.empty:
+                # If only Close exists, refresh with OHLCV
+                need_ohlc = not set(["Open", "High", "Low", "Volume"]).issubset(set(hist_daily.columns))
+                if need_ohlc:
+                    try:
+                        raw = yf.download(symbol, period="6mo", interval="1d", auto_adjust=False, progress=False)
+                        hist_daily = raw.reset_index()
+                    except Exception:
+                        pass
+
+            # ---------------- Trend regime (MAs) ----------------
+            ma = compute_ma_stack_and_regime(hist_daily)
+            if ma["ok"]:
+                c1, c2, c3 = st.columns([1.6, 1, 1])
+                with c1:
+                    st.markdown("### Trend (Moving Averages)")
+                    st.write(ma["label"])
+                with c2:
+                    st.metric("Trend strength", f"{ma['strength']}/100")
+                with c3:
+                    rv20 = realized_vol_annualized(hist_daily, window=20)
+                    st.metric("Realized vol (20d)", f"{rv20:.2%}" if pd.notna(rv20) else "N/A")
+            else:
+                st.warning("Not enough daily history to compute MA regime (need more candles).")
+
+            # ---------------- Structure (HH/HL) ----------------
+            st.markdown("### Structure (HH/HL vs LH/LL)")
+            struct = structure_label(hist_daily, lookback=50)
+            if struct["ok"]:
+                st.write(struct["label"])
+                with st.expander("Show recent swing pivots", expanded=False):
+                    st.write({"pivot_highs": struct.get("pivot_highs"), "pivot_lows": struct.get("pivot_lows")})
+            else:
+                st.info("Structure label unavailable (insufficient candles).")
+
+            # ---------------- Levels (support/resistance) ----------------
+            st.markdown("### Key Levels (Support/Resistance)")
+            lvl = compute_key_levels(hist_daily)
+            if lvl["ok"]:
+                level_df = pd.DataFrame([{
+                    "Prev High": lvl["prev_high"],
+                    "Prev Low": lvl["prev_low"],
+                    "Prev Close": lvl["prev_close"],
+                    "Weekly High (5d)": lvl["wk_high"],
+                    "Weekly Low (5d)": lvl["wk_low"],
+                }])
+                st_df(level_df, height=80)
+
+                # Distance from spot
+                try:
+                    dist_df = pd.DataFrame([{
+                        "Spot": spot_now,
+                        "To Prev High": lvl["prev_high"] - spot_now,
+                        "To Prev Low": spot_now - lvl["prev_low"],
+                        "To Wk High": lvl["wk_high"] - spot_now,
+                        "To Wk Low": spot_now - lvl["wk_low"],
+                    }])
+                    st_df(dist_df, height=80)
+                except Exception:
+                    pass
+            else:
+                st.info("Levels unavailable.")
+
+            # ---------------- Intraday Opening Range (30m) ----------------
+            st.markdown("### Opening Range (first 30 minutes)")
+            intra = fetch_intraday(symbol, period="5d", interval="5m")
+            orr = compute_opening_range(intra, minutes=30)
+            if orr["ok"]:
+                or_high = orr["or_high"]
+                or_low = orr["or_low"]
+                st.write(f"Session: **{orr['session_date']}** | OR High: **{or_high:.2f}** | OR Low: **{or_low:.2f}**")
+                if spot_now > or_high:
+                    st.success("OR Breakout ↑ (spot above OR high)")
+                elif spot_now < or_low:
+                    st.error("OR Breakdown ↓ (spot below OR low)")
+                else:
+                    st.info("Inside Opening Range (chop risk)")
+            else:
+                st.info("Intraday data not available (this can happen on Streamlit Cloud / Yahoo blocks).")
+
+            # ---------------- Gamma regime (GEX) ----------------
+            st.markdown("### Gamma Regime (from your weekly GEX tab)")
+            net_gex = None
+            try:
+                net_gex = float(totals.get("net_gex", totals.get("Net GEX", float("nan"))))
+            except Exception:
+                net_gex = None
+
+            if net_gex is None or (isinstance(net_gex, float) and pd.isna(net_gex)):
+                st.info("Weekly GEX totals not available from backend for this symbol/expiry.")
+                gex_regime = "UNKNOWN"
+            else:
+                if net_gex < 0:
+                    gex_regime = "NEGATIVE GAMMA 💥 (fast moves / whipsaws)"
+                    st.error(f"{gex_regime} | Net GEX: {net_gex:,.0f}")
+                elif net_gex > 0:
+                    gex_regime = "POSITIVE GAMMA 🧱 (pin / mean-revert risk)"
+                    st.success(f"{gex_regime} | Net GEX: {net_gex:,.0f}")
+                else:
+                    gex_regime = "NEUTRAL GAMMA"
+                    st.write(f"{gex_regime} | Net GEX: {net_gex:,.0f}")
+
+            # ---------------- IV + Vanna + Charm (approx) ----------------
+            st.markdown("### IV + Vanna + Charm (Approx)")
+            atm_iv = None
+
+            # 1) Try from your loaded chain df
+            try:
+                if not df.empty and "Strike" in df.columns:
+                    tmp = df.copy()
+                    tmp["Strike"] = pd.to_numeric(tmp["Strike"], errors="coerce")
+                    tmp = tmp.dropna(subset=["Strike"])
+                    tmp["dist"] = (tmp["Strike"] - float(spot_now)).abs()
+                    atm_row = tmp.sort_values("dist").iloc[0]
+                    c_iv = pd.to_numeric(atm_row.get("Call IV", np.nan), errors="coerce")
+                    p_iv = pd.to_numeric(atm_row.get("Put IV", np.nan), errors="coerce")
+                    if pd.notna(c_iv) and pd.notna(p_iv):
+                        atm_iv = float((c_iv + p_iv) / 2.0)
+                    elif pd.notna(c_iv):
+                        atm_iv = float(c_iv)
+                    elif pd.notna(p_iv):
+                        atm_iv = float(p_iv)
+            except Exception:
+                pass
+
+            # 2) Fallback: yfinance option chain (if available)
+            if atm_iv is None:
+                try:
+                    tkr = yf.Ticker(symbol)
+                    oc = tkr.option_chain(date)
+                    calls = oc.calls.copy()
+                    puts = oc.puts.copy()
+                    calls["dist"] = (pd.to_numeric(calls["strike"], errors="coerce") - float(spot_now)).abs()
+                    puts["dist"] = (pd.to_numeric(puts["strike"], errors="coerce") - float(spot_now)).abs()
+                    c_atm = calls.sort_values("dist").iloc[0]
+                    p_atm = puts.sort_values("dist").iloc[0]
+                    civ = float(c_atm.get("impliedVolatility", float("nan")))
+                    piv = float(p_atm.get("impliedVolatility", float("nan")))
+                    if pd.notna(civ) and pd.notna(piv):
+                        atm_iv = float((civ + piv) / 2.0)
+                except Exception:
+                    pass
+
+            if atm_iv is None or atm_iv <= 0:
+                st.warning("ATM IV not available (free feeds sometimes block this). IV/Vanna/Charm section will be limited.")
+                iv_rank = {"ok": False}
+                iv_rank_proxy = None
+            else:
+                iv_rank = iv_proxy_rank(atm_iv, hist_daily, window=20)
+                iv_rank_proxy = float(iv_rank["iv_proxy_rank"]) if iv_rank.get("ok") else None
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("ATM IV", f"{atm_iv:.2%}")
+                with c2:
+                    st.metric("IV Rank (proxy)", f"{iv_rank_proxy:.0f}/100" if iv_rank_proxy is not None else "N/A")
+                with c3:
+                    rv = realized_vol_annualized(hist_daily, window=20)
+                    st.metric("RV20 vs IV", f"{rv/atm_iv:.2f}x" if (pd.notna(rv) and atm_iv > 0) else "N/A")
+
+                # Vanna/Charm for ATM option (call+put average)
+                try:
+                    expiry_dt = datetime.strptime(date, "%Y-%m-%d")
+                    expiry_dt = expiry_dt.replace(hour=16, minute=0, second=0)
+                    now_dt = datetime.now(TZ)
+                    T = max(0.0, (expiry_dt - now_dt).total_seconds() / (365.0 * 24 * 3600))
+                    K = float(round(spot_now))  # proxy ATM strike
+                    r = 0.04  # rough default risk-free rate
+                    call_vc = bs_vanna_charm(spot_now, K, T, r, atm_iv, True)
+                    put_vc = bs_vanna_charm(spot_now, K, T, r, atm_iv, False)
+
+                    vanna_avg = (call_vc["vanna"] + put_vc["vanna"]) / 2.0
+                    charm_day_avg = (call_vc["charm_per_day"] + put_vc["charm_per_day"]) / 2.0
+
+                    st.write({
+                        "ATM strike (proxy K)": K,
+                        "T (years)": round(T, 4),
+                        "Delta (call)": round(call_vc["delta"], 4),
+                        "Delta (put)": round(put_vc["delta"], 4),
+                        "Vanna (avg)": round(vanna_avg, 6),
+                        "Charm per day (avg)": round(charm_day_avg, 6),
+                    })
+                    st.caption("Interpretation: Vanna relates to hedging flows when IV changes; Charm relates to delta drift as time passes (strong near expiry).")
+                except Exception:
+                    st.info("Vanna/Charm not computed (date/time parsing issue).")
+
+            # ---------------- Volume confirmation (daily) ----------------
+            st.markdown("### Volume Confirmation (daily)")
+            vol_ok = False
+            try:
+                if "Volume" in hist_daily.columns:
+                    v = pd.to_numeric(hist_daily["Volume"], errors="coerce").dropna()
+                    if len(v) >= 21:
+                        v_last = float(v.iloc[-1])
+                        v_avg = float(v.iloc[-21:-1].mean())
+                        vol_ok = v_last > v_avg
+                        st.write({"Last volume": v_last, "20d avg (prev)": v_avg, "Above avg?": vol_ok})
+            except Exception:
+                pass
+            if not vol_ok:
+                st.caption("If volume is below average, breakouts can fail more often (chop risk).")
+
+            # ---------------- Trade bias + checklist ----------------
+            st.markdown("### Trade Bias + Checklist")
+            trend_label = ma["label"] if ma.get("ok") else "N/A"
+            bias_text = build_trade_bias(trend_label, gex_regime, iv_rank_proxy)
+            st.markdown(bias_text)
+
+            checklist = []
+            trend_ok = ("UPTREND" in trend_label) or ("DOWNTREND" in trend_label)
+            structure_ok = struct.get("ok") and ("BULL STRUCTURE" in struct.get("label", "") or "BEAR STRUCTURE" in struct.get("label", ""))
+            gex_ok = (gex_regime != "UNKNOWN")
+            or_ok = bool(orr.get("ok")) and (spot_now > orr.get("or_high", float("inf")) or spot_now < orr.get("or_low", float("-inf")))
+
+            # IV suitability (proxy)
+            if iv_rank_proxy is None:
+                iv_ok = False
+            else:
+                # For weeklies: mid IV is often easiest; very high IV = prefer spreads, very low IV = prefer buying
+                iv_ok = 30 <= iv_rank_proxy <= 80
+
+            checklist.append(("Trend regime defined", trend_ok))
+            checklist.append(("Structure confirms (HH/HL or LH/LL)", structure_ok))
+            checklist.append(("Key levels computed", lvl.get("ok", False)))
+            checklist.append(("Opening range signal available", orr.get("ok", False)))
+            checklist.append(("Volume above average", vol_ok))
+            checklist.append(("GEX regime available", gex_ok))
+            checklist.append(("IV data available", iv_rank_proxy is not None))
+
+            chk_df = pd.DataFrame([{"Item": k, "OK": v} for k, v in checklist])
+            st_df(chk_df, height=260)
+
+            score = confidence_score(ma.get("strength", 0), structure_ok, iv_ok, gex_ok, or_ok)
+            st.markdown("### Confidence Score (0–100)")
+            st.metric("Score", score)
+
+            if score >= 70:
+                st.success("Higher alignment across signals (still manage risk).")
+            elif score >= 45:
+                st.warning("Mixed alignment — trade smaller or wait for cleaner setup.")
+            else:
+                st.error("Low alignment — chop/uncertainty risk is high. Consider waiting.")
+
     else:
         st.info("👆 Enter symbol/date/spot and click **Fetch Data**.")
 

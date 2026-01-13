@@ -8,8 +8,10 @@ services:
     environment:
       - TZ=UTC
       - PYTHONUNBUFFERED=1
+      - SPOT_TTL_SECONDS=15
+      - BROWSER_CONCURRENCY=1
     # Chrome needs extra shared memory
-    shm_size: '2gb'
+    shm_size: "2gb"
     # Security options for Chrome
     security_opt:
       - seccomp:unconfined

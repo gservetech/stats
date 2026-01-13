@@ -76,6 +76,8 @@ _OPTIONS_CACHE = {}  # (symbol,date) -> {"ts": float, "rows": list}
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 _SPOT_CACHE = {}  # (symbol,date) -> {"ts": float, "data": dict}
 SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
+_BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "1"))
+_BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
 
 
 async def get_rows_cached(symbol: str, date: str):
@@ -339,64 +341,65 @@ async def scrape_options(symbol: str, date: str):
         elif "/proxies/core-api/v1/options-expirations/get" in resp_url and "expirations" not in captured_requests:
             captured_requests["expirations"] = (params.get("requestId"), resp_url)
 
-    options = build_chrome_options()
+    async with _BROWSER_SEMAPHORE:
+        options = build_chrome_options()
 
-    print("[INFO] Starting browser (headless mode)...")
-    print("[INFO] Chrome binary:", getattr(options, "binary_location", None) or "(auto-detect)")
+        print("[INFO] Starting browser (headless mode)...")
+        print("[INFO] Chrome binary:", getattr(options, "binary_location", None) or "(auto-detect)")
 
-    async with Chrome(options=options) as browser:
-        tab = await browser.start()
+        async with Chrome(options=options) as browser:
+            tab = await browser.start()
 
-        await tab.enable_network_events()
-        await tab.on("Network.responseReceived", on_response)
+            await tab.enable_network_events()
+            await tab.on("Network.responseReceived", on_response)
 
-        try:
-            await tab.go_to(url)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
+            try:
+                await tab.go_to(url)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
 
-        print("[INFO] Waiting for network requests (max 45s)...")
-        for i in range(45):
-            await asyncio.sleep(1)
-            if "options" in captured_requests:
-                await asyncio.sleep(3)
-                break
+            print("[INFO] Waiting for network requests (max 45s)...")
+            for i in range(45):
+                await asyncio.sleep(1)
+                if "options" in captured_requests:
+                    await asyncio.sleep(3)
+                    break
 
-        if "options" not in captured_requests:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Options data not found for {symbol} on {date}. "
-                    f"Verify symbol + expiration date, or Barchart may be blocking headless requests."
+            if "options" not in captured_requests:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Options data not found for {symbol} on {date}. "
+                        f"Verify symbol + expiration date, or Barchart may be blocking headless requests."
+                    )
                 )
-            )
 
-        request_id, _api_url = captured_requests["options"]
+            request_id, _api_url = captured_requests["options"]
 
-        try:
-            body_data = await tab.get_network_response_body(request_id)
+            try:
+                body_data = await tab.get_network_response_body(request_id)
 
-            if isinstance(body_data, dict):
-                body = body_data.get("body", "")
-                if body_data.get("base64Encoded"):
-                    body = base64.b64decode(body).decode("utf-8", errors="ignore")
-            else:
-                body = body_data
+                if isinstance(body_data, dict):
+                    body = body_data.get("body", "")
+                    if body_data.get("base64Encoded"):
+                        body = base64.b64decode(body).decode("utf-8", errors="ignore")
+                else:
+                    body = body_data
 
-            opt_json = json.loads(body)
-            rows = process_options_data(opt_json)
+                opt_json = json.loads(body)
+                rows = process_options_data(opt_json)
 
-            if not rows:
-                raise HTTPException(status_code=404, detail=f"No options data found for {symbol} on {date}.")
+                if not rows:
+                    raise HTTPException(status_code=404, detail=f"No options data found for {symbol} on {date}.")
 
-            return rows
+                return rows
 
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to parse options data: {str(e)}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=500, detail=f"Failed to parse options data: {str(e)}")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
 
 
 async def _query_text_any(tab, selectors: list[str]) -> str | None:
@@ -417,95 +420,103 @@ async def _query_text_any(tab, selectors: list[str]) -> str | None:
 
 async def scrape_spot(symbol: str, date: str | None):
     symbol_q = quote(symbol, safe="")
-    if date:
-        url = f"https://www.barchart.com/stocks/quotes/{symbol_q}/options?expiration={date}&view=sbs"
-    else:
-        url = f"https://www.barchart.com/stocks/quotes/{symbol_q}"
+    quote_url = f"https://www.barchart.com/stocks/quotes/{symbol_q}"
+    options_url = f"https://www.barchart.com/stocks/quotes/{symbol_q}/options?expiration={date}&view=sbs" if date else None
+    urls = [options_url, quote_url] if options_url else [quote_url]
 
-    print(f"[INFO] Scraping spot: {url}")
-    options = build_chrome_options()
+    last_error: Exception | None = None
 
-    async with Chrome(options=options) as browser:
-        tab = await browser.start()
+    async with _BROWSER_SEMAPHORE:
+        options = build_chrome_options()
 
-        try:
-            await tab.go_to(url)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
+        async with Chrome(options=options) as browser:
+            tab = await browser.start()
 
-        price_text = None
-        for _ in range(30):
-            await asyncio.sleep(1)
-            price_text = await _query_text_any(
-                tab,
-                [
-                    "span.last-change[data-ng-class*='lastPrice']",
-                    ".pricechangerow span.last-change",
-                ],
-            )
-            if price_text:
-                break
+            for url in urls:
+                if not url:
+                    continue
+                print(f"[INFO] Scraping spot: {url}")
+                try:
+                    await tab.go_to(url)
+                except Exception as e:
+                    last_error = e
+                    continue
 
-        if not price_text:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Spot price not found for {symbol} (page may be blocked).",
-            )
+                price_text = None
+                for _ in range(30):
+                    await asyncio.sleep(1)
+                    price_text = await _query_text_any(
+                        tab,
+                        [
+                            "span.last-change[data-ng-class*='lastPrice']",
+                            ".pricechangerow span.last-change",
+                        ],
+                    )
+                    if price_text:
+                        break
 
-        change_text = await _query_text_any(
-            tab,
-            [
-                "span.last-change[data-ng-class*='priceChange']",
-                ".pricechangerow span.last-change.up",
-                ".pricechangerow span.last-change.down",
-            ],
-        )
-        percent_text = await _query_text_any(
-            tab,
-            [
-                "span[data-ng-class*='percentChange']",
-            ],
-        )
-        trade_time = await _query_text_any(
-            tab,
-            [
-                ".pricechangerow span.symbol-trade-time[data-ng-class*='tradeTime']",
-                ".pricechangerow span.symbol-trade-time",
-            ],
-        )
-        exchange = await _query_text_any(
-            tab,
-            [
-                ".pricechangerow span.symbol-trade-time + span.symbol-trade-time",
-            ],
-        )
-        session = await _query_text_any(
-            tab,
-            [
-                ".realtime-title-wrapper .session",
-            ],
-        )
-        bid_text = await _query_text_any(tab, [".ask-bid-data .bid"])
-        ask_text = await _query_text_any(tab, [".ask-bid-data .ask"])
+                if not price_text:
+                    last_error = Exception("Spot price element not found")
+                    continue
 
-        spot = _to_float(price_text, None)
-        change = _to_float(change_text, None)
-        percent_change = _to_float(percent_text, None)
+                change_text = await _query_text_any(
+                    tab,
+                    [
+                        "span.last-change[data-ng-class*='priceChange']",
+                        ".pricechangerow span.last-change.up",
+                        ".pricechangerow span.last-change.down",
+                    ],
+                )
+                percent_text = await _query_text_any(
+                    tab,
+                    [
+                        "span[data-ng-class*='percentChange']",
+                    ],
+                )
+                trade_time = await _query_text_any(
+                    tab,
+                    [
+                        ".pricechangerow span.symbol-trade-time[data-ng-class*='tradeTime']",
+                        ".pricechangerow span.symbol-trade-time",
+                    ],
+                )
+                exchange = await _query_text_any(
+                    tab,
+                    [
+                        ".pricechangerow span.symbol-trade-time + span.symbol-trade-time",
+                    ],
+                )
+                session = await _query_text_any(
+                    tab,
+                    [
+                        ".realtime-title-wrapper .session",
+                    ],
+                )
+                bid_text = await _query_text_any(tab, [".ask-bid-data .bid"])
+                ask_text = await _query_text_any(tab, [".ask-bid-data .ask"])
 
-        return {
-            "url": url,
-            "spot": spot,
-            "spot_text": price_text,
-            "change": change,
-            "change_text": change_text,
-            "percent_change": percent_change,
-            "percent_text": percent_text,
-            "trade_time": trade_time,
-            "exchange": exchange,
-            "session": session,
-            "bid_text": bid_text,
-            "ask_text": ask_text,
-        }
+                spot = _to_float(price_text, None)
+                change = _to_float(change_text, None)
+                percent_change = _to_float(percent_text, None)
+
+                return {
+                    "url": url,
+                    "spot": spot,
+                    "spot_text": price_text,
+                    "change": change,
+                    "change_text": change_text,
+                    "percent_change": percent_change,
+                    "percent_text": percent_text,
+                    "trade_time": trade_time,
+                    "exchange": exchange,
+                    "session": session,
+                    "bid_text": bid_text,
+                    "ask_text": ask_text,
+                }
+
+    if last_error:
+        raise HTTPException(status_code=500, detail=f"Failed to load page: {str(last_error)}")
+    raise HTTPException(status_code=404, detail=f"Spot price not found for {symbol}.")
 
 
 # ---------------- Gamma / GEX helpers ----------------
@@ -612,6 +623,7 @@ async def health():
         "chrome_binary": os.getenv("CHROME_BINARY", ""),
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "spot_ttl_seconds": SPOT_TTL_SECONDS,
+        "browser_concurrency": _BROWSER_CONCURRENCY,
     }
 
 

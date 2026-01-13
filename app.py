@@ -2340,6 +2340,8 @@ def main():
         date = expiry_date.isoformat()
         if "spot_input" not in st.session_state:
             st.session_state["spot_input"] = 260.00
+        if "spot_input_pending" in st.session_state:
+            st.session_state["spot_input"] = float(st.session_state.pop("spot_input_pending"))
 
         use_live_spot = st.checkbox("Use live Barchart spot (recommended)", value=True)
         auto_refresh_spot = st.checkbox("Auto-refresh spot", value=True)
@@ -2364,12 +2366,16 @@ def main():
             spot_date = str(spot_data.get("date") or "")
             if spot_symbol != symbol or spot_date != date:
                 spot_data = None
+                st.session_state["spot_error"] = None
 
         should_fetch_spot = False
         if use_live_spot and api_ok and symbol and auto_refresh_spot and allow_auto_spot:
-            last_ts = float(st.session_state.get("spot_last_ts", 0.0))
-            if (time.time() - last_ts) >= float(refresh_seconds):
+            if spot_data is None and not st.session_state.get("spot_error"):
                 should_fetch_spot = True
+            else:
+                last_ts = float(st.session_state.get("spot_last_ts", 0.0))
+                if (time.time() - last_ts) >= float(refresh_seconds):
+                    should_fetch_spot = True
 
         if use_live_spot and api_ok and symbol and should_fetch_spot:
             spot_quote = fetch_spot_quote(symbol, date)
@@ -2470,7 +2476,7 @@ def main():
                 spot_val = spot_data.get("spot")
                 if spot_val is not None:
                     spot_for_fetch = float(spot_val)
-                    st.session_state["spot_input"] = float(spot_val)
+                    st.session_state["spot_input_pending"] = float(spot_val)
             else:
                 st.session_state["spot_error"] = spot_quote.get("error")
 

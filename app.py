@@ -105,6 +105,7 @@ API_BASE_URL = "https://api.kdsinsured.com"
 import os
 import re
 import math
+import time
 import datetime as dt
 import numpy as np
 import streamlit as st
@@ -2344,22 +2345,55 @@ def main():
         auto_refresh_spot = st.checkbox("Auto-refresh spot", value=True)
         refresh_seconds = st.number_input("Spot refresh interval (sec)", min_value=3, max_value=60, value=10, step=1)
 
+        if "spot_data" not in st.session_state:
+            st.session_state["spot_data"] = None
+        if "spot_last_ts" not in st.session_state:
+            st.session_state["spot_last_ts"] = 0.0
+        if "spot_error" not in st.session_state:
+            st.session_state["spot_error"] = None
+
         live_spot = None
-        if use_live_spot and api_ok and symbol:
+        spot_data = st.session_state.get("spot_data")
+        last_fetch = st.session_state.get("last_fetch")
+        allow_auto_spot = True
+        if last_fetch and (last_fetch.get("symbol") == symbol and last_fetch.get("date") == date):
+            allow_auto_spot = False
+
+        if spot_data:
+            spot_symbol = str(spot_data.get("symbol", "")).upper().strip()
+            spot_date = str(spot_data.get("date") or "")
+            if spot_symbol != symbol or spot_date != date:
+                spot_data = None
+
+        should_fetch_spot = False
+        if use_live_spot and api_ok and symbol and auto_refresh_spot and allow_auto_spot:
+            last_ts = float(st.session_state.get("spot_last_ts", 0.0))
+            if (time.time() - last_ts) >= float(refresh_seconds):
+                should_fetch_spot = True
+
+        if use_live_spot and api_ok and symbol and should_fetch_spot:
             spot_quote = fetch_spot_quote(symbol, date)
+            st.session_state["spot_last_ts"] = time.time()
             if spot_quote.get("success"):
-                data = spot_quote.get("data", {})
-                live_spot = data.get("spot")
+                spot_data = spot_quote.get("data", {})
+                st.session_state["spot_data"] = spot_data
+                st.session_state["spot_error"] = None
+            else:
+                st.session_state["spot_error"] = spot_quote.get("error")
+
+        if use_live_spot and api_ok and symbol:
+            if spot_data:
+                live_spot = spot_data.get("spot")
                 if live_spot is not None:
                     st.session_state["spot_input"] = float(live_spot)
 
-                spot_label = data.get("spot_text")
+                spot_label = spot_data.get("spot_text")
                 spot_meta = " ".join(
                     part for part in [
-                        data.get("change_text"),
-                        data.get("percent_text"),
-                        data.get("trade_time"),
-                        data.get("exchange"),
+                        spot_data.get("change_text"),
+                        spot_data.get("percent_text"),
+                        spot_data.get("trade_time"),
+                        spot_data.get("exchange"),
                     ]
                     if part
                 ).strip()
@@ -2371,7 +2405,11 @@ def main():
                 else:
                     st.caption("Barchart spot: available (display value missing).")
             else:
-                st.caption("Barchart spot: unavailable (using manual spot).")
+                err = st.session_state.get("spot_error")
+                if err:
+                    st.caption(f"Barchart spot: unavailable ({err})")
+                else:
+                    st.caption("Barchart spot: unavailable (using manual spot).")
         elif use_live_spot and not api_ok:
             st.caption("Barchart spot: backend offline (using manual spot).")
 
@@ -2380,11 +2418,11 @@ def main():
 
         fetch_btn = st_btn("🔄 Fetch Data", disabled=not api_ok)
 
-        if auto_refresh_spot and st_autorefresh is not None and not st.session_state.get("last_fetch") and not fetch_btn:
+        if auto_refresh_spot and st_autorefresh is not None and allow_auto_spot and not fetch_btn:
             st_autorefresh(interval=int(refresh_seconds * 1000), key="spot_autorefresh")
         elif auto_refresh_spot and st_autorefresh is None:
             st.caption("Auto-refresh requires streamlit-autorefresh.")
-        elif auto_refresh_spot and (st.session_state.get("last_fetch") or fetch_btn):
+        elif auto_refresh_spot and ((not allow_auto_spot) or fetch_btn):
             st.caption("Auto-refresh paused after Fetch Data to avoid interrupting scraping.")
 
         st.markdown("---")
@@ -2416,8 +2454,27 @@ def main():
             f"`uvicorn api:app --port 8000 --reload`"
         )
         return
+    options_result = None
+    weekly_result = None
+    fetch_error = None
 
-    if fetch_btn or st.session_state.get("last_fetch"):
+    if fetch_btn:
+        spot_for_fetch = spot
+        if use_live_spot and api_ok and symbol:
+            spot_quote = fetch_spot_quote(symbol, date)
+            if spot_quote.get("success"):
+                spot_data = spot_quote.get("data", {})
+                st.session_state["spot_data"] = spot_data
+                st.session_state["spot_last_ts"] = time.time()
+                st.session_state["spot_error"] = None
+                spot_val = spot_data.get("spot")
+                if spot_val is not None:
+                    spot_for_fetch = float(spot_val)
+                    st.session_state["spot_input"] = float(spot_val)
+            else:
+                st.session_state["spot_error"] = spot_quote.get("error")
+
+        spot = float(spot_for_fetch) if spot_for_fetch is not None else float(spot_input)
         st.session_state["last_fetch"] = {"symbol": symbol, "date": date, "spot": spot}
 
         with st.spinner(f"Scraping {symbol} options for {date}..."):
@@ -2427,11 +2484,27 @@ def main():
             weekly_result = fetch_weekly_summary(symbol, date, spot)
 
         if not options_result.get("success"):
-            st.error(f"Options error: {options_result.get('error')}")
-            return
-        if not weekly_result.get("success"):
-            st.error(f"Weekly summary error: {weekly_result.get('error')}")
-            return
+            fetch_error = f"Options error: {options_result.get('error')}"
+        elif not weekly_result.get("success"):
+            fetch_error = f"Weekly summary error: {weekly_result.get('error')}"
+        else:
+            st.session_state["options_result"] = options_result
+            st.session_state["weekly_result"] = weekly_result
+            st.session_state["spot_at_fetch"] = spot
+
+    if options_result is None:
+        options_result = st.session_state.get("options_result")
+    if weekly_result is None:
+        weekly_result = st.session_state.get("weekly_result")
+
+    if fetch_error:
+        st.error(fetch_error)
+
+    if options_result and weekly_result:
+        spot = st.session_state.get("spot_at_fetch", spot)
+        last_fetch = st.session_state.get("last_fetch")
+        if last_fetch and (last_fetch.get("symbol") != symbol or last_fetch.get("date") != date):
+            st.warning("Inputs changed - click Fetch Data to refresh results.")
 
         api_data = options_result["data"]
         df = pd.DataFrame(api_data.get("data", []))

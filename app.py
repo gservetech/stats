@@ -2356,10 +2356,6 @@ def main():
 
         live_spot = None
         spot_data = st.session_state.get("spot_data")
-        last_fetch = st.session_state.get("last_fetch")
-        allow_auto_spot = True
-        if last_fetch and (last_fetch.get("symbol") == symbol and last_fetch.get("date") == date):
-            allow_auto_spot = False
 
         if spot_data:
             spot_symbol = str(spot_data.get("symbol", "")).upper().strip()
@@ -2369,7 +2365,7 @@ def main():
                 st.session_state["spot_error"] = None
 
         should_fetch_spot = False
-        if use_live_spot and api_ok and symbol and auto_refresh_spot and allow_auto_spot:
+        if use_live_spot and api_ok and symbol and auto_refresh_spot:
             if spot_data is None and not st.session_state.get("spot_error"):
                 should_fetch_spot = True
             else:
@@ -2424,12 +2420,12 @@ def main():
 
         fetch_btn = st_btn("🔄 Fetch Data", disabled=not api_ok)
 
-        if auto_refresh_spot and st_autorefresh is not None and allow_auto_spot and not fetch_btn:
+        if auto_refresh_spot and st_autorefresh is not None and not fetch_btn:
             st_autorefresh(interval=int(refresh_seconds * 1000), key="spot_autorefresh")
         elif auto_refresh_spot and st_autorefresh is None:
             st.caption("Auto-refresh requires streamlit-autorefresh.")
-        elif auto_refresh_spot and ((not allow_auto_spot) or fetch_btn):
-            st.caption("Auto-refresh paused after Fetch Data to avoid interrupting scraping.")
+        elif auto_refresh_spot and fetch_btn:
+            st.caption("Auto-refresh paused while Fetch Data runs.")
 
         st.markdown("---")
         st.markdown("### 🔥 Quick Symbols")

@@ -87,6 +87,7 @@ API_BASE_URL = "https://api.kdsinsured.com"
 import os
 import re
 import math
+import datetime as dt
 import numpy as np
 import streamlit as st
 import pandas as pd
@@ -97,11 +98,15 @@ from plotly.subplots import make_subplots
 # -----------------------------
 # Page configuration (MUST be the first Streamlit call)
 # -----------------------------
-st.set_page_config(
-    page_title="Stats Dashboard",
-    page_icon="📊",
-    layout="wide"
-)
+try:
+    st.set_page_config(
+        page_title="Stats Dashboard",
+        page_icon="📊",
+        layout="wide"
+    )
+except st.errors.StreamlitAPIException:
+    # Avoid crashing if another Streamlit command ran before config (e.g., reloads).
+    pass
 
 
 # ---------------- Streamlit cache wrapper (avoids TokenError on some Streamlit/Python combos) ----------------
@@ -2276,7 +2281,13 @@ def main():
         st.markdown("## 🔍 Options Query")
 
         symbol = st.text_input("Symbol", value="AAPL").upper().strip()
-        date = st.text_input("Expiration Date", value="2026-01-16", help="Format: YYYY-MM-DD (ex: 2026-01-16)")
+        default_expiry = dt.date.fromisoformat("2026-01-16")
+        expiry_date = st.date_input(
+            "Expiration Date",
+            value=default_expiry,
+            help="Pick the option expiry date.",
+        )
+        date = expiry_date.isoformat()
         spot_input = st.number_input("Spot Price (manual fallback)", value=260.00, step=0.50)
         use_yahoo_spot = st.checkbox("Use live Yahoo spot (recommended)", value=True)
         yahoo_spot = get_spot_from_yahoo(symbol) if use_yahoo_spot else None

@@ -74,6 +74,8 @@ app.add_middleware(
 # ---------------- Cache (avoid double-scraping) ----------------
 _OPTIONS_CACHE = {}  # (symbol,date) -> {"ts": float, "rows": list}
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+_SPOT_CACHE = {}  # (symbol,date) -> {"ts": float, "data": dict}
+SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
 
 
 async def get_rows_cached(symbol: str, date: str):
@@ -87,6 +89,19 @@ async def get_rows_cached(symbol: str, date: str):
     rows = await scrape_options(symbol, date)
     _OPTIONS_CACHE[key] = {"ts": now, "rows": rows}
     return rows
+
+
+async def get_spot_cached(symbol: str, date: str | None):
+    key = (symbol.upper().strip(), (date or "").strip())
+    now = time()
+
+    hit = _SPOT_CACHE.get(key)
+    if hit and (now - hit["ts"]) < SPOT_TTL_SECONDS:
+        return hit["data"]
+
+    data = await scrape_spot(symbol, date)
+    _SPOT_CACHE[key] = {"ts": now, "data": data}
+    return data
 
 
 # ---------------- JSON Sanitizer (fix NaN/Inf) ----------------
@@ -139,9 +154,12 @@ def _to_float(val, default=None):
         return default
 
 
-def _to_int(val, default=0):
+def _to_int(val, default: int | float | str | None = 0) -> int:
     f = _to_float(val, None)
-    return int(round(f)) if f is not None else default
+    if f is not None:
+        return int(round(f))
+    d = _to_float(default, None)
+    return int(round(d)) if d is not None else 0
 
 
 def _fmt_price(x):
@@ -381,6 +399,115 @@ async def scrape_options(symbol: str, date: str):
             raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
 
 
+async def _query_text_any(tab, selectors: list[str]) -> str | None:
+    for selector in selectors:
+        try:
+            el = await tab.query(selector, timeout=0, raise_exc=False)
+        except Exception:
+            el = None
+        if el:
+            try:
+                text = (await el.text).strip()
+            except Exception:
+                text = ""
+            if text:
+                return text
+    return None
+
+
+async def scrape_spot(symbol: str, date: str | None):
+    symbol_q = quote(symbol, safe="")
+    if date:
+        url = f"https://www.barchart.com/stocks/quotes/{symbol_q}/options?expiration={date}&view=sbs"
+    else:
+        url = f"https://www.barchart.com/stocks/quotes/{symbol_q}"
+
+    print(f"[INFO] Scraping spot: {url}")
+    options = build_chrome_options()
+
+    async with Chrome(options=options) as browser:
+        tab = await browser.start()
+
+        try:
+            await tab.go_to(url)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
+
+        price_text = None
+        for _ in range(30):
+            await asyncio.sleep(1)
+            price_text = await _query_text_any(
+                tab,
+                [
+                    "span.last-change[data-ng-class*='lastPrice']",
+                    ".pricechangerow span.last-change",
+                ],
+            )
+            if price_text:
+                break
+
+        if not price_text:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Spot price not found for {symbol} (page may be blocked).",
+            )
+
+        change_text = await _query_text_any(
+            tab,
+            [
+                "span.last-change[data-ng-class*='priceChange']",
+                ".pricechangerow span.last-change.up",
+                ".pricechangerow span.last-change.down",
+            ],
+        )
+        percent_text = await _query_text_any(
+            tab,
+            [
+                "span[data-ng-class*='percentChange']",
+            ],
+        )
+        trade_time = await _query_text_any(
+            tab,
+            [
+                ".pricechangerow span.symbol-trade-time[data-ng-class*='tradeTime']",
+                ".pricechangerow span.symbol-trade-time",
+            ],
+        )
+        exchange = await _query_text_any(
+            tab,
+            [
+                ".pricechangerow span.symbol-trade-time + span.symbol-trade-time",
+            ],
+        )
+        session = await _query_text_any(
+            tab,
+            [
+                ".realtime-title-wrapper .session",
+            ],
+        )
+        bid_text = await _query_text_any(tab, [".ask-bid-data .bid"])
+        ask_text = await _query_text_any(tab, [".ask-bid-data .ask"])
+
+        spot = _to_float(price_text, None)
+        change = _to_float(change_text, None)
+        percent_change = _to_float(percent_text, None)
+
+        return {
+            "url": url,
+            "spot": spot,
+            "spot_text": price_text,
+            "change": change,
+            "change_text": change_text,
+            "percent_change": percent_change,
+            "percent_text": percent_text,
+            "trade_time": trade_time,
+            "exchange": exchange,
+            "session": session,
+            "bid_text": bid_text,
+            "ask_text": ask_text,
+        }
+
+
 # ---------------- Gamma / GEX helpers ----------------
 def _iv_to_decimal(iv_str_or_num):
     if iv_str_or_num is None:
@@ -469,6 +596,7 @@ async def root():
             "/options/csv": "GET - CSV download (params: symbol, date)",
             "/weekly/summary": "GET - PCR + GEX summary (params: symbol, date, spot)",
             "/weekly/gex": "GET - per-strike GEX (params: symbol, date, spot)",
+            "/spot": "GET - spot quote (params: symbol, date optional)",
             "/health": "GET - Health check"
         },
         "example": "/options?symbol=AAPL&date=2026-01-16"
@@ -482,8 +610,36 @@ async def health():
         "timestamp": datetime.now().isoformat(),
         "platform": sys.platform,
         "chrome_binary": os.getenv("CHROME_BINARY", ""),
-        "cache_ttl_seconds": CACHE_TTL_SECONDS
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "spot_ttl_seconds": SPOT_TTL_SECONDS,
     }
+
+
+@app.get("/spot")
+async def get_spot(
+    symbol: str = Query(..., description="Stock symbol (e.g., AAPL, $SPX, TSLA)"),
+    date: str | None = Query(None, description="Optional expiration date (YYYY-MM-DD)"),
+):
+    data = await get_spot_cached(symbol, date)
+    payload = {
+        "success": True,
+        "symbol": symbol,
+        "date": date,
+        "spot": data.get("spot"),
+        "spot_text": data.get("spot_text"),
+        "change": data.get("change"),
+        "change_text": data.get("change_text"),
+        "percent_change": data.get("percent_change"),
+        "percent_text": data.get("percent_text"),
+        "trade_time": data.get("trade_time"),
+        "exchange": data.get("exchange"),
+        "session": data.get("session"),
+        "bid_text": data.get("bid_text"),
+        "ask_text": data.get("ask_text"),
+        "url": data.get("url"),
+        "fetched_at": datetime.now().isoformat(),
+    }
+    return sanitize_json(payload)
 
 
 @app.get("/options")

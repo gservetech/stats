@@ -70,6 +70,24 @@ def get_close_series(hist):
     return pd.Series(dtype="float64")
 
 
+def _scalar_from_value(val, default=float("nan")):
+    import pandas as pd
+    try:
+        if isinstance(val, pd.DataFrame):
+            if val.empty:
+                return default
+            val = val.iloc[:, 0]
+        if isinstance(val, pd.Series):
+            if val.empty:
+                return default
+            val = val.iloc[0]
+        if val is None:
+            return default
+        return float(val)
+    except Exception:
+        return default
+
+
 # -*- coding: utf-8 -*-
 """
 Barchart Options Dashboard - Streamlit Frontend
@@ -94,6 +112,10 @@ import pandas as pd
 import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
 
 # -----------------------------
 # Page configuration (MUST be the first Streamlit call)
@@ -593,6 +615,33 @@ def check_api() -> bool:
         return r.status_code == 200
     except Exception:
         return False
+
+
+@safe_cache_data(ttl=5, show_spinner=False)
+def fetch_spot_quote(symbol: str, date: str):
+    """GET /spot?symbol=...&date=..."""
+    try:
+        r = requests.get(
+            f"{API_BASE_URL}/spot",
+            params={"symbol": symbol, "date": date},
+            timeout=30,
+        )
+        if r.status_code == 200:
+            return {"success": True, "data": r.json()}
+
+        try:
+            detail = r.json().get("detail", f"HTTP {r.status_code}")
+        except Exception:
+            detail = f"HTTP {r.status_code}"
+
+        return {"success": False, "error": detail, "status_code": r.status_code}
+
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": "Timeout calling backend spot endpoint.", "status_code": 408}
+    except requests.exceptions.ConnectionError:
+        return {"success": False, "error": "Cannot connect to backend.", "status_code": 503}
+    except Exception as e:
+        return {"success": False, "error": str(e), "status_code": 500}
 
 
 @safe_cache_data(ttl=300, show_spinner=False)
@@ -2025,11 +2074,11 @@ def compute_key_levels(hist_daily: pd.DataFrame) -> dict:
 
     out.update({
         "ok": True,
-        "prev_high": float(prev.get("High", float("nan"))),
-        "prev_low": float(prev.get("Low", float("nan"))),
-        "prev_close": float(prev.get("Close", float("nan"))),
-        "wk_high": float(last5["High"].max()) if "High" in last5.columns else float("nan"),
-        "wk_low": float(last5["Low"].min()) if "Low" in last5.columns else float("nan"),
+        "prev_high": _scalar_from_value(prev.get("High", float("nan"))),
+        "prev_low": _scalar_from_value(prev.get("Low", float("nan"))),
+        "prev_close": _scalar_from_value(prev.get("Close", float("nan"))),
+        "wk_high": _scalar_from_value(last5["High"].max()) if "High" in last5.columns else float("nan"),
+        "wk_low": _scalar_from_value(last5["Low"].min()) if "Low" in last5.columns else float("nan"),
     })
     return out
 
@@ -2288,17 +2337,55 @@ def main():
             help="Pick the option expiry date.",
         )
         date = expiry_date.isoformat()
-        spot_input = st.number_input("Spot Price (manual fallback)", value=260.00, step=0.50)
-        use_yahoo_spot = st.checkbox("Use live Yahoo spot (recommended)", value=True)
-        yahoo_spot = get_spot_from_yahoo(symbol) if use_yahoo_spot else None
-        if yahoo_spot is not None:
-            st.caption(f"Yahoo spot: {float(yahoo_spot):,.2f}")
-        else:
-            if use_yahoo_spot:
-                st.caption("Yahoo spot: unavailable (using manual spot).")
-        spot = float(yahoo_spot) if yahoo_spot is not None else float(spot_input)
+        if "spot_input" not in st.session_state:
+            st.session_state["spot_input"] = 260.00
+
+        use_live_spot = st.checkbox("Use live Barchart spot (recommended)", value=True)
+        auto_refresh_spot = st.checkbox("Auto-refresh spot", value=True)
+        refresh_seconds = st.number_input("Spot refresh interval (sec)", min_value=3, max_value=60, value=10, step=1)
+
+        live_spot = None
+        if use_live_spot and api_ok and symbol:
+            spot_quote = fetch_spot_quote(symbol, date)
+            if spot_quote.get("success"):
+                data = spot_quote.get("data", {})
+                live_spot = data.get("spot")
+                if live_spot is not None:
+                    st.session_state["spot_input"] = float(live_spot)
+
+                spot_label = data.get("spot_text")
+                spot_meta = " ".join(
+                    part for part in [
+                        data.get("change_text"),
+                        data.get("percent_text"),
+                        data.get("trade_time"),
+                        data.get("exchange"),
+                    ]
+                    if part
+                ).strip()
+                if spot_label:
+                    if spot_meta:
+                        st.caption(f"Barchart spot: {spot_label} ({spot_meta})")
+                    else:
+                        st.caption(f"Barchart spot: {spot_label}")
+                else:
+                    st.caption("Barchart spot: available (display value missing).")
+            else:
+                st.caption("Barchart spot: unavailable (using manual spot).")
+        elif use_live_spot and not api_ok:
+            st.caption("Barchart spot: backend offline (using manual spot).")
+
+        spot_input = st.number_input("Spot Price (manual fallback)", step=0.50, key="spot_input")
+        spot = float(live_spot) if live_spot is not None else float(spot_input)
 
         fetch_btn = st_btn("🔄 Fetch Data", disabled=not api_ok)
+
+        if auto_refresh_spot and st_autorefresh is not None and not st.session_state.get("last_fetch") and not fetch_btn:
+            st_autorefresh(interval=int(refresh_seconds * 1000), key="spot_autorefresh")
+        elif auto_refresh_spot and st_autorefresh is None:
+            st.caption("Auto-refresh requires streamlit-autorefresh.")
+        elif auto_refresh_spot and (st.session_state.get("last_fetch") or fetch_btn):
+            st.caption("Auto-refresh paused after Fetch Data to avoid interrupting scraping.")
 
         st.markdown("---")
         st.markdown("### 🔥 Quick Symbols")

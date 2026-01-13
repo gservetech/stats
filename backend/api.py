@@ -100,6 +100,12 @@ async def get_spot_cached(symbol: str, date: str | None):
     hit = _SPOT_CACHE.get(key)
     if hit and (now - hit["ts"]) < SPOT_TTL_SECONDS:
         return hit["data"]
+    # If a browser slot is busy, return last known spot (even if stale)
+    # to avoid timing out callers.
+    if hit and _BROWSER_SEMAPHORE.locked():
+        data = dict(hit["data"])
+        data["stale"] = True
+        return data
 
     data = await scrape_spot(symbol, date)
     _SPOT_CACHE[key] = {"ts": now, "data": data}

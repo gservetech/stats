@@ -2390,6 +2390,7 @@ def main():
                     st.session_state["spot_input"] = float(live_spot)
 
                 spot_label = spot_data.get("spot_text")
+                is_stale = bool(spot_data.get("stale"))
                 spot_meta = " ".join(
                     part for part in [
                         spot_data.get("change_text"),
@@ -2400,6 +2401,8 @@ def main():
                     if part
                 ).strip()
                 if spot_label:
+                    if is_stale:
+                        spot_meta = (spot_meta + " | cached").strip(" |")
                     if spot_meta:
                         st.caption(f"Barchart spot: {spot_label} ({spot_meta})")
                     else:

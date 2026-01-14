@@ -77,8 +77,9 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min default
 CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "3600"))  # serve stale up to 1 hour
 _SPOT_CACHE = {}  # (symbol,date) -> {"ts": float, "data": dict}
 SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
-_BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "1"))
+_BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "2")) # Increased to 2 for production
 _BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
+_BROWSER_ACQUIRE_TIMEOUT = 100 # Max wait for a browser slot before erroring
 
 # Request deduplication: prevent multiple identical scrapes
 _PENDING_OPTIONS = {}  # (symbol,date) -> asyncio.Event (signals when scrape completes)
@@ -132,9 +133,14 @@ async def get_rows_cached(symbol: str, date: str):
         _PENDING_OPTIONS[key] = event
 
     try:
-        rows = await scrape_options(symbol, date)
-        _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows}
-        return rows
+        # Wait for the result with a timeout slightly shorter than the frontend timeout
+        async with asyncio.timeout(110): 
+            rows = await scrape_options(symbol, date)
+            _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows}
+            return rows
+    except asyncio.TimeoutError:
+        print(f"[TIMEOUT] Scrape for {key} took too long.")
+        raise HTTPException(status_code=504, detail="Scrape timed out. Please try again.")
     finally:
         # Signal other waiters that we're done
         event.set()
@@ -404,7 +410,10 @@ async def scrape_options(symbol: str, date: str):
             await tab.on("Network.responseReceived", on_response)
 
             try:
-                await tab.go_to(url)
+                # Add a timeout to the initial page load to avoid hanging the semaphore
+                await asyncio.wait_for(tab.go_to(url), timeout=45)
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail="Barchart took too long to respond.")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
 

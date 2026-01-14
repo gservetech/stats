@@ -1291,7 +1291,7 @@ def fetch_options(symbol: str, date: str):
         r = requests.get(
             f"{API_BASE_URL}/options",
             params={"symbol": symbol, "date": date},
-            timeout=120
+            timeout=300 # Increased for production resilience
         )
         if r.status_code == 200:
             return {"success": True, "data": r.json()}
@@ -1318,7 +1318,7 @@ def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, m
         rqs = requests.get(
             f"{API_BASE_URL}/weekly/summary",
             params={"symbol": symbol, "date": date, "spot": spot, "r": r, "multiplier": multiplier},
-            timeout=180
+            timeout=300
         )
         if rqs.status_code == 200:
             return {"success": True, "data": rqs.json()}
@@ -1346,7 +1346,7 @@ def fetch_weekly_gex(symbol: str, date: str, spot: float, r: float = 0.05, multi
         rqs = requests.get(
             f"{API_BASE_URL}/weekly/gex",
             params={"symbol": symbol, "date": date, "spot": spot, "r": r, "multiplier": multiplier},
-            timeout=180
+            timeout=300
         )
         if rqs.status_code == 200:
             return {"success": True, "data": rqs.json()}

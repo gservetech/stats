@@ -73,24 +73,73 @@ app.add_middleware(
 
 # ---------------- Cache (avoid double-scraping) ----------------
 _OPTIONS_CACHE = {}  # (symbol,date) -> {"ts": float, "rows": list}
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min default (was 5 min)
+CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "3600"))  # serve stale up to 1 hour
 _SPOT_CACHE = {}  # (symbol,date) -> {"ts": float, "data": dict}
 SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
 _BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "1"))
 _BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
 
+# Request deduplication: prevent multiple identical scrapes
+_PENDING_OPTIONS = {}  # (symbol,date) -> asyncio.Event (signals when scrape completes)
+_PENDING_OPTIONS_LOCK = asyncio.Lock()
+
 
 async def get_rows_cached(symbol: str, date: str):
+    """
+    Fetch options with:
+    1. Cache hit -> return immediately
+    2. Stale cache + busy browser -> return stale data (fast)
+    3. Request deduplication -> wait for in-flight scrape instead of starting new one
+    4. Otherwise -> scrape fresh data
+    """
     key = (symbol.upper().strip(), date.strip())
     now = time()
 
+    # 1. Fresh cache hit
     hit = _OPTIONS_CACHE.get(key)
     if hit and (now - hit["ts"]) < CACHE_TTL_SECONDS:
+        print(f"[CACHE] Fresh cache hit for {key}")
         return hit["rows"]
 
-    rows = await scrape_options(symbol, date)
-    _OPTIONS_CACHE[key] = {"ts": now, "rows": rows}
-    return rows
+    # 2. Stale cache available + browser busy -> return stale immediately
+    if hit and (now - hit["ts"]) < CACHE_STALE_SECONDS and _BROWSER_SEMAPHORE.locked():
+        print(f"[CACHE] Returning stale data for {key} (browser busy)")
+        return hit["rows"]
+
+    # 3. Check if another request is already scraping this key
+    async with _PENDING_OPTIONS_LOCK:
+        if key in _PENDING_OPTIONS:
+            # Wait for the other request to finish
+            event = _PENDING_OPTIONS[key]
+            print(f"[DEDUP] Waiting for in-flight scrape of {key}")
+    
+    # If there's an in-flight request, wait for it
+    if key in _PENDING_OPTIONS:
+        try:
+            await asyncio.wait_for(_PENDING_OPTIONS[key].wait(), timeout=120)
+        except asyncio.TimeoutError:
+            pass
+        # Check cache again after waiting
+        hit = _OPTIONS_CACHE.get(key)
+        if hit:
+            print(f"[DEDUP] Got result from parallel scrape for {key}")
+            return hit["rows"]
+
+    # 4. Start a new scrape (register as pending first)
+    event = asyncio.Event()
+    async with _PENDING_OPTIONS_LOCK:
+        _PENDING_OPTIONS[key] = event
+
+    try:
+        rows = await scrape_options(symbol, date)
+        _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows}
+        return rows
+    finally:
+        # Signal other waiters that we're done
+        event.set()
+        async with _PENDING_OPTIONS_LOCK:
+            _PENDING_OPTIONS.pop(key, None)
 
 
 async def get_spot_cached(symbol: str, date: str | None):
@@ -302,21 +351,16 @@ def build_chrome_options() -> ChromiumOptions:
 
     # ---- args ----
     opts.add_argument("--headless=new")
+    # speed & stability
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-extensions")
-    opts.add_argument("--window-size=1920,1080")
-
-    # profile stability (OK to add; not default in pydoll)
-    opts.add_argument(f"--user-data-dir={user_data_dir.as_posix()}")
-
-    # crashpad / temp locks
-    opts.add_argument("--disable-breakpad")
-    opts.add_argument("--disable-crash-reporter")
-    opts.add_argument("--disable-features=Crashpad")
-
-    # Docker/Linux flags (safe on Windows too)
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-setuid-sandbox")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--proxy-server='direct://'")
+    opts.add_argument("--proxy-bypass-list=*")
+    opts.add_argument("--blink-settings=imagesEnabled=false") # don't load images
 
     # DO NOT force remote debugging port (pydoll handles this)
 
@@ -364,11 +408,13 @@ async def scrape_options(symbol: str, date: str):
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
 
-            print("[INFO] Waiting for network requests (max 45s)...")
-            for i in range(45):
-                await asyncio.sleep(1)
+            print("[INFO] Waiting for network requests (max 30s)...")
+            # Poll much faster (every 0.2s) instead of every 1s
+            for _ in range(150): 
+                await asyncio.sleep(0.2)
                 if "options" in captured_requests:
-                    await asyncio.sleep(3)
+                    # Once request is seen, wait just a tiny bit for the body to be populateable
+                    await asyncio.sleep(0.5) 
                     break
 
             if "options" not in captured_requests:

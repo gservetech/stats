@@ -158,6 +158,143 @@ try:
 except Exception:
     yf = None
 
+# ---------------- Finnhub API Helper ----------------
+# Finnhub provides reliable spot price data with free tier (60 calls/min)
+# Sign up at https://finnhub.io for a free API key
+# API Docs: https://finnhub.io/docs/api
+
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
+
+def get_finnhub_api_key() -> str | None:
+    """Get Finnhub API key from secrets or environment."""
+    try:
+        if "FINNHUB_API_KEY" in st.secrets:
+            return str(st.secrets["FINNHUB_API_KEY"])
+    except Exception:
+        pass
+    return os.getenv("FINNHUB_API_KEY")
+
+
+def get_spot_from_finnhub(symbol: str) -> dict | None:
+    """
+    Fetch spot price data from Finnhub API using direct HTTP calls.
+    
+    API Endpoint: GET /api/v1/quote
+    Response fields:
+      c  - Current price
+      d  - Change
+      dp - Percent change
+      h  - High price of the day
+      l  - Low price of the day
+      o  - Open price of the day
+      pc - Previous close price
+      t  - Timestamp
+    
+    Returns dict with spot data or None if unavailable.
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/quote"
+        params = {"symbol": symbol, "token": api_key}
+        
+        resp = requests.get(url, params=params, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json"
+        })
+        resp.raise_for_status()
+        quote = resp.json()
+        
+        # Validate response - 'c' is current price
+        if quote and quote.get('c') is not None and float(quote.get('c', 0)) > 0:
+            from datetime import datetime as _dt
+            timestamp = quote.get('t', 0)
+            return {
+                "spot": float(quote['c']),          # Current price
+                "open": float(quote.get('o', 0)),   # Open price
+                "high": float(quote.get('h', 0)),   # High
+                "low": float(quote.get('l', 0)),    # Low
+                "prev_close": float(quote.get('pc', 0)),  # Previous close
+                "change": float(quote.get('d') or 0),     # Change (can be None)
+                "percent_change": float(quote.get('dp') or 0),  # Percent change (can be None)
+                "timestamp": _dt.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S') if timestamp else None,
+                "source": "Finnhub"
+            }
+    except requests.exceptions.RequestException as e:
+        # Log error but don't crash
+        pass
+    except Exception:
+        pass
+    
+    return None
+
+
+def get_stock_candles_from_finnhub(symbol: str, resolution: str = "D", from_ts: int = None, to_ts: int = None) -> dict | None:
+    """
+    Fetch historical stock candles from Finnhub API.
+    
+    API Endpoint: GET /api/v1/stock/candle
+    
+    Args:
+        symbol: Stock symbol (e.g., 'AAPL')
+        resolution: Candle resolution (1, 5, 15, 30, 60, D, W, M)
+        from_ts: UNIX timestamp for start date
+        to_ts: UNIX timestamp for end date
+    
+    Returns dict with OHLCV data or None if unavailable.
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    # Default to last 30 days if no range specified
+    if to_ts is None:
+        to_ts = int(time.time())
+    if from_ts is None:
+        from_ts = to_ts - (30 * 24 * 60 * 60)  # 30 days ago
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/stock/candle"
+        params = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "from": from_ts,
+            "to": to_ts,
+            "token": api_key
+        }
+        
+        resp = requests.get(url, params=params, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json"
+        })
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if data and data.get('s') == 'ok':
+            return {
+                "open": data.get('o', []),
+                "high": data.get('h', []),
+                "low": data.get('l', []),
+                "close": data.get('c', []),
+                "volume": data.get('v', []),
+                "timestamps": data.get('t', []),
+                "source": "Finnhub"
+            }
+    except Exception:
+        pass
+    
+    return None
+
 
 def get_spot_from_yahoo(symbol: str) -> float | None:
     """
@@ -167,6 +304,41 @@ def get_spot_from_yahoo(symbol: str) -> float | None:
     symbol = (symbol or "").strip().upper()
     if not symbol:
         return None
+
+    # Try yfinance first (more resilient)
+    if yf is not None:
+        try:
+            t = yf.Ticker(symbol)
+            # fast_info is lightweight; falls back to history if needed
+            price = None
+            try:
+                price = t.fast_info.get("last_price")
+            except Exception:
+                price = None
+            if price is None:
+                hist = t.history(period="1d")
+                if hist is not None and not hist.empty:
+                    price = float(hist["Close"].iloc[-1])
+            if price is not None and float(price) > 0:
+                return float(price)
+        except Exception:
+            pass
+
+    # Direct HTTP fallback (no extra dependency)
+    try:
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
+        resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        data = resp.json()
+        result = (data.get("quoteResponse") or {}).get("result") or []
+        if result and result[0].get("regularMarketPrice") is not None:
+            px = float(result[0]["regularMarketPrice"])
+            if px > 0:
+                return px
+    except Exception:
+        pass
+
+    return None
 
 
 def get_today_open_from_yahoo(symbol: str) -> float | None:
@@ -254,40 +426,6 @@ def atr_14_from_history(hist_df: pd.DataFrame) -> float | None:
             atr = cl.diff().abs().rolling(14, min_periods=5).mean().iloc[-1]
             if pd.notna(atr) and float(atr) > 0:
                 return float(atr)
-
-    return None
-    # Try yfinance first (more resilient)
-    if yf is not None:
-        try:
-            t = yf.Ticker(symbol)
-            # fast_info is lightweight; falls back to history if needed
-            price = None
-            try:
-                price = t.fast_info.get("last_price")
-            except Exception:
-                price = None
-            if price is None:
-                hist = t.history(period="1d")
-                if hist is not None and not hist.empty:
-                    price = float(hist["Close"].iloc[-1])
-            if price is not None and float(price) > 0:
-                return float(price)
-        except Exception:
-            pass
-
-    # Direct HTTP fallback (no extra dependency)
-    try:
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
-        resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        data = resp.json()
-        result = (data.get("quoteResponse") or {}).get("result") or []
-        if result and result[0].get("regularMarketPrice") is not None:
-            px = float(result[0]["regularMarketPrice"])
-            if px > 0:
-                return px
-    except Exception:
-        pass
 
     return None
 
@@ -2343,9 +2481,15 @@ def main():
         if "spot_input_pending" in st.session_state:
             st.session_state["spot_input"] = float(st.session_state.pop("spot_input_pending"))
 
-        use_live_spot = st.checkbox("Use live Barchart spot (recommended)", value=True)
-        auto_refresh_spot = st.checkbox("Auto-refresh spot", value=True)
-        refresh_seconds = st.number_input("Spot refresh interval (sec)", min_value=3, max_value=60, value=10, step=1)
+        # Spot price source selection
+        spot_source = st.selectbox(
+            "Spot Price Source",
+            options=["Finnhub (recommended)", "Barchart Backend", "Yahoo Finance", "Manual"],
+            help="Finnhub provides reliable real-time data. Barchart requires backend. Yahoo is fallback."
+        )
+        
+        # Manual refresh spot button
+        refresh_spot_btn = st_btn("🔄 Refresh Spot", key="refresh_spot_btn")
 
         if "spot_data" not in st.session_state:
             st.session_state["spot_data"] = None
@@ -2353,82 +2497,130 @@ def main():
             st.session_state["spot_last_ts"] = 0.0
         if "spot_error" not in st.session_state:
             st.session_state["spot_error"] = None
+        if "spot_source_used" not in st.session_state:
+            st.session_state["spot_source_used"] = None
 
         live_spot = None
         spot_data = st.session_state.get("spot_data")
 
+        # Reset spot data if symbol changed
         if spot_data:
             spot_symbol = str(spot_data.get("symbol", "")).upper().strip()
-            spot_date = str(spot_data.get("date") or "")
-            if spot_symbol != symbol or spot_date != date:
+            if spot_symbol != symbol:
                 spot_data = None
+                st.session_state["spot_data"] = None
                 st.session_state["spot_error"] = None
 
+        # Fetch spot when button is clicked OR on first load when no data exists
         should_fetch_spot = False
-        if use_live_spot and api_ok and symbol and auto_refresh_spot:
-            if spot_data is None and not st.session_state.get("spot_error"):
+        if spot_source != "Manual" and symbol:
+            if refresh_spot_btn:
                 should_fetch_spot = True
-            else:
-                last_ts = float(st.session_state.get("spot_last_ts", 0.0))
-                if (time.time() - last_ts) >= float(refresh_seconds):
-                    should_fetch_spot = True
+            elif spot_data is None and not st.session_state.get("spot_error"):
+                # Initial fetch only
+                should_fetch_spot = True
 
-        if use_live_spot and api_ok and symbol and should_fetch_spot:
-            spot_quote = fetch_spot_quote(symbol, date)
-            st.session_state["spot_last_ts"] = time.time()
-            if spot_quote.get("success"):
-                spot_data = spot_quote.get("data", {})
+        if should_fetch_spot and symbol:
+            spot_data = None
+            source_used = None
+            
+            # Try Finnhub first (if selected or as fallback)
+            if spot_source == "Finnhub (recommended)":
+                finnhub_data = get_spot_from_finnhub(symbol)
+                if finnhub_data:
+                    spot_data = {
+                        "symbol": symbol,
+                        "spot": finnhub_data["spot"],
+                        "spot_text": f"${finnhub_data['spot']:.2f}",
+                        "change_text": f"{finnhub_data['change']:+.2f}" if finnhub_data.get('change') else None,
+                        "percent_text": f"{finnhub_data['percent_change']:+.2f}%" if finnhub_data.get('percent_change') else None,
+                        "trade_time": finnhub_data.get("timestamp"),
+                        "source": "Finnhub"
+                    }
+                    source_used = "Finnhub"
+                else:
+                    # Fallback to Yahoo
+                    yahoo_spot = get_spot_from_yahoo(symbol)
+                    if yahoo_spot:
+                        spot_data = {
+                            "symbol": symbol,
+                            "spot": yahoo_spot,
+                            "spot_text": f"${yahoo_spot:.2f}",
+                            "source": "Yahoo (fallback)"
+                        }
+                        source_used = "Yahoo"
+                    else:
+                        st.session_state["spot_error"] = "Finnhub API key not set or no data"
+            
+            # Try Barchart backend
+            elif spot_source == "Barchart Backend" and api_ok:
+                spot_quote = fetch_spot_quote(symbol, date)
+                st.session_state["spot_last_ts"] = time.time()
+                if spot_quote.get("success"):
+                    spot_data = spot_quote.get("data", {})
+                    spot_data["symbol"] = symbol
+                    source_used = "Barchart"
+                else:
+                    st.session_state["spot_error"] = spot_quote.get("error")
+            
+            # Try Yahoo Finance
+            elif spot_source == "Yahoo Finance":
+                yahoo_spot = get_spot_from_yahoo(symbol)
+                if yahoo_spot:
+                    spot_data = {
+                        "symbol": symbol,
+                        "spot": yahoo_spot,
+                        "spot_text": f"${yahoo_spot:.2f}",
+                        "source": "Yahoo Finance"
+                    }
+                    source_used = "Yahoo"
+                else:
+                    st.session_state["spot_error"] = "Yahoo Finance unavailable"
+            
+            if spot_data:
                 st.session_state["spot_data"] = spot_data
                 st.session_state["spot_error"] = None
-            else:
-                st.session_state["spot_error"] = spot_quote.get("error")
+                st.session_state["spot_source_used"] = source_used
 
-        if use_live_spot and api_ok and symbol:
+        # Display spot info
+        if spot_source != "Manual" and symbol:
+            spot_data = st.session_state.get("spot_data")
             if spot_data:
                 live_spot = spot_data.get("spot")
                 if live_spot is not None:
                     st.session_state["spot_input"] = float(live_spot)
 
-                spot_label = spot_data.get("spot_text")
-                is_stale = bool(spot_data.get("stale"))
+                spot_label = spot_data.get("spot_text", f"${live_spot:.2f}" if live_spot else None)
+                source_label = spot_data.get("source", st.session_state.get("spot_source_used", ""))
                 spot_meta = " ".join(
                     part for part in [
                         spot_data.get("change_text"),
                         spot_data.get("percent_text"),
                         spot_data.get("trade_time"),
-                        spot_data.get("exchange"),
                     ]
                     if part
                 ).strip()
                 if spot_label:
-                    if is_stale:
-                        spot_meta = (spot_meta + " | cached").strip(" |")
+                    display_text = f"📈 {source_label}: {spot_label}"
                     if spot_meta:
-                        st.caption(f"Barchart spot: {spot_label} ({spot_meta})")
-                    else:
-                        st.caption(f"Barchart spot: {spot_label}")
+                        display_text += f" ({spot_meta})"
+                    st.success(display_text)
                 else:
-                    st.caption("Barchart spot: available (display value missing).")
+                    st.caption(f"{source_label} spot: available (display value missing).")
             else:
                 err = st.session_state.get("spot_error")
                 if err:
-                    st.caption(f"Barchart spot: unavailable ({err})")
-                else:
-                    st.caption("Barchart spot: unavailable (using manual spot).")
-        elif use_live_spot and not api_ok:
-            st.caption("Barchart spot: backend offline (using manual spot).")
+                    st.warning(f"Spot unavailable: {err}")
+                elif spot_source == "Finnhub (recommended)" and not get_finnhub_api_key():
+                    st.info("💡 Set FINNHUB_API_KEY in Secrets or environment for Finnhub data")
+                elif spot_source == "Barchart Backend" and not api_ok:
+                    st.caption("Barchart backend offline.")
 
         spot_input = st.number_input("Spot Price (manual fallback)", step=0.50, key="spot_input")
         spot = float(live_spot) if live_spot is not None else float(spot_input)
 
         fetch_btn = st_btn("🔄 Fetch Data", disabled=not api_ok)
 
-        if auto_refresh_spot and st_autorefresh is not None and not fetch_btn:
-            st_autorefresh(interval=int(refresh_seconds * 1000), key="spot_autorefresh")
-        elif auto_refresh_spot and st_autorefresh is None:
-            st.caption("Auto-refresh requires streamlit-autorefresh.")
-        elif auto_refresh_spot and fetch_btn:
-            st.caption("Auto-refresh paused while Fetch Data runs.")
 
         st.markdown("---")
         st.markdown("### 🔥 Quick Symbols")
@@ -2465,19 +2657,37 @@ def main():
 
     if fetch_btn:
         spot_for_fetch = spot
-        if use_live_spot and api_ok and symbol:
-            spot_quote = fetch_spot_quote(symbol, date)
-            if spot_quote.get("success"):
-                spot_data = spot_quote.get("data", {})
-                st.session_state["spot_data"] = spot_data
-                st.session_state["spot_last_ts"] = time.time()
-                st.session_state["spot_error"] = None
-                spot_val = spot_data.get("spot")
-                if spot_val is not None:
-                    spot_for_fetch = float(spot_val)
-                    st.session_state["spot_input_pending"] = float(spot_val)
-            else:
-                st.session_state["spot_error"] = spot_quote.get("error")
+        # Re-fetch spot on Fetch Data click if using a live source
+        if spot_source != "Manual" and symbol:
+            if spot_source == "Finnhub (recommended)":
+                finnhub_data = get_spot_from_finnhub(symbol)
+                if finnhub_data:
+                    spot_for_fetch = float(finnhub_data["spot"])
+                    st.session_state["spot_input_pending"] = float(finnhub_data["spot"])
+                else:
+                    yahoo_spot = get_spot_from_yahoo(symbol)
+                    if yahoo_spot:
+                        spot_for_fetch = float(yahoo_spot)
+                        st.session_state["spot_input_pending"] = float(yahoo_spot)
+            elif spot_source == "Barchart Backend" and api_ok:
+                spot_quote = fetch_spot_quote(symbol, date)
+                if spot_quote.get("success"):
+                    spot_data = spot_quote.get("data", {})
+                    st.session_state["spot_data"] = spot_data
+                    st.session_state["spot_last_ts"] = time.time()
+                    st.session_state["spot_error"] = None
+                    spot_val = spot_data.get("spot")
+                    if spot_val is not None:
+                        spot_for_fetch = float(spot_val)
+                        st.session_state["spot_input_pending"] = float(spot_val)
+                else:
+                    st.session_state["spot_error"] = spot_quote.get("error")
+            elif spot_source == "Yahoo Finance":
+                yahoo_spot = get_spot_from_yahoo(symbol)
+                if yahoo_spot:
+                    spot_for_fetch = float(yahoo_spot)
+                    st.session_state["spot_input_pending"] = float(yahoo_spot)
+
 
         spot = float(spot_for_fetch) if spot_for_fetch is not None else float(spot_input)
         st.session_state["last_fetch"] = {"symbol": symbol, "date": date, "spot": spot}

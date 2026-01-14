@@ -296,6 +296,324 @@ def get_stock_candles_from_finnhub(symbol: str, resolution: str = "D", from_ts: 
     return None
 
 
+def get_company_profile_from_finnhub(symbol: str) -> dict | None:
+    """
+    Fetch company profile from Finnhub API.
+    
+    API Endpoint: GET /api/v1/stock/profile2
+    
+    Returns: country, currency, exchange, industry, logo, marketCap, name, ticker, weburl
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/stock/profile2"
+        params = {"symbol": symbol, "token": api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and data.get('name'):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def get_basic_financials_from_finnhub(symbol: str) -> dict | None:
+    """
+    Fetch basic financials (key metrics) from Finnhub API.
+    
+    API Endpoint: GET /api/v1/stock/metric
+    
+    Returns: 52WeekHigh, 52WeekLow, beta, peRatio, dividendYield, etc.
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/stock/metric"
+        params = {"symbol": symbol, "metric": "all", "token": api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and data.get('metric'):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def get_recommendation_trends_from_finnhub(symbol: str) -> list | None:
+    """
+    Fetch analyst recommendation trends from Finnhub API.
+    
+    API Endpoint: GET /api/v1/stock/recommendation
+    
+    Returns: buy, hold, sell, strongBuy, strongSell counts per period
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/stock/recommendation"
+        params = {"symbol": symbol, "token": api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def get_price_target_from_finnhub(symbol: str) -> dict | None:
+    """
+    Fetch analyst price targets from Finnhub API.
+    
+    API Endpoint: GET /api/v1/stock/price-target
+    
+    Returns: targetHigh, targetLow, targetMean, targetMedian
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/stock/price-target"
+        params = {"symbol": symbol, "token": api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and data.get('targetMean'):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def get_company_news_from_finnhub(symbol: str, from_date: str = None, to_date: str = None) -> list | None:
+    """
+    Fetch company news from Finnhub API.
+    
+    API Endpoint: GET /api/v1/company-news
+    
+    Returns: list of news articles with headline, summary, url, datetime
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    # Default to last 7 days
+    if not to_date:
+        to_date = dt.date.today().isoformat()
+    if not from_date:
+        from_date = (dt.date.today() - dt.timedelta(days=7)).isoformat()
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/company-news"
+        params = {"symbol": symbol, "from": from_date, "to": to_date, "token": api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and isinstance(data, list):
+            return data[:10]  # Limit to 10 most recent
+    except Exception:
+        pass
+    return None
+
+
+def get_earnings_from_finnhub(symbol: str) -> list | None:
+    """
+    Fetch earnings surprises from Finnhub API.
+    
+    API Endpoint: GET /api/v1/stock/earnings
+    
+    Returns: list of earnings with actual, estimate, surprise, period
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/stock/earnings"
+        params = {"symbol": symbol, "token": api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def get_support_resistance_from_finnhub(symbol: str, resolution: str = "D") -> dict | None:
+    """
+    Fetch support and resistance levels from Finnhub API.
+    
+    API Endpoint: GET /api/v1/scan/support-resistance
+    
+    Returns: list of support/resistance price levels
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/scan/support-resistance"
+        params = {"symbol": symbol, "resolution": resolution, "token": api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and data.get('levels'):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def get_technical_indicator_from_finnhub(symbol: str) -> dict | None:
+    """
+    Fetch aggregate technical indicator signals from Finnhub API.
+    
+    API Endpoint: GET /api/v1/scan/technical-indicator
+    
+    Returns: buy/sell/neutral signal counts, trend analysis
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return None
+    
+    api_key = get_finnhub_api_key()
+    if not api_key:
+        return None
+    
+    try:
+        url = f"{FINNHUB_BASE_URL}/scan/technical-indicator"
+        params = {"symbol": symbol, "resolution": "D", "token": api_key}
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def fetch_all_finnhub_data(symbol: str) -> dict:
+    """
+    Fetch comprehensive data from Finnhub API for a symbol.
+    
+    Returns a dictionary with all available data types.
+    """
+    result = {
+        "symbol": symbol,
+        "quote": None,
+        "profile": None,
+        "financials": None,
+        "candles": None,
+        "recommendations": None,
+        "price_target": None,
+        "news": None,
+        "earnings": None,
+        "support_resistance": None,
+        "technical": None,
+        "success": False,
+        "errors": []
+    }
+    
+    # Fetch quote
+    quote = get_spot_from_finnhub(symbol)
+    if quote:
+        result["quote"] = quote
+        result["success"] = True
+    else:
+        result["errors"].append("Quote unavailable")
+    
+    # Fetch company profile
+    profile = get_company_profile_from_finnhub(symbol)
+    if profile:
+        result["profile"] = profile
+    
+    # Fetch basic financials
+    financials = get_basic_financials_from_finnhub(symbol)
+    if financials:
+        result["financials"] = financials
+    
+    # Fetch historical candles (1 year)
+    to_ts = int(time.time())
+    from_ts = to_ts - (365 * 24 * 60 * 60)  # 1 year ago
+    candles = get_stock_candles_from_finnhub(symbol, "D", from_ts, to_ts)
+    if candles:
+        result["candles"] = candles
+    
+    # Fetch recommendation trends
+    recommendations = get_recommendation_trends_from_finnhub(symbol)
+    if recommendations:
+        result["recommendations"] = recommendations
+    
+    # Fetch price targets
+    price_target = get_price_target_from_finnhub(symbol)
+    if price_target:
+        result["price_target"] = price_target
+    
+    # Fetch company news
+    news = get_company_news_from_finnhub(symbol)
+    if news:
+        result["news"] = news
+    
+    # Fetch earnings
+    earnings = get_earnings_from_finnhub(symbol)
+    if earnings:
+        result["earnings"] = earnings
+    
+    # Fetch support/resistance
+    sr = get_support_resistance_from_finnhub(symbol)
+    if sr:
+        result["support_resistance"] = sr
+    
+    # Fetch technical indicators
+    tech = get_technical_indicator_from_finnhub(symbol)
+    if tech:
+        result["technical"] = tech
+    
+    return result
+
+
 def get_spot_from_yahoo(symbol: str) -> float | None:
     """
     Fetch latest spot price for a symbol from Yahoo Finance.
@@ -2619,7 +2937,9 @@ def main():
         spot_input = st.number_input("Spot Price (manual fallback)", step=0.50, key="spot_input")
         spot = float(live_spot) if live_spot is not None else float(spot_input)
 
-        fetch_btn = st_btn("🔄 Fetch Data", disabled=not api_ok)
+        # Fetch Data button - disabled only if backend is required but offline
+        backend_required = spot_source == "Barchart Backend"
+        fetch_btn = st_btn("🔄 Fetch Data", disabled=(backend_required and not api_ok))
 
 
         st.markdown("---")
@@ -2644,16 +2964,25 @@ def main():
         if API_BASE_URL.startswith("http://localhost"):
             st.caption("Tip: On Streamlit Cloud, set API_BASE_URL in Secrets (App → Settings → Secrets).")
 
+    # Backend API status message
     if not api_ok:
-        st.error(
-            f"Cannot connect to API at `{API_BASE_URL}`.\n\n"
-            f"Local backend example:\n"
-            f"`uvicorn api:app --port 8000 --reload`"
-        )
-        return
+        if spot_source == "Barchart Backend":
+            st.error(
+                f"Cannot connect to API at `{API_BASE_URL}`.\n\n"
+                f"Local backend example:\n"
+                f"`uvicorn api:app --port 8000 --reload`"
+            )
+            return
+        else:
+            st.warning(
+                f"Backend API offline - using **{spot_source.replace(' (recommended)', '')}** for price data.\n\n"
+                f"Options/GEX data requires the backend API."
+            )
+    
     options_result = None
     weekly_result = None
     fetch_error = None
+    finnhub_price_data = None
 
     if fetch_btn:
         spot_for_fetch = spot
@@ -2664,6 +2993,8 @@ def main():
                 if finnhub_data:
                     spot_for_fetch = float(finnhub_data["spot"])
                     st.session_state["spot_input_pending"] = float(finnhub_data["spot"])
+                    # Store full Finnhub data for display
+                    st.session_state["finnhub_price_data"] = finnhub_data
                 else:
                     yahoo_spot = get_spot_from_yahoo(symbol)
                     if yahoo_spot:
@@ -2692,20 +3023,35 @@ def main():
         spot = float(spot_for_fetch) if spot_for_fetch is not None else float(spot_input)
         st.session_state["last_fetch"] = {"symbol": symbol, "date": date, "spot": spot}
 
-        with st.spinner(f"Scraping {symbol} options for {date}..."):
-            options_result = fetch_options(symbol, date)
+        # Fetch options data from backend if available
+        if api_ok:
+            with st.spinner(f"Fetching {symbol} options for {date}..."):
+                options_result = fetch_options(symbol, date)
 
-        with st.spinner(f"Computing Weekly Gamma/GEX for {symbol} {date} (spot={spot})..."):
-            weekly_result = fetch_weekly_summary(symbol, date, spot)
+            with st.spinner(f"Computing Weekly Gamma/GEX for {symbol} {date} (spot={spot})..."):
+                weekly_result = fetch_weekly_summary(symbol, date, spot)
 
-        if not options_result.get("success"):
-            fetch_error = f"Options error: {options_result.get('error')}"
-        elif not weekly_result.get("success"):
-            fetch_error = f"Weekly summary error: {weekly_result.get('error')}"
+            if not options_result.get("success"):
+                fetch_error = f"Options error: {options_result.get('error')}"
+            elif not weekly_result.get("success"):
+                fetch_error = f"Weekly summary error: {weekly_result.get('error')}"
+            else:
+                st.session_state["options_result"] = options_result
+                st.session_state["weekly_result"] = weekly_result
+                st.session_state["spot_at_fetch"] = spot
         else:
-            st.session_state["options_result"] = options_result
-            st.session_state["weekly_result"] = weekly_result
+            # Backend offline - Finnhub-only mode
             st.session_state["spot_at_fetch"] = spot
+            
+            # Fetch comprehensive Finnhub data
+            if spot_source == "Finnhub (recommended)":
+                with st.spinner(f"Fetching comprehensive data from Finnhub for {symbol}..."):
+                    finnhub_full_data = fetch_all_finnhub_data(symbol)
+                    st.session_state["finnhub_full_data"] = finnhub_full_data
+            else:
+                st.info(f"✅ **{symbol}** spot price: **${spot:.2f}** (from {spot_source.replace(' (recommended)', '')})")
+
+
 
     if options_result is None:
         options_result = st.session_state.get("options_result")
@@ -2714,6 +3060,242 @@ def main():
 
     if fetch_error:
         st.error(fetch_error)
+
+    # Display Finnhub data if available (when backend is offline)
+    finnhub_full_data = st.session_state.get("finnhub_full_data")
+    if finnhub_full_data and finnhub_full_data.get("success") and not api_ok:
+        st.markdown("---")
+        st.markdown(f"## 📊 {symbol} - Finnhub Market Data")
+        
+        # Company Profile Section
+        profile = finnhub_full_data.get("profile")
+        quote = finnhub_full_data.get("quote")
+        
+        if profile or quote:
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                if profile:
+                    st.markdown(f"**{profile.get('name', symbol)}**")
+                    st.caption(f"{profile.get('finnhubIndustry', 'N/A')} | {profile.get('exchange', 'N/A')}")
+                else:
+                    st.markdown(f"**{symbol}**")
+            
+            with col2:
+                if quote:
+                    change = quote.get('change', 0)
+                    pct = quote.get('percent_change', 0)
+                    color = "green" if change >= 0 else "red"
+                    st.markdown(f"### ${quote.get('spot', 0):.2f}")
+                    st.markdown(f"<span style='color:{color}'>{change:+.2f} ({pct:+.2f}%)</span>", unsafe_allow_html=True)
+            
+            with col3:
+                if quote:
+                    st.metric("Day High", f"${quote.get('high', 0):.2f}")
+            
+            with col4:
+                if quote:
+                    st.metric("Day Low", f"${quote.get('low', 0):.2f}")
+        
+        # Key Metrics Section
+        financials = finnhub_full_data.get("financials")
+        if financials and financials.get("metric"):
+            metrics = financials["metric"]
+            st.markdown("### 📈 Key Metrics")
+            
+            m_cols = st.columns(6)
+            metric_items = [
+                ("52W High", metrics.get("52WeekHigh"), "${:.2f}"),
+                ("52W Low", metrics.get("52WeekLow"), "${:.2f}"),
+                ("P/E Ratio", metrics.get("peBasicExclExtraTTM"), "{:.2f}"),
+                ("Beta", metrics.get("beta"), "{:.3f}"),
+                ("Div Yield", metrics.get("dividendYieldIndicatedAnnual"), "{:.2%}" if metrics.get("dividendYieldIndicatedAnnual") else None),
+                ("Market Cap", metrics.get("marketCapitalization"), "${:.0f}M"),
+            ]
+            
+            for i, (label, value, fmt) in enumerate(metric_items):
+                with m_cols[i]:
+                    if value is not None:
+                        if fmt == "{:.2%}":
+                            st.metric(label, f"{value:.2%}")
+                        else:
+                            st.metric(label, fmt.format(value) if value else "N/A")
+                    else:
+                        st.metric(label, "N/A")
+        
+        # Price Chart with Candlesticks
+        candles = finnhub_full_data.get("candles")
+        if candles and candles.get("close"):
+            st.markdown("### 📉 Price History (1 Year)")
+            
+            # Convert timestamps to dates
+            from datetime import datetime as _dt
+            dates = [_dt.fromtimestamp(ts) for ts in candles.get("timestamps", [])]
+            
+            fig_candle = go.Figure()
+            
+            # Add candlestick chart
+            fig_candle.add_trace(go.Candlestick(
+                x=dates,
+                open=candles.get("open", []),
+                high=candles.get("high", []),
+                low=candles.get("low", []),
+                close=candles.get("close", []),
+                name="Price"
+            ))
+            
+            # Add 20-day MA
+            close_series = pd.Series(candles.get("close", []))
+            ma20 = close_series.rolling(window=20).mean()
+            ma50 = close_series.rolling(window=50).mean()
+            
+            fig_candle.add_trace(go.Scatter(
+                x=dates, y=ma20, mode='lines',
+                name='MA 20', line=dict(color='orange', width=1)
+            ))
+            fig_candle.add_trace(go.Scatter(
+                x=dates, y=ma50, mode='lines',
+                name='MA 50', line=dict(color='blue', width=1)
+            ))
+            
+            fig_candle.update_layout(
+                title=f"{symbol} Price Chart",
+                yaxis_title="Price ($)",
+                xaxis_title="Date",
+                template="plotly_dark",
+                height=500,
+                xaxis_rangeslider_visible=False
+            )
+            st.plotly_chart(fig_candle, use_container_width=True)
+            
+            # Volume Chart
+            st.markdown("### 📊 Volume")
+            fig_vol = go.Figure()
+            colors = ['green' if c >= o else 'red' 
+                     for c, o in zip(candles.get("close", []), candles.get("open", []))]
+            fig_vol.add_trace(go.Bar(
+                x=dates, y=candles.get("volume", []),
+                marker_color=colors, name="Volume"
+            ))
+            fig_vol.update_layout(
+                template="plotly_dark",
+                height=250,
+                yaxis_title="Volume"
+            )
+            st.plotly_chart(fig_vol, use_container_width=True)
+        
+        # Analyst Recommendations
+        recommendations = finnhub_full_data.get("recommendations")
+        if recommendations and len(recommendations) > 0:
+            st.markdown("### 🎯 Analyst Recommendations")
+            
+            # Get most recent recommendation
+            recent = recommendations[0]
+            
+            rec_cols = st.columns(5)
+            rec_items = [
+                ("Strong Buy", recent.get("strongBuy", 0), "#00c853"),
+                ("Buy", recent.get("buy", 0), "#4caf50"),
+                ("Hold", recent.get("hold", 0), "#ff9800"),
+                ("Sell", recent.get("sell", 0), "#f44336"),
+                ("Strong Sell", recent.get("strongSell", 0), "#b71c1c"),
+            ]
+            
+            for i, (label, count, color) in enumerate(rec_items):
+                with rec_cols[i]:
+                    st.markdown(f"<div style='text-align:center; padding:10px; background-color:{color}20; border-radius:8px;'>"
+                              f"<h3 style='margin:0; color:{color};'>{count}</h3>"
+                              f"<p style='margin:0; font-size:12px;'>{label}</p></div>", 
+                              unsafe_allow_html=True)
+            
+            # Recommendation history chart
+            if len(recommendations) > 1:
+                rec_df = pd.DataFrame(recommendations[:12])  # Last 12 months
+                rec_df['period'] = pd.to_datetime(rec_df['period'])
+                rec_df = rec_df.sort_values('period')
+                
+                fig_rec = go.Figure()
+                fig_rec.add_trace(go.Bar(name='Strong Buy', x=rec_df['period'], y=rec_df['strongBuy'], marker_color='#00c853'))
+                fig_rec.add_trace(go.Bar(name='Buy', x=rec_df['period'], y=rec_df['buy'], marker_color='#4caf50'))
+                fig_rec.add_trace(go.Bar(name='Hold', x=rec_df['period'], y=rec_df['hold'], marker_color='#ff9800'))
+                fig_rec.add_trace(go.Bar(name='Sell', x=rec_df['period'], y=rec_df['sell'], marker_color='#f44336'))
+                fig_rec.add_trace(go.Bar(name='Strong Sell', x=rec_df['period'], y=rec_df['strongSell'], marker_color='#b71c1c'))
+                
+                fig_rec.update_layout(
+                    barmode='stack',
+                    title="Recommendation History",
+                    template="plotly_dark",
+                    height=350
+                )
+                st.plotly_chart(fig_rec, use_container_width=True)
+        
+        # Price Target
+        price_target = finnhub_full_data.get("price_target")
+        if price_target:
+            st.markdown("### 🎯 Price Targets")
+            
+            pt_cols = st.columns(4)
+            with pt_cols[0]:
+                st.metric("Target High", f"${price_target.get('targetHigh', 0):.2f}")
+            with pt_cols[1]:
+                st.metric("Target Mean", f"${price_target.get('targetMean', 0):.2f}")
+            with pt_cols[2]:
+                st.metric("Target Median", f"${price_target.get('targetMedian', 0):.2f}")
+            with pt_cols[3]:
+                st.metric("Target Low", f"${price_target.get('targetLow', 0):.2f}")
+            
+            # Show current price vs targets
+            if quote:
+                current = quote.get('spot', 0)
+                mean_target = price_target.get('targetMean', 0)
+                upside = ((mean_target - current) / current * 100) if current > 0 else 0
+                
+                if upside >= 0:
+                    st.success(f"📈 **Upside Potential**: +{upside:.1f}% to mean target of ${mean_target:.2f}")
+                else:
+                    st.warning(f"📉 **Downside Risk**: {upside:.1f}% to mean target of ${mean_target:.2f}")
+        
+        # Earnings History
+        earnings = finnhub_full_data.get("earnings")
+        if earnings and len(earnings) > 0:
+            st.markdown("### 💰 Earnings History")
+            
+            earn_df = pd.DataFrame(earnings[:8])  # Last 8 quarters
+            if 'period' in earn_df.columns:
+                earn_df = earn_df.sort_values('period')
+                
+                fig_earn = go.Figure()
+                fig_earn.add_trace(go.Bar(
+                    name='Actual EPS', x=earn_df['period'], y=earn_df['actual'],
+                    marker_color=['green' if a >= e else 'red' 
+                                 for a, e in zip(earn_df['actual'], earn_df['estimate'])]
+                ))
+                fig_earn.add_trace(go.Scatter(
+                    name='Estimate', x=earn_df['period'], y=earn_df['estimate'],
+                    mode='lines+markers', line=dict(color='yellow', dash='dash')
+                ))
+                
+                fig_earn.update_layout(
+                    title="EPS: Actual vs Estimate",
+                    template="plotly_dark",
+                    height=350,
+                    yaxis_title="EPS ($)"
+                )
+                st.plotly_chart(fig_earn, use_container_width=True)
+        
+        # News Section
+        news = finnhub_full_data.get("news")
+        if news and len(news) > 0:
+            st.markdown("### 📰 Recent News")
+            
+            for article in news[:5]:
+                with st.expander(f"📄 {article.get('headline', 'No headline')[:100]}..."):
+                    st.write(article.get('summary', 'No summary available.'))
+                    st.caption(f"Source: {article.get('source', 'Unknown')} | "
+                             f"[Read more]({article.get('url', '#')})")
+        
+        st.markdown("---")
+        st.caption("Data provided by Finnhub.io | Free tier: 60 API calls/minute")
 
     if options_result and weekly_result:
         spot = st.session_state.get("spot_at_fetch", spot)

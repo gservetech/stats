@@ -2985,8 +2985,8 @@ def main():
         # Spot price source selection
         spot_source = st.selectbox(
             "Spot Price Source",
-            options=["Finnhub (recommended)", "Barchart", "Yahoo Finance", "Manual"],
-            help="Finnhub provides reliable real-time data. Barchart requires backend. Yahoo is fallback."
+            options=["Finnhub (spot only)", "Manual"],
+            help="Finnhub provides real-time spot pricing. Options and analytics come from the backend."
         )
         
         # Manual refresh spot button
@@ -3025,8 +3025,8 @@ def main():
             spot_data = None
             source_used = None
             
-            # Try Finnhub first (if selected or as fallback)
-            if spot_source == "Finnhub (recommended)":
+            # Use Finnhub for spot only
+            if spot_source == "Finnhub (spot only)":
                 finnhub_data = get_spot_from_finnhub(symbol)
                 if finnhub_data:
                     spot_data = {
@@ -3040,43 +3040,7 @@ def main():
                     }
                     source_used = "Finnhub"
                 else:
-                    # Fallback to Yahoo
-                    yahoo_spot = get_spot_from_yahoo(symbol)
-                    if yahoo_spot:
-                        spot_data = {
-                            "symbol": symbol,
-                            "spot": yahoo_spot,
-                            "spot_text": f"${yahoo_spot:.2f}",
-                            "source": "Yahoo (fallback)"
-                        }
-                        source_used = "Yahoo"
-                    else:
-                        st.session_state["spot_error"] = "Finnhub API key not set or no data"
-            
-            # Try Barchart
-            elif spot_source == "Barchart" and api_ok:
-                spot_quote = fetch_spot_quote(symbol, date)
-                st.session_state["spot_last_ts"] = time.time()
-                if spot_quote.get("success"):
-                    spot_data = spot_quote.get("data", {})
-                    spot_data["symbol"] = symbol
-                    source_used = "Barchart"
-                else:
-                    st.session_state["spot_error"] = spot_quote.get("error")
-            
-            # Try Yahoo Finance
-            elif spot_source == "Yahoo Finance":
-                yahoo_spot = get_spot_from_yahoo(symbol)
-                if yahoo_spot:
-                    spot_data = {
-                        "symbol": symbol,
-                        "spot": yahoo_spot,
-                        "spot_text": f"${yahoo_spot:.2f}",
-                        "source": "Yahoo Finance"
-                    }
-                    source_used = "Yahoo"
-                else:
-                    st.session_state["spot_error"] = "Yahoo Finance unavailable"
+                    st.session_state["spot_error"] = "Finnhub API key not set or no data"
             
             if spot_data:
                 st.session_state["spot_data"] = spot_data
@@ -3112,17 +3076,14 @@ def main():
                 err = st.session_state.get("spot_error")
                 if err:
                     st.warning(f"Spot unavailable: {err}")
-                elif spot_source == "Finnhub (recommended)" and not get_finnhub_api_key():
+                elif spot_source == "Finnhub (spot only)" and not get_finnhub_api_key():
                     st.info("💡 Set FINNHUB_API_KEY in Secrets or environment for Finnhub data")
-                elif spot_source == "Barchart" and not api_ok:
-                    st.caption("Barchart offline.")
 
         spot_input = st.number_input("Spot Price (manual fallback)", step=0.50, key="spot_input")
         spot = float(live_spot) if live_spot is not None else float(spot_input)
 
-        # Fetch Data button - disabled only if backend is required but offline
-        backend_required = spot_source == "Barchart"
-        fetch_btn = st_btn("🔄 Fetch Data", disabled=(backend_required and not api_ok))
+        # Fetch Data button - backend required for options/GEX
+        fetch_btn = st_btn("🔄 Fetch Data", disabled=(not api_ok))
 
 
         st.markdown("---")
@@ -3149,102 +3110,59 @@ def main():
 
     # Backend API status message
     if not api_ok:
-        if spot_source == "Barchart":
-            st.error(
-                f"Cannot connect to API at `{API_BASE_URL}`.\n\n"
-                f"Local backend example:\n"
-                f"`uvicorn api:app --port 8000 --reload`"
-            )
-            return
-        elif spot_source == "Finnhub (recommended)":
-            # Finnhub works independently - no warning needed
-            pass
-        else:
-            st.warning(
-                f"Backend API offline - using **{spot_source.replace(' (recommended)', '')}** for price data.\n\n"
-                f"Options/GEX data requires the backend API."
-            )
+        st.warning(
+            f"Backend API offline - options/GEX data unavailable.\n\n"
+            f"Local backend example:\n"
+            f"`uvicorn api:app --port 8000 --reload`"
+        )
     
     options_result = None
     weekly_result = None
     fetch_error = None
-    finnhub_price_data = None
 
     if fetch_btn:
         spot_for_fetch = spot
         # Re-fetch spot on Fetch Data click if using a live source
         if spot_source != "Manual" and symbol:
-            if spot_source == "Finnhub (recommended)":
-                finnhub_data = get_spot_from_finnhub(symbol)
-                if finnhub_data:
-                    spot_for_fetch = float(finnhub_data["spot"])
-                    st.session_state["spot_input_pending"] = float(finnhub_data["spot"])
-                    # Store full Finnhub data for display
-                    st.session_state["finnhub_price_data"] = finnhub_data
-                else:
-                    yahoo_spot = get_spot_from_yahoo(symbol)
-                    if yahoo_spot:
-                        spot_for_fetch = float(yahoo_spot)
-                        st.session_state["spot_input_pending"] = float(yahoo_spot)
-            elif spot_source == "Barchart" and api_ok:
-                spot_quote = fetch_spot_quote(symbol, date)
-                if spot_quote.get("success"):
-                    spot_data = spot_quote.get("data", {})
-                    st.session_state["spot_data"] = spot_data
-                    st.session_state["spot_last_ts"] = time.time()
-                    st.session_state["spot_error"] = None
-                    spot_val = spot_data.get("spot")
-                    if spot_val is not None:
-                        spot_for_fetch = float(spot_val)
-                        st.session_state["spot_input_pending"] = float(spot_val)
-                else:
-                    st.session_state["spot_error"] = spot_quote.get("error")
-            elif spot_source == "Yahoo Finance":
-                yahoo_spot = get_spot_from_yahoo(symbol)
-                if yahoo_spot:
-                    spot_for_fetch = float(yahoo_spot)
-                    st.session_state["spot_input_pending"] = float(yahoo_spot)
-
+            finnhub_data = get_spot_from_finnhub(symbol)
+            if finnhub_data:
+                spot_for_fetch = float(finnhub_data["spot"])
+                st.session_state["spot_input_pending"] = float(finnhub_data["spot"])
+                st.session_state["spot_data"] = {
+                    "symbol": symbol,
+                    "spot": finnhub_data["spot"],
+                    "spot_text": f"${finnhub_data['spot']:.2f}",
+                    "change_text": f"{finnhub_data['change']:+.2f}" if finnhub_data.get('change') else None,
+                    "percent_text": f"{finnhub_data['percent_change']:+.2f}%" if finnhub_data.get('percent_change') else None,
+                    "trade_time": finnhub_data.get("timestamp"),
+                    "source": "Finnhub"
+                }
+                st.session_state["spot_error"] = None
+                st.session_state["spot_source_used"] = "Finnhub"
+            else:
+                st.session_state["spot_error"] = "Finnhub API key not set or no data"
 
         spot = float(spot_for_fetch) if spot_for_fetch is not None else float(spot_input)
         st.session_state["last_fetch"] = {"symbol": symbol, "date": date, "spot": spot}
 
-        # Determine data source based on spot_source selection
-        if spot_source == "Finnhub (recommended)":
-            # ALWAYS use Finnhub API when Finnhub is selected (ignore backend)
-            with st.spinner(f"Fetching comprehensive data from Finnhub for {symbol}..."):
-                finnhub_full_data = fetch_all_finnhub_data(symbol)
-                st.session_state["finnhub_full_data"] = finnhub_full_data
-                st.session_state["spot_at_fetch"] = spot
-                # Clear backend results when using Finnhub
-                st.session_state["options_result"] = None
-                st.session_state["weekly_result"] = None
-        else:
-            # For Barchart and Yahoo Finance, use backend scraping
-            st.session_state["finnhub_full_data"] = None  # Clear Finnhub data
-            
-            if api_ok:
-                with st.spinner(f"Fetching {symbol} options for {date}..."):
-                    options_result = fetch_options(symbol, date)
+        if api_ok:
+            with st.spinner(f"Fetching {symbol} options for {date}..."):
+                options_result = fetch_options(symbol, date)
 
-                with st.spinner(f"Computing Weekly Gamma/GEX for {symbol} {date} (spot={spot})..."):
-                    weekly_result = fetch_weekly_summary(symbol, date, spot)
+            with st.spinner(f"Computing Weekly Gamma/GEX for {symbol} {date} (spot={spot})..."):
+                weekly_result = fetch_weekly_summary(symbol, date, spot)
 
-                if not options_result.get("success"):
-                    fetch_error = f"Options error: {options_result.get('error')}"
-                elif not weekly_result.get("success"):
-                    fetch_error = f"Weekly summary error: {weekly_result.get('error')}"
-                else:
-                    st.session_state["options_result"] = options_result
-                    st.session_state["weekly_result"] = weekly_result
-                    st.session_state["spot_at_fetch"] = spot
+            if not options_result.get("success"):
+                fetch_error = f"Options error: {options_result.get('error')}"
+            elif not weekly_result.get("success"):
+                fetch_error = f"Weekly summary error: {weekly_result.get('error')}"
             else:
-                # Backend offline - show error for Barchart/Yahoo sources
+                st.session_state["options_result"] = options_result
+                st.session_state["weekly_result"] = weekly_result
                 st.session_state["spot_at_fetch"] = spot
-                st.warning(f"Backend API offline. Cannot fetch options data for {spot_source}.")
-
-
-
+        else:
+            st.session_state["spot_at_fetch"] = spot
+            st.warning("Backend API offline. Cannot fetch options data.")
 
     if options_result is None:
         options_result = st.session_state.get("options_result")
@@ -3253,474 +3171,6 @@ def main():
 
     if fetch_error:
         st.error(fetch_error)
-
-    # Display Finnhub data if available (when Finnhub source is selected)
-    finnhub_full_data = st.session_state.get("finnhub_full_data")
-    if finnhub_full_data and finnhub_full_data.get("success") and spot_source == "Finnhub (recommended)":
-        st.markdown("---")
-        st.markdown(f"## 📊 {symbol} - Finnhub Market Data")
-        
-        # Company Profile Section
-        profile = finnhub_full_data.get("profile")
-        quote = finnhub_full_data.get("quote")
-        
-        if profile or quote:
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                if profile:
-                    st.markdown(f"**{profile.get('name', symbol)}**")
-                    st.caption(f"{profile.get('finnhubIndustry', 'N/A')} | {profile.get('exchange', 'N/A')}")
-                else:
-                    st.markdown(f"**{symbol}**")
-            
-            with col2:
-                if quote:
-                    change = quote.get('change', 0)
-                    pct = quote.get('percent_change', 0)
-                    color = "green" if change >= 0 else "red"
-                    st.markdown(f"### ${quote.get('spot', 0):.2f}")
-                    st.markdown(f"<span style='color:{color}'>{change:+.2f} ({pct:+.2f}%)</span>", unsafe_allow_html=True)
-            
-            with col3:
-                if quote:
-                    st.metric("Day High", f"${quote.get('high', 0):.2f}")
-            
-            with col4:
-                if quote:
-                    st.metric("Day Low", f"${quote.get('low', 0):.2f}")
-        
-        # Key Metrics Section
-        financials = finnhub_full_data.get("financials")
-        if financials and financials.get("metric"):
-            metrics = financials["metric"]
-            st.markdown("### 📈 Key Metrics")
-            
-            m_cols = st.columns(6)
-            metric_items = [
-                ("52W High", metrics.get("52WeekHigh"), "${:.2f}"),
-                ("52W Low", metrics.get("52WeekLow"), "${:.2f}"),
-                ("P/E Ratio", metrics.get("peBasicExclExtraTTM"), "{:.2f}"),
-                ("Beta", metrics.get("beta"), "{:.3f}"),
-                ("Div Yield", metrics.get("dividendYieldIndicatedAnnual"), "{:.2%}" if metrics.get("dividendYieldIndicatedAnnual") else None),
-                ("Market Cap", metrics.get("marketCapitalization"), "${:.0f}M"),
-            ]
-            
-            for i, (label, value, fmt) in enumerate(metric_items):
-                with m_cols[i]:
-                    if value is not None:
-                        if fmt == "{:.2%}":
-                            st.metric(label, f"{value:.2%}")
-                        else:
-                            st.metric(label, fmt.format(value) if value else "N/A")
-                    else:
-                        st.metric(label, "N/A")
-        
-        # Price Chart with Candlesticks
-        candles = finnhub_full_data.get("candles")
-        if candles and candles.get("close"):
-            st.markdown("### 📉 Price History (1 Year)")
-            
-            # Convert timestamps to dates
-            from datetime import datetime as _dt
-            dates = [_dt.fromtimestamp(ts) for ts in candles.get("timestamps", [])]
-            
-            fig_candle = go.Figure()
-            
-            # Add candlestick chart
-            fig_candle.add_trace(go.Candlestick(
-                x=dates,
-                open=candles.get("open", []),
-                high=candles.get("high", []),
-                low=candles.get("low", []),
-                close=candles.get("close", []),
-                name="Price"
-            ))
-            
-            # Add 20-day MA
-            close_series = pd.Series(candles.get("close", []))
-            ma20 = close_series.rolling(window=20).mean()
-            ma50 = close_series.rolling(window=50).mean()
-            
-            fig_candle.add_trace(go.Scatter(
-                x=dates, y=ma20, mode='lines',
-                name='MA 20', line=dict(color='orange', width=1)
-            ))
-            fig_candle.add_trace(go.Scatter(
-                x=dates, y=ma50, mode='lines',
-                name='MA 50', line=dict(color='blue', width=1)
-            ))
-            
-            fig_candle.update_layout(
-                title=f"{symbol} Price Chart",
-                yaxis_title="Price ($)",
-                xaxis_title="Date",
-                template="plotly_dark",
-                height=500,
-                xaxis_rangeslider_visible=False
-            )
-            st.plotly_chart(fig_candle, use_container_width=True)
-            
-            # Volume Chart
-            st.markdown("### 📊 Volume")
-            fig_vol = go.Figure()
-            colors = ['green' if c >= o else 'red' 
-                     for c, o in zip(candles.get("close", []), candles.get("open", []))]
-            fig_vol.add_trace(go.Bar(
-                x=dates, y=candles.get("volume", []),
-                marker_color=colors, name="Volume"
-            ))
-            fig_vol.update_layout(
-                template="plotly_dark",
-                height=250,
-                yaxis_title="Volume"
-            )
-            st.plotly_chart(fig_vol, use_container_width=True)
-        
-        # Analyst Recommendations
-        recommendations = finnhub_full_data.get("recommendations")
-        if recommendations and len(recommendations) > 0:
-            st.markdown("### 🎯 Analyst Recommendations")
-            
-            # Get most recent recommendation
-            recent = recommendations[0]
-            
-            rec_cols = st.columns(5)
-            rec_items = [
-                ("Strong Buy", recent.get("strongBuy", 0), "#00c853"),
-                ("Buy", recent.get("buy", 0), "#4caf50"),
-                ("Hold", recent.get("hold", 0), "#ff9800"),
-                ("Sell", recent.get("sell", 0), "#f44336"),
-                ("Strong Sell", recent.get("strongSell", 0), "#b71c1c"),
-            ]
-            
-            for i, (label, count, color) in enumerate(rec_items):
-                with rec_cols[i]:
-                    st.markdown(f"<div style='text-align:center; padding:10px; background-color:{color}20; border-radius:8px;'>"
-                              f"<h3 style='margin:0; color:{color};'>{count}</h3>"
-                              f"<p style='margin:0; font-size:12px;'>{label}</p></div>", 
-                              unsafe_allow_html=True)
-            
-            # Recommendation history chart
-            if len(recommendations) > 1:
-                rec_df = pd.DataFrame(recommendations[:12])  # Last 12 months
-                rec_df['period'] = pd.to_datetime(rec_df['period'])
-                rec_df = rec_df.sort_values('period')
-                
-                fig_rec = go.Figure()
-                fig_rec.add_trace(go.Bar(name='Strong Buy', x=rec_df['period'], y=rec_df['strongBuy'], marker_color='#00c853'))
-                fig_rec.add_trace(go.Bar(name='Buy', x=rec_df['period'], y=rec_df['buy'], marker_color='#4caf50'))
-                fig_rec.add_trace(go.Bar(name='Hold', x=rec_df['period'], y=rec_df['hold'], marker_color='#ff9800'))
-                fig_rec.add_trace(go.Bar(name='Sell', x=rec_df['period'], y=rec_df['sell'], marker_color='#f44336'))
-                fig_rec.add_trace(go.Bar(name='Strong Sell', x=rec_df['period'], y=rec_df['strongSell'], marker_color='#b71c1c'))
-                
-                fig_rec.update_layout(
-                    barmode='stack',
-                    title="Recommendation History",
-                    template="plotly_dark",
-                    height=350
-                )
-                st.plotly_chart(fig_rec, use_container_width=True)
-        
-        # Price Target with Gauge
-        price_target = finnhub_full_data.get("price_target")
-        if price_target and quote:
-            st.markdown("### 🎯 Analyst Price Targets")
-            
-            current = quote.get('spot', 0)
-            target_low = price_target.get('targetLow', 0)
-            target_mean = price_target.get('targetMean', 0)
-            target_median = price_target.get('targetMedian', 0)
-            target_high = price_target.get('targetHigh', 0)
-            num_analysts = price_target.get('numberAnalysts', 0)
-            
-            # Create bullet gauge chart
-            fig_gauge = go.Figure()
-            
-            # Add bullet gauge
-            fig_gauge.add_trace(go.Indicator(
-                mode = "number+gauge+delta",
-                value = current,
-                domain = {'x': [0.1, 0.9], 'y': [0.3, 0.9]},
-                title = {'text': f"<b>Current vs Target</b><br><span style='font-size:12px'>({num_analysts} analysts)</span>"},
-                delta = {'reference': target_mean, 'increasing': {'color': "green"}, 'decreasing': {'color': "red"}},
-                gauge = {
-                    'shape': "bullet",
-                    'axis': {'range': [min(target_low * 0.9, current * 0.9), max(target_high * 1.1, current * 1.1)]},
-                    'threshold': {
-                        'line': {'color': "white", 'width': 3},
-                        'thickness': 0.8,
-                        'value': target_mean
-                    },
-                    'steps': [
-                        {'range': [target_low, target_mean], 'color': "rgba(255, 152, 0, 0.4)"},
-                        {'range': [target_mean, target_high], 'color': "rgba(76, 175, 80, 0.4)"}
-                    ],
-                    'bar': {'color': "#2196F3", 'thickness': 0.3}
-                }
-            ))
-            
-            fig_gauge.update_layout(
-                height=180,
-                template="plotly_dark",
-                margin=dict(l=20, r=20, t=60, b=20)
-            )
-            st.plotly_chart(fig_gauge, use_container_width=True)
-            
-            # Price target metrics
-            pt_cols = st.columns(5)
-            with pt_cols[0]:
-                st.metric("🔴 Low", f"${target_low:.2f}", 
-                         delta=f"{((target_low - current) / current * 100):+.1f}%" if current > 0 else None)
-            with pt_cols[1]:
-                st.metric("🟡 Mean", f"${target_mean:.2f}",
-                         delta=f"{((target_mean - current) / current * 100):+.1f}%" if current > 0 else None)
-            with pt_cols[2]:
-                st.metric("🟠 Median", f"${target_median:.2f}",
-                         delta=f"{((target_median - current) / current * 100):+.1f}%" if current > 0 else None)
-            with pt_cols[3]:
-                st.metric("🟢 High", f"${target_high:.2f}",
-                         delta=f"{((target_high - current) / current * 100):+.1f}%" if current > 0 else None)
-            with pt_cols[4]:
-                st.metric("👥 Analysts", num_analysts)
-        
-
-        # Earnings History
-        earnings = finnhub_full_data.get("earnings")
-        if earnings and len(earnings) > 0:
-            st.markdown("### 💰 Earnings History")
-            
-            earn_df = pd.DataFrame(earnings[:8])  # Last 8 quarters
-            if 'period' in earn_df.columns:
-                earn_df = earn_df.sort_values('period')
-                
-                fig_earn = go.Figure()
-                fig_earn.add_trace(go.Bar(
-                    name='Actual EPS', x=earn_df['period'], y=earn_df['actual'],
-                    marker_color=['green' if a >= e else 'red' 
-                                 for a, e in zip(earn_df['actual'], earn_df['estimate'])]
-                ))
-                fig_earn.add_trace(go.Scatter(
-                    name='Estimate', x=earn_df['period'], y=earn_df['estimate'],
-                    mode='lines+markers', line=dict(color='yellow', dash='dash')
-                ))
-                
-                fig_earn.update_layout(
-                    title="EPS: Actual vs Estimate",
-                    template="plotly_dark",
-                    height=350,
-                    yaxis_title="EPS ($)"
-                )
-                st.plotly_chart(fig_earn, use_container_width=True)
-        
-        # Technical Indicators Section
-        technical = finnhub_full_data.get("technical")
-        if technical:
-            st.markdown("### 🔬 Technical Analysis")
-            
-            tech_analysis = technical.get("technicalAnalysis", {})
-            trend = technical.get("trend", {})
-            count = tech_analysis.get("count", {})
-            signal = tech_analysis.get("signal", "neutral")
-            
-            # Signal display with color
-            signal_colors = {
-                "strong buy": "#00c853",
-                "buy": "#4caf50",
-                "neutral": "#ff9800",
-                "sell": "#f44336",
-                "strong sell": "#b71c1c"
-            }
-            signal_color = signal_colors.get(signal.lower(), "#ff9800")
-            
-            tech_cols = st.columns(4)
-            with tech_cols[0]:
-                st.markdown(f"""
-                <div style='text-align:center; padding:15px; background: linear-gradient(135deg, {signal_color}30, {signal_color}10); 
-                     border: 2px solid {signal_color}; border-radius:12px;'>
-                    <h3 style='margin:0; color:{signal_color}; text-transform:uppercase;'>{signal}</h3>
-                    <p style='margin:0; font-size:12px; color: #888;'>Overall Signal</p>
-                </div>
-                """, unsafe_allow_html=True)
-            with tech_cols[1]:
-                buy = count.get("buy", 0)
-                st.metric("🟢 Buy Signals", buy)
-            with tech_cols[2]:
-                neutral = count.get("neutral", 0)
-                st.metric("🟡 Neutral", neutral)
-            with tech_cols[3]:
-                sell = count.get("sell", 0)
-                st.metric("🔴 Sell Signals", sell)
-            
-            # Trend info
-            if trend:
-                adx = trend.get("adx", 0)
-                trending = trend.get("trending", False)
-                trend_text = "📈 **Trending**" if trending else "📊 **Consolidating**"
-                st.info(f"{trend_text} | ADX: {adx:.1f} ({'Strong trend' if adx > 25 else 'Weak trend' if adx > 20 else 'No clear trend'})")
-        
-        # Support/Resistance Levels
-        sr = finnhub_full_data.get("support_resistance")
-        if sr and sr.get("levels"):
-            levels = sr.get("levels", [])
-            if levels and quote:
-                st.markdown("### 📍 Support & Resistance Levels")
-                current_price = quote.get('spot', 0)
-                
-                # Separate into support and resistance
-                supports = sorted([l for l in levels if l < current_price], reverse=True)[:3]
-                resistances = sorted([l for l in levels if l > current_price])[:3]
-                
-                sr_cols = st.columns(2)
-                with sr_cols[0]:
-                    st.markdown("**🟢 Support Levels**")
-                    for i, s in enumerate(supports):
-                        dist = ((current_price - s) / current_price * 100)
-                        st.markdown(f"S{i+1}: **${s:.2f}** ({dist:.1f}% below)")
-                with sr_cols[1]:
-                    st.markdown("**🔴 Resistance Levels**")
-                    for i, r in enumerate(resistances):
-                        dist = ((r - current_price) / current_price * 100)
-                        st.markdown(f"R{i+1}: **${r:.2f}** ({dist:.1f}% above)")
-        
-        # Peers Comparison
-        peers = finnhub_full_data.get("peers")
-        peers_quotes = finnhub_full_data.get("peers_quotes")
-        if peers and len(peers) > 1:
-            st.markdown("### 👥 Peer Comparison")
-            
-            if peers_quotes:
-                peer_data = []
-                for peer_symbol in peers[:6]:
-                    if peer_symbol == symbol:
-                        continue
-                    if peer_symbol in peers_quotes:
-                        pq = peers_quotes[peer_symbol]
-                        peer_data.append({
-                            "Symbol": peer_symbol,
-                            "Price": f"${pq['price']:.2f}" if pq['price'] else "N/A",
-                            "Change": f"{pq['change']:+.2f}" if pq['change'] else "N/A",
-                            "% Change": f"{pq['percent_change']:+.2f}%" if pq['percent_change'] else "N/A"
-                        })
-                
-                if peer_data:
-                    peer_df = pd.DataFrame(peer_data)
-                    st.dataframe(peer_df, use_container_width=True, hide_index=True)
-            else:
-                # Just show peer symbols as badges
-                peer_badges = " ".join([f"`{p}`" for p in peers[:8] if p != symbol])
-                st.markdown(f"Related: {peer_badges}")
-        
-        # Insider Sentiment
-        insider = finnhub_full_data.get("insider_sentiment")
-        if insider and insider.get("data"):
-            st.markdown("### 🕵️ Insider Sentiment (12 Months)")
-            
-            insider_data = insider.get("data", [])
-            if len(insider_data) > 0:
-                insider_df = pd.DataFrame(insider_data)
-                
-                # Calculate totals
-                total_change = sum([d.get('change', 0) for d in insider_data])
-                avg_mspr = sum([d.get('mspr', 0) for d in insider_data]) / len(insider_data) if insider_data else 0
-                
-                in_cols = st.columns(3)
-                with in_cols[0]:
-                    color = "green" if total_change > 0 else "red"
-                    st.metric("Net Insider Activity", f"{total_change:+,.0f} shares", 
-                             delta="Net Buying" if total_change > 0 else "Net Selling")
-                with in_cols[1]:
-                    st.metric("Avg MSPR", f"{avg_mspr:.2f}", 
-                             help="Monthly Share Purchase Ratio: +100 = all buying, -100 = all selling")
-                with in_cols[2]:
-                    sentiment = "Bullish 🐂" if avg_mspr > 0 else "Bearish 🐻" if avg_mspr < 0 else "Neutral"
-                    st.metric("Insider Sentiment", sentiment)
-                
-                # Insider activity chart
-                if 'month' in insider_df.columns and 'year' in insider_df.columns:
-                    insider_df['period'] = insider_df.apply(lambda x: f"{x['year']}-{x['month']:02d}", axis=1)
-                    insider_df = insider_df.sort_values('period')
-                    
-                    fig_insider = go.Figure()
-                    fig_insider.add_trace(go.Bar(
-                        x=insider_df['period'], y=insider_df['change'],
-                        marker_color=['green' if c > 0 else 'red' for c in insider_df['change']],
-                        name="Net Shares"
-                    ))
-                    fig_insider.update_layout(
-                        title="Monthly Insider Net Share Activity",
-                        template="plotly_dark",
-                        height=300,
-                        yaxis_title="Shares Traded"
-                    )
-                    st.plotly_chart(fig_insider, use_container_width=True)
-        
-        # Upgrade/Downgrade History
-        upgrades = finnhub_full_data.get("upgrades_downgrades")
-        if upgrades and len(upgrades) > 0:
-            st.markdown("### 📊 Recent Rating Changes")
-            
-            # Create rating changes table
-            rating_data = []
-            for ud in upgrades[:10]:
-                action = ud.get("action", "")
-                action_icons = {
-                    "up": "⬆️ Upgrade",
-                    "down": "⬇️ Downgrade", 
-                    "main": "➡️ Maintains",
-                    "init": "🆕 Initiates",
-                    "reit": "🔄 Reiterates"
-                }
-                
-                from datetime import datetime as _dt
-                grade_time = ud.get("gradeTime")
-                date_str = _dt.fromtimestamp(grade_time).strftime("%Y-%m-%d") if grade_time else "N/A"
-                
-                rating_data.append({
-                    "Date": date_str,
-                    "Firm": ud.get("company", "Unknown")[:25],
-                    "Action": action_icons.get(action, action),
-                    "From": ud.get("fromGrade", "—"),
-                    "To": ud.get("toGrade", "—")
-                })
-            
-            if rating_data:
-                ratings_df = pd.DataFrame(rating_data)
-                st.dataframe(ratings_df, use_container_width=True, hide_index=True)
-        
-        # News Section
-        news = finnhub_full_data.get("news")
-        if news and len(news) > 0:
-            st.markdown("### 📰 Recent News")
-            
-            for article in news[:5]:
-                with st.expander(f"📄 {article.get('headline', 'No headline')[:100]}..."):
-                    st.write(article.get('summary', 'No summary available.'))
-                    st.caption(f"Source: {article.get('source', 'Unknown')} | "
-                             f"[Read more]({article.get('url', '#')})")
-        
-        # Footer with data summary
-        st.markdown("---")
-        
-        # Data summary
-        data_sources = []
-        if finnhub_full_data.get("quote"): data_sources.append("Quote")
-        if finnhub_full_data.get("profile"): data_sources.append("Profile")
-        if finnhub_full_data.get("financials"): data_sources.append("Financials")
-        if finnhub_full_data.get("candles"): data_sources.append("Historical")
-        if finnhub_full_data.get("recommendations"): data_sources.append("Recommendations")
-        if finnhub_full_data.get("price_target"): data_sources.append("Price Targets")
-        if finnhub_full_data.get("earnings"): data_sources.append("Earnings")
-        if finnhub_full_data.get("technical"): data_sources.append("Technical")
-        if finnhub_full_data.get("support_resistance"): data_sources.append("S/R Levels")
-        if finnhub_full_data.get("peers"): data_sources.append("Peers")
-        if finnhub_full_data.get("insider_sentiment"): data_sources.append("Insider Data")
-        if finnhub_full_data.get("upgrades_downgrades"): data_sources.append("Ratings")
-        if finnhub_full_data.get("news"): data_sources.append("News")
-        
-        st.caption(f"📊 **Finnhub Data Loaded**: {', '.join(data_sources)}")
-        st.caption("Data provided by [Finnhub.io](https://finnhub.io) | Free tier: 60 API calls/minute")
-
 
     if options_result and weekly_result:
         spot = st.session_state.get("spot_at_fetch", spot)

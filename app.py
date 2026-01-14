@@ -3173,15 +3173,25 @@ def main():
         st.error(fetch_error)
 
     if options_result and weekly_result:
-        spot = st.session_state.get("spot_at_fetch", spot)
-        last_fetch = st.session_state.get("last_fetch")
-        if last_fetch and (last_fetch.get("symbol") != symbol or last_fetch.get("date") != date):
-            st.warning("Inputs changed - click Fetch Data to refresh results.")
+        options_ok = isinstance(options_result, dict) and options_result.get("success") and isinstance(options_result.get("data"), dict)
+        weekly_ok = isinstance(weekly_result, dict) and weekly_result.get("success") and isinstance(weekly_result.get("data"), dict)
 
-        api_data = options_result["data"]
-        df = pd.DataFrame(api_data.get("data", []))
+        if not options_ok or not weekly_ok:
+            opt_err = options_result.get("error") if isinstance(options_result, dict) else None
+            wk_err = weekly_result.get("error") if isinstance(weekly_result, dict) else None
+            msg_parts = [m for m in [opt_err, wk_err] if m]
+            msg = " | ".join(msg_parts) if msg_parts else "Data unavailable (missing payload)."
+            st.warning(f"Options/GEX data unavailable: {msg}")
+        else:
+            spot = st.session_state.get("spot_at_fetch", spot)
+            last_fetch = st.session_state.get("last_fetch")
+            if last_fetch and (last_fetch.get("symbol") != symbol or last_fetch.get("date") != date):
+                st.warning("Inputs changed - click Fetch Data to refresh results.")
 
-        w = weekly_result["data"]
+            api_data = options_result["data"]
+            df = pd.DataFrame(api_data.get("data", []))
+
+            w = weekly_result["data"]
         totals = w.get("totals", {}) or {}
         pcr = w.get("pcr", {}) or {}
         top = w.get("top_strikes", {}) or {}

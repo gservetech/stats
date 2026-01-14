@@ -2973,6 +2973,9 @@ def main():
                 f"`uvicorn api:app --port 8000 --reload`"
             )
             return
+        elif spot_source == "Finnhub (recommended)":
+            # Finnhub works independently - no warning needed
+            pass
         else:
             st.warning(
                 f"Backend API offline - using **{spot_source.replace(' (recommended)', '')}** for price data.\n\n"
@@ -3023,33 +3026,40 @@ def main():
         spot = float(spot_for_fetch) if spot_for_fetch is not None else float(spot_input)
         st.session_state["last_fetch"] = {"symbol": symbol, "date": date, "spot": spot}
 
-        # Fetch options data from backend if available
-        if api_ok:
-            with st.spinner(f"Fetching {symbol} options for {date}..."):
-                options_result = fetch_options(symbol, date)
-
-            with st.spinner(f"Computing Weekly Gamma/GEX for {symbol} {date} (spot={spot})..."):
-                weekly_result = fetch_weekly_summary(symbol, date, spot)
-
-            if not options_result.get("success"):
-                fetch_error = f"Options error: {options_result.get('error')}"
-            elif not weekly_result.get("success"):
-                fetch_error = f"Weekly summary error: {weekly_result.get('error')}"
-            else:
-                st.session_state["options_result"] = options_result
-                st.session_state["weekly_result"] = weekly_result
+        # Determine data source based on spot_source selection
+        if spot_source == "Finnhub (recommended)":
+            # ALWAYS use Finnhub API when Finnhub is selected (ignore backend)
+            with st.spinner(f"Fetching comprehensive data from Finnhub for {symbol}..."):
+                finnhub_full_data = fetch_all_finnhub_data(symbol)
+                st.session_state["finnhub_full_data"] = finnhub_full_data
                 st.session_state["spot_at_fetch"] = spot
+                # Clear backend results when using Finnhub
+                st.session_state["options_result"] = None
+                st.session_state["weekly_result"] = None
         else:
-            # Backend offline - Finnhub-only mode
-            st.session_state["spot_at_fetch"] = spot
+            # For Barchart Backend and Yahoo Finance, use backend scraping
+            st.session_state["finnhub_full_data"] = None  # Clear Finnhub data
             
-            # Fetch comprehensive Finnhub data
-            if spot_source == "Finnhub (recommended)":
-                with st.spinner(f"Fetching comprehensive data from Finnhub for {symbol}..."):
-                    finnhub_full_data = fetch_all_finnhub_data(symbol)
-                    st.session_state["finnhub_full_data"] = finnhub_full_data
+            if api_ok:
+                with st.spinner(f"Fetching {symbol} options for {date}..."):
+                    options_result = fetch_options(symbol, date)
+
+                with st.spinner(f"Computing Weekly Gamma/GEX for {symbol} {date} (spot={spot})..."):
+                    weekly_result = fetch_weekly_summary(symbol, date, spot)
+
+                if not options_result.get("success"):
+                    fetch_error = f"Options error: {options_result.get('error')}"
+                elif not weekly_result.get("success"):
+                    fetch_error = f"Weekly summary error: {weekly_result.get('error')}"
+                else:
+                    st.session_state["options_result"] = options_result
+                    st.session_state["weekly_result"] = weekly_result
+                    st.session_state["spot_at_fetch"] = spot
             else:
-                st.info(f"✅ **{symbol}** spot price: **${spot:.2f}** (from {spot_source.replace(' (recommended)', '')})")
+                # Backend offline - show error for Barchart/Yahoo sources
+                st.session_state["spot_at_fetch"] = spot
+                st.warning(f"Backend API offline. Cannot fetch options data for {spot_source}.")
+
 
 
 
@@ -3061,9 +3071,9 @@ def main():
     if fetch_error:
         st.error(fetch_error)
 
-    # Display Finnhub data if available (when backend is offline)
+    # Display Finnhub data if available (when Finnhub source is selected)
     finnhub_full_data = st.session_state.get("finnhub_full_data")
-    if finnhub_full_data and finnhub_full_data.get("success") and not api_ok:
+    if finnhub_full_data and finnhub_full_data.get("success") and spot_source == "Finnhub (recommended)":
         st.markdown("---")
         st.markdown(f"## 📊 {symbol} - Finnhub Market Data")
         

@@ -235,7 +235,13 @@ def get_spot_from_finnhub(symbol: str) -> dict | None:
     return None
 
 
-def get_stock_candles_from_finnhub(symbol: str, resolution: str = "D", from_ts: int = None, to_ts: int = None) -> dict | None:
+def get_stock_candles_from_finnhub(
+    symbol: str,
+    resolution: str = "D",
+    from_ts: int = None,
+    to_ts: int = None,
+    return_raw: bool = False,
+) -> dict | None:
     """
     Fetch historical stock candles from Finnhub API.
     
@@ -251,11 +257,11 @@ def get_stock_candles_from_finnhub(symbol: str, resolution: str = "D", from_ts: 
     """
     symbol = (symbol or "").strip().upper()
     if not symbol:
-        return None
+        return {"s": "error", "error": "missing_symbol"} if return_raw else None
     
     api_key = get_finnhub_api_key()
     if not api_key:
-        return None
+        return {"s": "error", "error": "missing_api_key"} if return_raw else None
     
     # Default to last 30 days if no range specified
     if to_ts is None:
@@ -270,29 +276,51 @@ def get_stock_candles_from_finnhub(symbol: str, resolution: str = "D", from_ts: 
             "resolution": resolution,
             "from": from_ts,
             "to": to_ts,
-            "token": api_key
+            "token": api_key,
         }
-        
+
         resp = requests.get(url, params=params, timeout=15, headers={
             "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json"
+            "Accept": "application/json",
         })
-        resp.raise_for_status()
-        data = resp.json()
-        
-        if data and data.get('s') == 'ok':
+
+        data = None
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"error": resp.text[:500]} if resp.text else {"error": "invalid_json"}
+
+        if resp.status_code != 200:
+            if return_raw:
+                msg = data.get("error") if isinstance(data, dict) else None
+                return {
+                    "s": "error",
+                    "error": f"http_{resp.status_code}",
+                    "status_code": resp.status_code,
+                    "message": msg or (resp.text[:500] if resp.text else None),
+                }
+            return None
+
+        if return_raw:
+            return data
+
+        if data and data.get("s") == "ok":
             return {
-                "open": data.get('o', []),
-                "high": data.get('h', []),
-                "low": data.get('l', []),
-                "close": data.get('c', []),
-                "volume": data.get('v', []),
-                "timestamps": data.get('t', []),
-                "source": "Finnhub"
+                "open": data.get("o", []),
+                "high": data.get("h", []),
+                "low": data.get("l", []),
+                "close": data.get("c", []),
+                "volume": data.get("v", []),
+                "timestamps": data.get("t", []),
+                "source": "Finnhub",
             }
+    except requests.exceptions.RequestException as e:
+        if return_raw:
+            return {"s": "error", "error": "request_failed", "message": str(e)}
     except Exception:
-        pass
-    
+        if return_raw:
+            return {"s": "error", "error": "request_failed"}
+
     return None
 
 
@@ -1101,34 +1129,73 @@ def rolling_eigen_entropy(df: pd.DataFrame, features: list[str], window: int, ba
 
 
 @safe_cache_data(ttl=900, show_spinner=False)
-def fetch_finnhub_candles_df(symbol: str, lookback_days: int = 730, resolution: str = "D") -> pd.DataFrame:
+def fetch_finnhub_candles_df(
+    symbol: str,
+    lookback_days: int = 730,
+    resolution: str = "D",
+) -> tuple[pd.DataFrame, int | None, str | None, str | None]:
     symbol = (symbol or "").strip().upper()
     if not symbol:
-        return pd.DataFrame()
+        return pd.DataFrame(), None, "missing_symbol", None
 
+    resolution = str(resolution).strip().upper()
     to_ts = int(time.time())
-    from_ts = to_ts - int(lookback_days * 24 * 60 * 60)
-    candles = get_stock_candles_from_finnhub(symbol, resolution=resolution, from_ts=from_ts, to_ts=to_ts)
-    if not candles:
-        return pd.DataFrame()
 
-    ts = candles.get("timestamps") or []
-    if not ts:
-        return pd.DataFrame()
+    attempts = []
+    if resolution != "D":
+        max_days = 90 if resolution == "60" else 30
+        attempts = [min(int(lookback_days), max_days)]
+    else:
+        attempts = [int(lookback_days)]
+        if lookback_days > 365:
+            attempts.append(365)
+        if lookback_days > 180:
+            attempts.append(180)
 
-    df = pd.DataFrame({
-        "Date": pd.to_datetime(ts, unit="s"),
-        "Open": candles.get("open", []),
-        "High": candles.get("high", []),
-        "Low": candles.get("low", []),
-        "Close": candles.get("close", []),
-        "Volume": candles.get("volume", []),
-    })
-    df = df.dropna(subset=["Date", "Close"])
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["Close"]).sort_values("Date").reset_index(drop=True)
+    attempts = [days for days in attempts if days > 0]
+    status = None
+    error = None
+
+    for days in attempts:
+        from_ts = to_ts - int(days * 24 * 60 * 60)
+        raw = get_stock_candles_from_finnhub(
+            symbol,
+            resolution=resolution,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            return_raw=True,
+        )
+        if not raw:
+            status = "request_failed"
+            error = None
+            continue
+
+        status = raw.get("s") or "unknown"
+        error = raw.get("message") or raw.get("error")
+        if status != "ok":
+            continue
+
+        ts = raw.get("t") or []
+        if not ts:
+            continue
+
+        df = pd.DataFrame({
+            "Date": pd.to_datetime(ts, unit="s", errors="coerce"),
+            "Open": raw.get("o", []),
+            "High": raw.get("h", []),
+            "Low": raw.get("l", []),
+            "Close": raw.get("c", []),
+            "Volume": raw.get("v", []),
+        })
+        df = df.dropna(subset=["Date", "Close"])
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Close"]).sort_values("Date").reset_index(drop=True)
+        if not df.empty:
+            return df, days, status, error
+
+    return pd.DataFrame(), None, status, error
 
 
 def build_market_folding(df: pd.DataFrame, window_size: int, smooth: int, entropy_base: float,
@@ -4166,49 +4233,64 @@ def main():
 
             with tab7:
                 st.subheader("Market Folding (Eigen-Entropy)")
-                st.caption("Uses Finnhub candles (requires FINNHUB_API_KEY).")
+                st.caption("Analyzes market structure using eigen-entropy of technical indicators (uses Yahoo Finance data).")
 
-                if not get_finnhub_api_key():
-                    st.info("Set FINNHUB_API_KEY in Streamlit secrets or the environment to enable Finnhub data.")
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    period_options = ["6mo", "1y", "2y", "5y"]
+                    period_idx = st.selectbox("History Period", period_options, index=2)
+                with c2:
+                    interval_options = ["1d", "1wk"]
+                    interval_idx = st.selectbox("Interval", interval_options, index=0, help="Daily (1d) or Weekly (1wk)")
+                with c3:
+                    window_size = st.number_input("Correlation window", min_value=10, max_value=200, value=50, step=1)
+                with c4:
+                    smooth = st.number_input("Smoothing", min_value=1, max_value=50, value=5, step=1)
+
+                c5, c6 = st.columns(2)
+                with c5:
+                    entropy_base = st.number_input("Entropy base", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
+                with c6:
+                    low_q, high_q = st.slider(
+                        "Regime quantiles",
+                        min_value=0.05,
+                        max_value=0.95,
+                        value=(0.25, 0.75),
+                        step=0.05,
+                    )
+
+                if high_q <= low_q:
+                    st.warning("High quantile must be above low quantile.")
                 else:
-                    c1, c2, c3, c4 = st.columns(4)
-                    with c1:
-                        lookback_days = st.selectbox("Lookback", [180, 365, 730, 1095], index=2)
-                    with c2:
-                        resolution = st.selectbox(
-                            "Resolution",
-                            ["D", "60", "30", "15"],
-                            index=0,
-                            help="Finnhub resolution: D=daily, 60=1h, 30=30m, 15=15m.",
-                        )
-                    with c3:
-                        window_size = st.number_input("Correlation window", min_value=10, max_value=200, value=50, step=1)
-                    with c4:
-                        smooth = st.number_input("Smoothing", min_value=1, max_value=50, value=5, step=1)
+                    with st.spinner(f"Loading {symbol} data from Yahoo Finance..."):
+                        try:
+                            hist_yf = yf.download(symbol, period=period_idx, interval=interval_idx, auto_adjust=False, progress=False)
+                        except Exception as e:
+                            hist_yf = pd.DataFrame()
+                            st.error(f"Error fetching data: {e}")
 
-                    c5, c6 = st.columns(2)
-                    with c5:
-                        entropy_base = st.number_input("Entropy base", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
-                    with c6:
-                        low_q, high_q = st.slider(
-                            "Regime quantiles",
-                            min_value=0.05,
-                            max_value=0.95,
-                            value=(0.25, 0.75),
-                            step=0.05,
-                        )
-
-                    if high_q <= low_q:
-                        st.warning("High quantile must be above low quantile.")
+                    if hist_yf is None or hist_yf.empty:
+                        st.warning("Yahoo Finance returned no data. Try a different symbol or period.")
                     else:
-                        with st.spinner("Loading Finnhub candles..."):
-                            hist_fh = fetch_finnhub_candles_df(symbol, int(lookback_days), str(resolution))
-
-                        if hist_fh.empty:
-                            st.warning("No Finnhub price history returned for this symbol.")
+                        # Normalize yfinance MultiIndex columns
+                        if isinstance(hist_yf.columns, pd.MultiIndex):
+                            hist_yf.columns = hist_yf.columns.droplevel(1)
+                        
+                        hist_yf = hist_yf.reset_index()
+                        # Ensure Date column exists
+                        if "Date" not in hist_yf.columns and "Datetime" in hist_yf.columns:
+                            hist_yf["Date"] = hist_yf["Datetime"]
+                        elif "Date" not in hist_yf.columns:
+                            hist_yf["Date"] = hist_yf.index
+                        
+                        # Check required columns
+                        required = {"High", "Low", "Close", "Volume"}
+                        missing = required - set(hist_yf.columns)
+                        if missing:
+                            st.warning(f"Missing columns: {sorted(list(missing))}. Cannot compute Market Folding.")
                         else:
                             fold_df, loq, hiq = build_market_folding(
-                                hist_fh, int(window_size), int(smooth), float(entropy_base), float(low_q), float(high_q)
+                                hist_yf, int(window_size), int(smooth), float(entropy_base), float(low_q), float(high_q)
                             )
                             plot_df = fold_df.dropna(subset=["Folding_Score"]).copy()
                             if plot_df.empty:
@@ -4231,22 +4313,45 @@ def main():
                                     "TRANSITION": "rgba(200, 200, 200, 0.14)",
                                     "COMPLEX_FOLDED": "rgba(102, 204, 102, 0.18)",
                                 }
+                                regime_line_colors = {
+                                    "COLLAPSED": "#ff4d4d",
+                                    "TRANSITION": "#888888",
+                                    "COMPLEX_FOLDED": "#66cc66",
+                                }
 
-                                fig = go.Figure()
+                                # Create subplots: Price chart on top (3x height), Folding Score oscillator below (1x height)
+                                fig = make_subplots(
+                                    rows=2, cols=1,
+                                    shared_xaxes=True,
+                                    vertical_spacing=0.08,
+                                    row_heights=[0.7, 0.3],
+                                    subplot_titles=(f"{symbol} Price with Regime Shading", "Folding Score (Eigen-Entropy)")
+                                )
 
-                                # Regime shading by contiguous segments.
+                                # Regime shading for BOTH subplots by contiguous segments.
                                 last_reg = None
                                 start_dt = None
                                 for _, row in plot_df.iterrows():
                                     reg = row.get("Regime")
                                     if reg != last_reg:
                                         if last_reg is not None:
+                                            # Add to price chart (row 1)
                                             fig.add_vrect(
                                                 x0=start_dt,
                                                 x1=row["Date"],
                                                 fillcolor=regime_colors.get(last_reg, "rgba(255,255,255,0.05)"),
                                                 opacity=0.35,
                                                 line_width=0,
+                                                row=1, col=1,
+                                            )
+                                            # Add to folding score chart (row 2)
+                                            fig.add_vrect(
+                                                x0=start_dt,
+                                                x1=row["Date"],
+                                                fillcolor=regime_colors.get(last_reg, "rgba(255,255,255,0.05)"),
+                                                opacity=0.35,
+                                                line_width=0,
+                                                row=2, col=1,
                                             )
                                         start_dt = row["Date"]
                                         last_reg = reg
@@ -4257,36 +4362,50 @@ def main():
                                         fillcolor=regime_colors.get(last_reg, "rgba(255,255,255,0.05)"),
                                         opacity=0.35,
                                         line_width=0,
+                                        row=1, col=1,
+                                    )
+                                    fig.add_vrect(
+                                        x0=start_dt,
+                                        x1=plot_df["Date"].iloc[-1],
+                                        fillcolor=regime_colors.get(last_reg, "rgba(255,255,255,0.05)"),
+                                        opacity=0.35,
+                                        line_width=0,
+                                        row=2, col=1,
                                     )
 
+                                # --- Price Chart (Row 1) ---
                                 fig.add_trace(go.Scatter(
                                     x=plot_df["Date"],
                                     y=plot_df["Close"],
                                     mode="lines",
                                     name="Close",
                                     line=dict(color="black", width=1.2),
-                                ))
+                                ), row=1, col=1)
+
                                 fig.add_trace(go.Scatter(
                                     x=plot_df["Date"],
                                     y=plot_df["Close"],
                                     mode="markers",
-                                    name="Folding Score",
+                                    name="Score (color)",
                                     marker=dict(
                                         size=6,
                                         color=plot_df["Folding_Score"],
                                         colorscale="Viridis",
-                                        colorbar=dict(title="Folding Score"),
+                                        colorbar=dict(title="Folding Score", x=1.02, len=0.5, y=0.75),
                                     ),
-                                ))
+                                    showlegend=False,
+                                ), row=1, col=1)
 
-                                fig.add_vline(x=last_date, line_dash="dash", line_width=1.2, opacity=0.6)
+                                # Latest point marker on price chart
+                                fig.add_vline(x=last_date, line_dash="dash", line_width=1.2, opacity=0.6, row=1, col=1)
                                 fig.add_trace(go.Scatter(
                                     x=[last_date],
                                     y=[last_close],
                                     mode="markers",
                                     marker=dict(size=14, color="white", line=dict(color="black", width=1.2)),
                                     name="Latest",
-                                ))
+                                    showlegend=False,
+                                ), row=1, col=1)
 
                                 fig.add_annotation(
                                     x=last_date,
@@ -4302,15 +4421,77 @@ def main():
                                     bgcolor="rgba(255,255,255,0.85)",
                                     bordercolor="black",
                                     borderwidth=1,
+                                    row=1, col=1,
                                 )
 
+                                # --- Folding Score Oscillator (Row 2) ---
+                                # Color each segment based on regime
+                                for regime, color in regime_line_colors.items():
+                                    mask = plot_df["Regime"] == regime
+                                    df_regime = plot_df[mask]
+                                    if not df_regime.empty:
+                                        fig.add_trace(go.Scatter(
+                                            x=df_regime["Date"],
+                                            y=df_regime["Folding_Score"],
+                                            mode="markers",
+                                            marker=dict(size=5, color=color),
+                                            name=regime,
+                                            legendgroup=regime,
+                                        ), row=2, col=1)
+
+                                # Folding score line (connecting all points)
+                                fig.add_trace(go.Scatter(
+                                    x=plot_df["Date"],
+                                    y=plot_df["Folding_Score"],
+                                    mode="lines",
+                                    line=dict(color="rgba(0,0,0,0.4)", width=1),
+                                    name="Folding Score",
+                                    showlegend=False,
+                                ), row=2, col=1)
+
+                                # Add threshold lines for regimes
+                                if loq is not None:
+                                    fig.add_hline(
+                                        y=loq,
+                                        line_dash="dot",
+                                        line_color="#ff4d4d",
+                                        line_width=1.5,
+                                        annotation_text=f"Low ({loq:.3f})",
+                                        annotation_position="bottom right",
+                                        row=2, col=1,
+                                    )
+                                if hiq is not None:
+                                    fig.add_hline(
+                                        y=hiq,
+                                        line_dash="dot",
+                                        line_color="#66cc66",
+                                        line_width=1.5,
+                                        annotation_text=f"High ({hiq:.3f})",
+                                        annotation_position="top right",
+                                        row=2, col=1,
+                                    )
+
+                                # Latest score marker
+                                fig.add_vline(x=last_date, line_dash="dash", line_width=1.2, opacity=0.6, row=2, col=1)
+                                fig.add_trace(go.Scatter(
+                                    x=[last_date],
+                                    y=[last_score],
+                                    mode="markers",
+                                    marker=dict(size=12, color=regime_line_colors.get(last_regime, "black"), 
+                                               line=dict(color="black", width=1.5)),
+                                    name="Latest Score",
+                                    showlegend=False,
+                                ), row=2, col=1)
+
                                 fig.update_layout(
-                                    height=520,
-                                    margin=dict(l=10, r=10, t=40, b=10),
-                                    title=f"{symbol} Market Folding (Eigen-Entropy)",
-                                    xaxis_title="Date",
-                                    yaxis_title="Price",
+                                    height=700,
+                                    margin=dict(l=10, r=80, t=60, b=10),
+                                    title=f"{symbol} Market Folding Analysis (Eigen-Entropy)",
+                                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                                 )
+                                fig.update_yaxes(title_text="Price", row=1, col=1)
+                                fig.update_yaxes(title_text="Folding Score", row=2, col=1)
+                                fig.update_xaxes(title_text="Date", row=2, col=1)
 
                                 st_plot(fig)
                                 if loq is not None and hiq is not None:

@@ -4411,16 +4411,18 @@ def main():
                                     x=last_date,
                                     y=last_close,
                                     text=(
-                                        f"Latest<br>{pd.to_datetime(last_date).date()}<br>"
+                                        f"<b>LATEST</b><br>{pd.to_datetime(last_date).date()}<br>"
                                         f"Close: {last_close:.2f}<br>Score: {last_score:.4f}<br>Regime: {last_regime}"
                                     ),
                                     showarrow=True,
                                     arrowhead=2,
-                                    ax=40,
-                                    ay=-40,
-                                    bgcolor="rgba(255,255,255,0.85)",
-                                    bordercolor="black",
+                                    arrowcolor="white",
+                                    ax=50,
+                                    ay=-50,
+                                    bgcolor="rgba(0,0,0,0.9)",
+                                    bordercolor="white",
                                     borderwidth=1,
+                                    font=dict(color="white", size=11),
                                     row=1, col=1,
                                 )
 

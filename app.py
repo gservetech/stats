@@ -1035,6 +1035,142 @@ def get_price_history_from_yahoo(symbol: str, period: str = "6mo", interval: str
     return None
 
 
+def _shannon_entropy_from_probs(p: np.ndarray, base: float = 2.0) -> float:
+    p = np.asarray(p, dtype=float)
+    p = p[np.isfinite(p) & (p > 0)]
+    if p.size == 0:
+        return float("nan")
+    log_base = np.log(base) if base and base != 1 else 1.0
+    return float(-np.sum(p * np.log(p)) / log_base)
+
+
+def rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def bbands(close: pd.Series, length: int = 20, std: float = 2.0):
+    mid = close.rolling(length).mean()
+    sd = close.rolling(length).std(ddof=0)
+    upper = mid + std * sd
+    lower = mid - std * sd
+    return lower, mid, upper
+
+
+def cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, length: int = 20) -> pd.Series:
+    denom = (high - low).replace(0, np.nan)
+    mfm = ((close - low) - (high - close)) / denom
+    mfv = mfm * volume
+    return mfv.rolling(length).sum() / volume.rolling(length).sum().replace(0, np.nan)
+
+
+def minmax_rolling(x: pd.Series, lookback: int) -> pd.Series:
+    rmin = x.rolling(lookback).min()
+    rmax = x.rolling(lookback).max()
+    return (x - rmin) / (rmax - rmin).replace(0, np.nan)
+
+
+def rolling_eigen_entropy(df: pd.DataFrame, features: list[str], window: int, base: float = 2.0) -> pd.Series:
+    n = len(df)
+    scores = np.full(n, np.nan)
+    X = df[features].to_numpy()
+
+    for i in range(window, n + 1):
+        corr = np.corrcoef(X[i - window:i], rowvar=False)
+        corr = np.nan_to_num(corr)
+        w = np.abs(np.linalg.eigvalsh(corr))
+        s = w.sum()
+        if s > 0 and np.isfinite(s):
+            scores[i - 1] = _shannon_entropy_from_probs(w / s, base=base)
+
+    return pd.Series(scores, index=df.index)
+
+
+@safe_cache_data(ttl=900, show_spinner=False)
+def fetch_finnhub_candles_df(symbol: str, lookback_days: int = 730, resolution: str = "D") -> pd.DataFrame:
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return pd.DataFrame()
+
+    to_ts = int(time.time())
+    from_ts = to_ts - int(lookback_days * 24 * 60 * 60)
+    candles = get_stock_candles_from_finnhub(symbol, resolution=resolution, from_ts=from_ts, to_ts=to_ts)
+    if not candles:
+        return pd.DataFrame()
+
+    ts = candles.get("timestamps") or []
+    if not ts:
+        return pd.DataFrame()
+
+    df = pd.DataFrame({
+        "Date": pd.to_datetime(ts, unit="s"),
+        "Open": candles.get("open", []),
+        "High": candles.get("high", []),
+        "Low": candles.get("low", []),
+        "Close": candles.get("close", []),
+        "Volume": candles.get("volume", []),
+    })
+    df = df.dropna(subset=["Date", "Close"])
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["Close"]).sort_values("Date").reset_index(drop=True)
+
+
+def build_market_folding(df: pd.DataFrame, window_size: int, smooth: int, entropy_base: float,
+                         low_q: float, high_q: float) -> tuple[pd.DataFrame, float | None, float | None]:
+    df = df.copy()
+    for col in ["High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["RSI"] = rsi(df["Close"]) / 100.0
+    lo, mid, hi = bbands(df["Close"])
+    df["BBW"] = minmax_rolling((hi - lo) / mid.replace(0, np.nan), 50)
+    df["NATR"] = atr(df["High"], df["Low"], df["Close"]) / df["Close"].replace(0, np.nan)
+
+    vslow = df["Volume"].rolling(10).mean()
+    vfast = df["Volume"].rolling(5).mean()
+    vol_osc = (vfast - vslow) / vslow.replace(0, np.nan)
+    df["VolOsc"] = np.tanh(vol_osc)
+
+    df["CMF"] = cmf(df["High"], df["Low"], df["Close"], df["Volume"])
+
+    feats = ["RSI", "BBW", "NATR", "VolOsc", "CMF"]
+    df = df.dropna(subset=feats).copy()
+    if df.empty:
+        return df, None, None
+
+    df["Entropy"] = rolling_eigen_entropy(df, feats, window_size, base=entropy_base)
+    df["Folding_Score"] = df["Entropy"].rolling(smooth).mean()
+
+    s = df["Folding_Score"].dropna()
+    if s.empty:
+        return df, None, None
+
+    loq = float(s.quantile(low_q))
+    hiq = float(s.quantile(high_q))
+    df["Regime"] = np.where(
+        df["Folding_Score"] <= loq, "COLLAPSED",
+        np.where(df["Folding_Score"] >= hiq, "COMPLEX_FOLDED", "TRANSITION")
+    )
+
+    return df, loq, hiq
+
+
 def get_api_base_url() -> str:
     """
     Priority:
@@ -3239,8 +3375,8 @@ def main():
 
             st.success(f"✓ Loaded {len(df)} strikes for **{symbol}** expiring **{date}**")
 
-            tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-                ["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters", "🧮 Volatility & Greeks", "🏆 Pro Edge"]
+            tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+                ["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters", "🧮 Volatility & Greeks", "🏆 Pro Edge", "Market Folding"]
             )
 
             with tab1:
@@ -4026,6 +4162,182 @@ def main():
                     st.warning("Mixed alignment — trade smaller or wait for cleaner setup.")
                 else:
                     st.error("Low alignment — chop/uncertainty risk is high. Consider waiting.")
+
+
+            with tab7:
+                st.subheader("Market Folding (Eigen-Entropy)")
+                st.caption("Uses Finnhub candles (requires FINNHUB_API_KEY).")
+
+                if not get_finnhub_api_key():
+                    st.info("Set FINNHUB_API_KEY in Streamlit secrets or the environment to enable Finnhub data.")
+                else:
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        lookback_days = st.selectbox("Lookback", [180, 365, 730, 1095], index=2)
+                    with c2:
+                        resolution = st.selectbox(
+                            "Resolution",
+                            ["D", "60", "30", "15"],
+                            index=0,
+                            help="Finnhub resolution: D=daily, 60=1h, 30=30m, 15=15m.",
+                        )
+                    with c3:
+                        window_size = st.number_input("Correlation window", min_value=10, max_value=200, value=50, step=1)
+                    with c4:
+                        smooth = st.number_input("Smoothing", min_value=1, max_value=50, value=5, step=1)
+
+                    c5, c6 = st.columns(2)
+                    with c5:
+                        entropy_base = st.number_input("Entropy base", min_value=1.0, max_value=10.0, value=2.0, step=0.5)
+                    with c6:
+                        low_q, high_q = st.slider(
+                            "Regime quantiles",
+                            min_value=0.05,
+                            max_value=0.95,
+                            value=(0.25, 0.75),
+                            step=0.05,
+                        )
+
+                    if high_q <= low_q:
+                        st.warning("High quantile must be above low quantile.")
+                    else:
+                        with st.spinner("Loading Finnhub candles..."):
+                            hist_fh = fetch_finnhub_candles_df(symbol, int(lookback_days), str(resolution))
+
+                        if hist_fh.empty:
+                            st.warning("No Finnhub price history returned for this symbol.")
+                        else:
+                            fold_df, loq, hiq = build_market_folding(
+                                hist_fh, int(window_size), int(smooth), float(entropy_base), float(low_q), float(high_q)
+                            )
+                            plot_df = fold_df.dropna(subset=["Folding_Score"]).copy()
+                            if plot_df.empty:
+                                st.warning("Not enough data after rolling windows to compute Folding Score.")
+                            else:
+                                plot_df = plot_df.sort_values("Date")
+                                last_row = plot_df.iloc[-1]
+                                last_date = last_row["Date"]
+                                last_close = float(last_row["Close"])
+                                last_score = float(last_row["Folding_Score"])
+                                last_regime = str(last_row["Regime"])
+
+                                cA, cB, cC = st.columns(3)
+                                cA.metric("Latest close", f"{last_close:.2f}")
+                                cB.metric("Folding Score", f"{last_score:.4f}")
+                                cC.metric("Regime", last_regime)
+
+                                regime_colors = {
+                                    "COLLAPSED": "rgba(255, 77, 77, 0.18)",
+                                    "TRANSITION": "rgba(200, 200, 200, 0.14)",
+                                    "COMPLEX_FOLDED": "rgba(102, 204, 102, 0.18)",
+                                }
+
+                                fig = go.Figure()
+
+                                # Regime shading by contiguous segments.
+                                last_reg = None
+                                start_dt = None
+                                for _, row in plot_df.iterrows():
+                                    reg = row.get("Regime")
+                                    if reg != last_reg:
+                                        if last_reg is not None:
+                                            fig.add_vrect(
+                                                x0=start_dt,
+                                                x1=row["Date"],
+                                                fillcolor=regime_colors.get(last_reg, "rgba(255,255,255,0.05)"),
+                                                opacity=0.35,
+                                                line_width=0,
+                                            )
+                                        start_dt = row["Date"]
+                                        last_reg = reg
+                                if last_reg is not None:
+                                    fig.add_vrect(
+                                        x0=start_dt,
+                                        x1=plot_df["Date"].iloc[-1],
+                                        fillcolor=regime_colors.get(last_reg, "rgba(255,255,255,0.05)"),
+                                        opacity=0.35,
+                                        line_width=0,
+                                    )
+
+                                fig.add_trace(go.Scatter(
+                                    x=plot_df["Date"],
+                                    y=plot_df["Close"],
+                                    mode="lines",
+                                    name="Close",
+                                    line=dict(color="black", width=1.2),
+                                ))
+                                fig.add_trace(go.Scatter(
+                                    x=plot_df["Date"],
+                                    y=plot_df["Close"],
+                                    mode="markers",
+                                    name="Folding Score",
+                                    marker=dict(
+                                        size=6,
+                                        color=plot_df["Folding_Score"],
+                                        colorscale="Viridis",
+                                        colorbar=dict(title="Folding Score"),
+                                    ),
+                                ))
+
+                                fig.add_vline(x=last_date, line_dash="dash", line_width=1.2, opacity=0.6)
+                                fig.add_trace(go.Scatter(
+                                    x=[last_date],
+                                    y=[last_close],
+                                    mode="markers",
+                                    marker=dict(size=14, color="white", line=dict(color="black", width=1.2)),
+                                    name="Latest",
+                                ))
+
+                                fig.add_annotation(
+                                    x=last_date,
+                                    y=last_close,
+                                    text=(
+                                        f"Latest<br>{pd.to_datetime(last_date).date()}<br>"
+                                        f"Close: {last_close:.2f}<br>Score: {last_score:.4f}<br>Regime: {last_regime}"
+                                    ),
+                                    showarrow=True,
+                                    arrowhead=2,
+                                    ax=40,
+                                    ay=-40,
+                                    bgcolor="rgba(255,255,255,0.85)",
+                                    bordercolor="black",
+                                    borderwidth=1,
+                                )
+
+                                fig.update_layout(
+                                    height=520,
+                                    margin=dict(l=10, r=10, t=40, b=10),
+                                    title=f"{symbol} Market Folding (Eigen-Entropy)",
+                                    xaxis_title="Date",
+                                    yaxis_title="Price",
+                                )
+
+                                st_plot(fig)
+                                if loq is not None and hiq is not None:
+                                    st.caption(f"Regime thresholds: low={loq:.4f}, high={hiq:.4f}")
+
+                                st.markdown(
+                                    """
+**What is Market Folding?**
+Market Folding treats the market as a geometric object. We build five forces (momentum, volatility,
+trend stress, volume pressure, money flow) and measure how tightly they move together.
+
+**What is the Folding Score (Eigen-Entropy)?**
+We compute a rolling correlation matrix of those forces and take its eigenvalues. Entropy of the
+eigenvalues measures effective dimensionality:
+- Higher entropy: drivers are more independent (complex/healthy structure)
+- Lower entropy: drivers collapse together (fragile/stressed structure)
+
+**Regimes**
+- COMPLEX_FOLDED (high score): diverse drivers, structurally stable trends often persist
+- TRANSITION (mid score): structure changing, consolidation or regime shift
+- COLLAPSED (low score): correlations converge; fragile market, sharp moves can start here
+
+**Interpretation**
+- Falling score: structure collapsing (risk rising)
+- Rising score: structure opening (stability improving)
+"""
+                                )
 
     else:
         st.info("👆 Enter symbol/date/spot and click **Fetch Data**.")

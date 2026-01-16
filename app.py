@@ -3247,8 +3247,11 @@ def add_acc_dist_signals(
     )
     
     # Mark only first day of signal streak (no repeated arrows)
-    out["BUY_MARK"] = out["BUY"] & (~out["BUY"].shift(1).fillna(False))
-    out["SELL_MARK"] = out["SELL"] & (~out["SELL"].shift(1).fillna(False))
+    # Avoid FutureWarning by using explicit boolean handling instead of fillna
+    buy_shifted = out["BUY"].shift(1)
+    sell_shifted = out["SELL"].shift(1)
+    out["BUY_MARK"] = out["BUY"] & (~buy_shifted.where(buy_shifted.notna(), False).astype(bool))
+    out["SELL_MARK"] = out["SELL"] & (~sell_shifted.where(sell_shifted.notna(), False).astype(bool))
     
     return out
 
@@ -3516,6 +3519,93 @@ def main():
         <p>Options chain + Weekly Gamma / GEX (dealer positioning) + Filters</p>
     </div>
     """,
+        unsafe_allow_html=True
+    )
+
+    # Custom CSS to enable multi-row tabs and premium look
+    st.markdown(
+        """
+        <style>
+        /* Force tabs to wrap into multiple rows */
+        .stTabs [data-baseweb="tab-list"] {
+            flex-wrap: wrap !important;
+            overflow: visible !important;
+            gap: 12px 8px !important;
+            padding: 10px 0 !important;
+            border-bottom: none !important;
+        }
+        
+        /* Hide default horizontal scroll and spacer buttons */
+        .stTabs [data-baseweb="tab-list"] > div {
+            display: none !important;
+        }
+        
+        /* Premium styling for tab buttons */
+        .stTabs [data-baseweb="tab"] {
+            background-color: #1e2328 !important;
+            border: 1px solid #3d4450 !important;
+            border-radius: 8px !important;
+            padding: 8px 16px !important;
+            color: #b0b5bc !important;
+            transition: all 0.3s ease !important;
+            font-weight: 500 !important;
+            flex-shrink: 0 !important;
+            white-space: nowrap !important;
+        }
+        
+        /* Active tab styling */
+        .stTabs [aria-selected="true"] {
+            background: linear-gradient(90deg, #00875a 0%, #00a86b 100%) !important;
+            color: white !important;
+            border-color: #00d775 !important;
+            box-shadow: 0 4px 15px rgba(0, 168, 107, 0.2) !important;
+        }
+        
+        /* Hover effect */
+        .stTabs [data-baseweb="tab"]:hover {
+            border-color: #00d775 !important;
+            color: #00d775 !important;
+            transform: translateY(-1px) !important;
+        }
+
+        /* Remove the purple line under tabs */
+        .stTabs [data-baseweb="tab-border"] {
+            display: none !important;
+        }
+        
+        /* Ensure tab content container has space */
+        .stTabs [data-baseweb="tab-panel"] {
+            padding-top: 20px !important;
+        }
+
+        /* Ensure the container doesn't clip the wrapped tabs */
+        div[data-testid="stHorizontalBlock"] > div.stColumn > div > div.stTabs {
+            overflow: visible !important;
+        }
+
+        .stTabs > div:first-child {
+            overflow: visible !important;
+            max-width: 100% !important;
+        }
+
+        /* Responsive adjustment for 2-row feel */
+        @media (min-width: 1000px) {
+            .stTabs [data-baseweb="tab"] {
+                flex: 1 1 180px !important; /* Forces wrap on typical widths */
+                max-width: 250px !important;
+                text-align: center !important;
+                justify-content: center !important;
+            }
+        }
+        @media (max-width: 1000px) {
+            .stTabs [data-baseweb="tab"] {
+                flex: 1 1 140px !important;
+                text-align: center !important;
+                justify-content: center !important;
+            }
+        }
+        </style>
+        """,
         unsafe_allow_html=True
     )
 

@@ -607,14 +607,19 @@ def _norm_pdf(x: float) -> float:
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
 
-def _bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
+def _bs_gamma(S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
+    """
+    Standard Black-Scholes Gamma: e^(-qT) * N'(d1) / (S * sigma * sqrt(T))
+    """
     if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return float("nan")
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-    return _norm_pdf(d1) / (S * sigma * math.sqrt(T))
+        return 0.0
+    
+    # d1 = (ln(S/K) + (r - q + 0.5*sigma^2)*T) / (sigma*sqrt(T))
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    return (math.exp(-q * T) * _norm_pdf(d1)) / (S * sigma * math.sqrt(T))
 
 
-def _compute_weekly_gex(rows, spot: float, date: str, r: float = 0.05, multiplier: int = 100) -> pd.DataFrame:
+def _compute_weekly_gex(rows, spot: float, date: str, r: float = 0.05, q: float = 0.0, multiplier: int = 100) -> pd.DataFrame:
     df = pd.DataFrame(rows).copy()
     if df.empty:
         return df
@@ -630,27 +635,46 @@ def _compute_weekly_gex(rows, spot: float, date: str, r: float = 0.05, multiplie
 
     T = _years_to_expiry(date)
 
-    def pick_iv(row):
-        return row["call_iv_dec"] if row["call_iv_dec"] is not None else row["put_iv_dec"]
+    # Calculate gamma separately for calls and puts to use their specific IVs (skew)
+    def calc_gamma(iv):
+        if iv is None or iv <= 0:
+            return 0.0
+        return _bs_gamma(spot, row["strike"], T, r, q, iv)
 
-    df["iv_used"] = df.apply(pick_iv, axis=1)
+    gammas_call = []
+    gammas_put = []
+    
+    for _, row in df.iterrows():
+        civ = row["call_iv_dec"]
+        piv = row["put_iv_dec"]
+        
+        # If one IV is missing, use the other as fallback
+        g_call = _bs_gamma(spot, row["strike"], T, r, q, civ) if civ else 0.0
+        g_put = _bs_gamma(spot, row["strike"], T, r, q, piv) if piv else 0.0
+        
+        if not g_call and g_put: g_call = g_put
+        if not g_put and g_call: g_put = g_call
+        
+        gammas_call.append(g_call)
+        gammas_put.append(g_put)
 
-    df["gamma"] = df.apply(
-        lambda row: _bs_gamma(spot, row["strike"], T, r, row["iv_used"]) if row["iv_used"] else float("nan"),
-        axis=1
-    )
+    df["gamma_call"] = gammas_call
+    df["gamma_put"] = gammas_put
 
+    # GEX = 0.01 * S^2 * Gamma * OI * Multiplier 
+    # (Representing dollar delta change for a 1% spot move)
     S2 = spot * spot
-    gamma_safe = df["gamma"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    df["call_gex"] = gamma_safe * df["call_oi"] * multiplier * S2
-    df["put_gex"] = gamma_safe * df["put_oi"] * multiplier * S2
+    df["call_gex"] = 0.01 * df["gamma_call"] * df["call_oi"] * multiplier * S2
+    df["put_gex"] = 0.01 * df["gamma_put"] * df["put_oi"] * multiplier * S2
+    
+    # Dealer Net GEX (Standard convention)
+    # Positive = Call Dominant (Supportive/Mean-Reverting)
+    # Negative = Put Dominant (Whipsaw/Acceleration)
     df["net_gex"] = df["call_gex"] - df["put_gex"]
 
     return df[[
         "strike",
-        "Call IV", "Put IV", "iv_used",
-        "gamma",
+        "Call IV", "Put IV", "gamma_call", "gamma_put",
         "call_oi", "put_oi",
         "call_vol", "put_vol",
         "call_gex", "put_gex", "net_gex"
@@ -756,10 +780,11 @@ async def weekly_summary(
     date: str = Query(..., description="Expiration date YYYY-MM-DD (example: 2026-01-16)"),
     spot: float = Query(..., description="Underlying spot price (required for gamma)"),
     r: float = Query(0.05, description="Risk-free rate (decimal), default 0.05"),
+    q: float = Query(0.0, description="Dividend yield (decimal), default 0.0"),
     multiplier: int = Query(100, description="Contract multiplier, default 100"),
 ):
     rows = await get_rows_cached(symbol, date)
-    gex_df = _compute_weekly_gex(rows, spot=spot, date=date, r=r, multiplier=multiplier)
+    gex_df = _compute_weekly_gex(rows, spot=spot, date=date, r=r, q=q, multiplier=multiplier)
     if gex_df.empty:
         raise HTTPException(status_code=404, detail="No data returned for GEX computation.")
 
@@ -807,10 +832,11 @@ async def weekly_gex(
     date: str = Query(...),
     spot: float = Query(...),
     r: float = Query(0.05),
+    q: float = Query(0.0),
     multiplier: int = Query(100),
 ):
     rows = await get_rows_cached(symbol, date)
-    gex_df = _compute_weekly_gex(rows, spot=spot, date=date, r=r, multiplier=multiplier)
+    gex_df = _compute_weekly_gex(rows, spot=spot, date=date, r=r, q=q, multiplier=multiplier)
     if gex_df.empty:
         raise HTTPException(status_code=404, detail="No data returned for GEX computation.")
 

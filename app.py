@@ -1515,12 +1515,12 @@ def fetch_options(symbol: str, date: str):
 
 
 @safe_cache_data(ttl=300, show_spinner=False)
-def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, multiplier: int = 100):
+def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, q: float = 0.0, multiplier: int = 100):
     """GET /weekly/summary?symbol=...&date=...&spot=..."""
     try:
         rqs = requests.get(
             f"{API_BASE_URL}/weekly/summary",
-            params={"symbol": symbol, "date": date, "spot": spot, "r": r, "multiplier": multiplier},
+            params={"symbol": symbol, "date": date, "spot": spot, "r": r, "q": q, "multiplier": multiplier},
             timeout=300
         )
         if rqs.status_code == 200:
@@ -1543,12 +1543,12 @@ def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, m
 
 
 @safe_cache_data(ttl=300, show_spinner=False)
-def fetch_weekly_gex(symbol: str, date: str, spot: float, r: float = 0.05, multiplier: int = 100):
+def fetch_weekly_gex(symbol: str, date: str, spot: float, r: float = 0.05, q: float = 0.0, multiplier: int = 100):
     """GET /weekly/gex?symbol=...&date=...&spot=..."""
     try:
         rqs = requests.get(
             f"{API_BASE_URL}/weekly/gex",
-            params={"symbol": symbol, "date": date, "spot": spot, "r": r, "multiplier": multiplier},
+            params={"symbol": symbol, "date": date, "spot": spot, "r": r, "q": q, "multiplier": multiplier},
             timeout=300
         )
         if rqs.status_code == 200:
@@ -2792,45 +2792,57 @@ def _norm_cdf(x: float) -> float:
     return 1.0 - prob if x > 0 else prob
 
 
-def bs_delta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+def bs_delta(S: float, K: float, T: float, r: float, q: float, sigma: float, is_call: bool) -> float:
+    """
+    Standard Black-Scholes Delta: 
+    Call = e^(-qT) * N(d1)
+    Put  = e^(-qT) * (N(d1) - 1)
+    """
     if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return float("nan")
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+        return 0.0
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
     if is_call:
-        return _norm_cdf(d1)
-    return _norm_cdf(d1) - 1.0
+        return math.exp(-q * T) * _norm_cdf(d1)
+    else:
+        return math.exp(-q * T) * (_norm_cdf(d1) - 1.0)
 
 
-def bs_vanna_charm(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> dict:
+def bs_vanna_charm(S: float, K: float, T: float, r: float, q: float, sigma: float, is_call: bool) -> dict:
     """
     Approximate Vanna and Charm for a single option using Black-Scholes.
-    - Vanna: dDelta/dVol (per 1.0 change in vol, e.g. +0.01 = 1 vol point)
-    - Charm: dDelta/dt (per year). We also provide per day.
-    Notes: This is an approximation (equity-style), but good for directional flow intuition.
+    - Vanna: dDelta/dVol 
+    - Charm: dDelta/dt (per year/day)
     """
     if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return {"delta": float("nan"), "vanna": float("nan"), "charm_per_year": float("nan"), "charm_per_day": float("nan")}
+        return {"delta": 0.0, "vanna": 0.0, "charm_per_year": 0.0, "charm_per_day": 0.0}
 
     sqrtT = math.sqrt(T)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
     d2 = d1 - sigma * sqrtT
-    pdf = _norm_pdf(d1)
+    
+    phi_d1 = _norm_pdf(d1)
+    exp_qT = math.exp(-q * T)
 
-    delta = bs_delta(S, K, T, r, sigma, is_call)
+    delta = bs_delta(S, K, T, r, q, sigma, is_call)
 
-    # Common vanna approximation (per 1.0 vol change). Convert to per 1 vol point by /100 later if needed.
-    vanna = pdf * (1.0 - d1 / (sigma * sqrtT)) / sigma
+    # Vanna = dDelta/dsigma
+    vanna = -exp_qT * phi_d1 * d2 / sigma
 
-    # Charm approximation (per year)
-    # Call charm = -pdf * (2rT - d2*sigma*sqrtT) / (2T*sigma*sqrtT)
-    # Put charm  = call charm (same core term) because delta differs by -1
-    charm = -pdf * (2.0 * r * T - d2 * sigma * sqrtT) / (2.0 * T * sigma * sqrtT)
+    # Charm (delta decay) = dDelta/dT
+    if is_call:
+        term1 = q * exp_qT * _norm_cdf(d1)
+        term2 = exp_qT * phi_d1 * ((r - q) / (sigma * sqrtT) - d2 / (2 * T))
+        charm_y = term1 - term2
+    else:
+        term1 = -q * exp_qT * _norm_cdf(-d1)
+        term2 = exp_qT * phi_d1 * ((r - q) / (sigma * sqrtT) - d2 / (2 * T))
+        charm_y = term1 - term2
 
     return {
         "delta": float(delta),
         "vanna": float(vanna),
-        "charm_per_year": float(charm),
-        "charm_per_day": float(charm / 365.0),
+        "charm_per_year": float(charm_y),
+        "charm_per_day": float(charm_y / 365.0),
     }
 
 
@@ -3845,7 +3857,10 @@ def main():
                 options_result = fetch_options(symbol, date)
 
             with st.spinner(f"Computing Weekly Gamma/GEX for {symbol} {date} (spot={spot})..."):
-                weekly_result = fetch_weekly_summary(symbol, date, spot)
+                # Pass r and q if available in session_state or use defaults
+                r_val = st.session_state.get("r_in", 0.041)
+                q_val = st.session_state.get("q_in", 0.004)
+                weekly_result = fetch_weekly_summary(symbol, date, spot, r=r_val, q=q_val)
 
             if not options_result.get("success"):
                 fetch_error = f"Options error: {options_result.get('error')}"
@@ -4002,7 +4017,9 @@ def main():
                 st.subheader("🧭 Gamma Map (Magnets / Walls / Box)")
 
                 with st.spinner("Loading per-strike GEX (weekly/gex) ..."):
-                    gex_result = fetch_weekly_gex(symbol, date, spot)
+                    r_val = st.session_state.get("r_in", 0.041)
+                    q_val = st.session_state.get("q_in", 0.004)
+                    gex_result = fetch_weekly_gex(symbol, date, spot, r=r_val, q=q_val)
 
                 if not gex_result.get("success"):
                     st.warning(f"Could not load /weekly/gex: {gex_result.get('error')}")
@@ -4648,14 +4665,16 @@ def main():
 
                     # Vanna/Charm for ATM option (call+put average)
                     try:
+                        r_val = float(st.session_state.get("r_in", 0.041))
+                        q_val = float(st.session_state.get("q_in", 0.004))
                         expiry_dt = datetime.strptime(date, "%Y-%m-%d")
                         expiry_dt = expiry_dt.replace(hour=16, minute=0, second=0)
-                        now_dt = datetime.now(TZ)
-                        T = max(0.0, (expiry_dt - now_dt).total_seconds() / (365.0 * 24 * 3600))
+                        now_dt = datetime.now()
+                        T = max(0.0001, (expiry_dt - now_dt).total_seconds() / (365.0 * 24 * 3600))
                         K = float(round(spot_now))  # proxy ATM strike
-                        r = 0.04  # rough default risk-free rate
-                        call_vc = bs_vanna_charm(spot_now, K, T, r, atm_iv, True)
-                        put_vc = bs_vanna_charm(spot_now, K, T, r, atm_iv, False)
+                        
+                        call_vc = bs_vanna_charm(spot_now, K, T, r_val, q_val, atm_iv, True)
+                        put_vc = bs_vanna_charm(spot_now, K, T, r_val, q_val, atm_iv, False)
 
                         vanna_avg = (call_vc["vanna"] + put_vc["vanna"]) / 2.0
                         charm_day_avg = (call_vc["charm_per_day"] + put_vc["charm_per_day"]) / 2.0

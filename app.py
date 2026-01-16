@@ -3155,6 +3155,163 @@ def confidence_score(trend_strength: int, structure_ok: bool, vol_ok: bool, gex_
     score += 10 if or_ok else 0
     return int(min(100, score))
 
+
+# =========================
+# VWAP + OBV SIGNAL SYSTEM
+# =========================
+
+def add_vwap_obv_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add VWAP, OBV, and ADL indicators to a DataFrame with OHLCV data.
+    
+    Args:
+        df: DataFrame with columns Open, High, Low, Close, Volume
+        
+    Returns:
+        DataFrame with added indicator columns: TP, VWAP, OBV, MFM, ADL
+    """
+    out = df.copy()
+    
+    # Typical Price (used for VWAP)
+    out["TP"] = (out["High"] + out["Low"] + out["Close"]) / 3.0
+    
+    # VWAP (cumulative Volume Weighted Average Price)
+    vol_cumsum = out["Volume"].cumsum().replace(0, np.nan)
+    out["VWAP"] = (out["TP"] * out["Volume"]).cumsum() / vol_cumsum
+    
+    # OBV (On-Balance Volume)
+    out["OBV"] = (np.sign(out["Close"].diff()) * out["Volume"]).fillna(0).cumsum()
+    
+    # ADL (Accumulation/Distribution Line)
+    hl = (out["High"] - out["Low"]).replace(0, np.nan)
+    out["MFM"] = ((out["Close"] - out["Low"]) - (out["High"] - out["Close"])) / hl
+    out["ADL"] = (out["MFM"].fillna(0) * out["Volume"]).cumsum()
+    
+    return out
+
+
+def add_acc_dist_signals(
+    df: pd.DataFrame,
+    confirm_days: int = 2,
+) -> pd.DataFrame:
+    """
+    Add Accumulation/Distribution signals and BUY/SELL signals based on VWAP + OBV.
+    
+    The signal logic is trend-following:
+    - ACC (Accumulation): Close↑ AND OBV↑ (buying pressure)
+    - DIST (Distribution): Close↓ AND OBV↓ (selling pressure)
+    
+    BUY signal triggers when:
+    - Today is ACC + confirmed (multiple days) + Close > VWAP + VWAP rising
+    
+    SELL signal triggers when:
+    - Today is DIST + confirmed (multiple days) + Close < VWAP + VWAP falling
+    
+    Args:
+        df: DataFrame with VWAP and OBV columns (from add_vwap_obv_indicators)
+        confirm_days: Number of consecutive days required to confirm a signal
+        
+    Returns:
+        DataFrame with signal columns: ACC, DIST, ACC_STR, DIST_STR, VWAP_SLOPE, BUY, SELL, BUY_MARK, SELL_MARK
+    """
+    out = df.copy()
+    
+    close_chg = out["Close"].diff()
+    obv_chg = out["OBV"].diff()
+    
+    # Pressure days
+    out["ACC"] = (close_chg > 0) & (obv_chg > 0)      # buying pressure
+    out["DIST"] = (close_chg < 0) & (obv_chg < 0)     # selling pressure
+    
+    # Confirmed streak strength
+    out["ACC_STR"] = out["ACC"].rolling(confirm_days).sum()
+    out["DIST_STR"] = out["DIST"].rolling(confirm_days).sum()
+    
+    # VWAP slope filter (helps reduce whipsaws)
+    out["VWAP_SLOPE"] = out["VWAP"].diff()
+    
+    # BUY only if today is ACC + confirmed + above VWAP + VWAP rising
+    out["BUY"] = (
+        out["ACC"]
+        & (out["ACC_STR"] >= confirm_days)
+        & (out["Close"] > out["VWAP"])
+        & (out["VWAP_SLOPE"] > 0)
+    )
+    
+    # SELL only if today is DIST + confirmed + below VWAP + VWAP falling
+    out["SELL"] = (
+        out["DIST"]
+        & (out["DIST_STR"] >= confirm_days)
+        & (out["Close"] < out["VWAP"])
+        & (out["VWAP_SLOPE"] < 0)
+    )
+    
+    # Mark only first day of signal streak (no repeated arrows)
+    out["BUY_MARK"] = out["BUY"] & (~out["BUY"].shift(1).fillna(False))
+    out["SELL_MARK"] = out["SELL"] & (~out["SELL"].shift(1).fillna(False))
+    
+    return out
+
+
+def build_vwap_obv_analysis(
+    hist: pd.DataFrame,
+    confirm_days: int = 2,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Build complete VWAP + OBV analysis from OHLCV data.
+    
+    Args:
+        hist: DataFrame with Open, High, Low, Close, Volume columns and Date index/column
+        confirm_days: Number of confirmation days for signals
+        
+    Returns:
+        Tuple of (processed DataFrame, summary dict with latest values)
+    """
+    df = hist.copy()
+    
+    # Ensure Date column
+    if "Date" not in df.columns:
+        if df.index.name == "Date" or df.index.name == "Datetime":
+            df = df.reset_index()
+        else:
+            df["Date"] = df.index
+    
+    # Normalize columns if MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
+    
+    # Ensure required columns exist
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    
+    # Add indicators
+    df = add_vwap_obv_indicators(df)
+    df = add_acc_dist_signals(df, confirm_days=confirm_days)
+    
+    # Build summary
+    last = df.iloc[-1]
+    summary = {
+        "date": df["Date"].iloc[-1] if "Date" in df.columns else df.index[-1],
+        "close": float(last["Close"]),
+        "vwap": float(last["VWAP"]) if pd.notna(last["VWAP"]) else None,
+        "vwap_slope": float(last["VWAP_SLOPE"]) if pd.notna(last["VWAP_SLOPE"]) else None,
+        "obv": float(last["OBV"]),
+        "adl": float(last["ADL"]) if pd.notna(last["ADL"]) else None,
+        "acc_str": int(last["ACC_STR"]) if pd.notna(last["ACC_STR"]) else 0,
+        "dist_str": int(last["DIST_STR"]) if pd.notna(last["DIST_STR"]) else 0,
+        "is_acc": bool(last["ACC"]),
+        "is_dist": bool(last["DIST"]),
+        "buy_signal": bool(last["BUY"]),
+        "sell_signal": bool(last["SELL"]),
+        "total_buys": int(df["BUY_MARK"].sum()),
+        "total_sells": int(df["SELL_MARK"].sum()),
+    }
+    
+    return df, summary
+
+
 def main():
     st.markdown(
         """
@@ -3442,8 +3599,8 @@ def main():
 
             st.success(f"✓ Loaded {len(df)} strikes for **{symbol}** expiring **{date}**")
 
-            tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-                ["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters", "🧮 Volatility & Greeks", "🏆 Pro Edge", "Market Folding"]
+            tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+                ["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters", "🧮 Volatility & Greeks", "🏆 Pro Edge", "Market Folding", "📈 VWAP + OBV"]
             )
 
             with tab1:
@@ -4521,6 +4678,254 @@ eigenvalues measures effective dimensionality:
 - Rising score: structure opening (stability improving)
 """
                                 )
+
+            with tab8:
+                st.subheader("VWAP + OBV Signal System")
+                st.caption("Analyzes price action using VWAP, OBV, and Accumulation/Distribution to generate buy/sell signals (uses Yahoo Finance data).")
+
+                vwap_c1, vwap_c2, vwap_c3 = st.columns(3)
+                with vwap_c1:
+                    vwap_period_options = ["3mo", "6mo", "1y", "2y"]
+                    vwap_period = st.selectbox("History Period", vwap_period_options, index=1, key="vwap_period")
+                with vwap_c2:
+                    vwap_interval_options = ["1d", "1wk"]
+                    vwap_interval = st.selectbox("Interval", vwap_interval_options, index=0, key="vwap_interval", help="Daily (1d) or Weekly (1wk)")
+                with vwap_c3:
+                    confirm_days = st.number_input("Confirmation Days", min_value=1, max_value=10, value=2, step=1, key="vwap_confirm",
+                                                   help="Number of consecutive ACC/DIST days required to confirm a signal. Lower = more signals, Higher = fewer but stronger signals.")
+
+                with st.spinner(f"Loading {symbol} data from Yahoo Finance..."):
+                    try:
+                        vwap_hist = yf.download(symbol, period=vwap_period, interval=vwap_interval, auto_adjust=False, progress=False)
+                    except Exception as e:
+                        vwap_hist = pd.DataFrame()
+                        st.error(f"Error fetching data: {e}")
+
+                if vwap_hist is None or vwap_hist.empty:
+                    st.warning("Yahoo Finance returned no data. Try a different symbol or period.")
+                else:
+                    # Normalize yfinance MultiIndex columns
+                    if isinstance(vwap_hist.columns, pd.MultiIndex):
+                        vwap_hist.columns = vwap_hist.columns.droplevel(1)
+
+                    vwap_hist = vwap_hist.reset_index()
+                    # Ensure Date column exists
+                    if "Date" not in vwap_hist.columns and "Datetime" in vwap_hist.columns:
+                        vwap_hist["Date"] = vwap_hist["Datetime"]
+                    elif "Date" not in vwap_hist.columns:
+                        vwap_hist["Date"] = vwap_hist.index
+
+                    # Check required columns
+                    required = {"Open", "High", "Low", "Close", "Volume"}
+                    missing = required - set(vwap_hist.columns)
+                    if missing:
+                        st.warning(f"Missing columns: {sorted(list(missing))}. Cannot compute VWAP + OBV analysis.")
+                    else:
+                        try:
+                            vwap_df, vwap_summary = build_vwap_obv_analysis(vwap_hist, confirm_days=int(confirm_days))
+
+
+                            # Display summary metrics
+                            m1, m2, m3, m4 = st.columns(4)
+                            m1.metric("Close", f"${vwap_summary['close']:.2f}")
+                            m2.metric("VWAP", f"${vwap_summary['vwap']:.2f}" if vwap_summary['vwap'] else "N/A")
+
+                            # Signal status
+                            if vwap_summary['buy_signal']:
+                                m3.metric("Signal", "🔼 BUY", delta="Active", delta_color="normal")
+                            elif vwap_summary['sell_signal']:
+                                m3.metric("Signal", "🔽 SELL", delta="Active", delta_color="inverse")
+                            elif vwap_summary['is_acc']:
+                                m3.metric("Signal", "ACC (Accumulating)", delta="Pressure")
+                            elif vwap_summary['is_dist']:
+                                m3.metric("Signal", "DIST (Distributing)", delta="Pressure", delta_color="inverse")
+                            else:
+                                m3.metric("Signal", "NEUTRAL")
+
+                            vwap_slope_str = f"{vwap_summary['vwap_slope']:.4f}" if vwap_summary['vwap_slope'] else "N/A"
+                            m4.metric("VWAP Slope", vwap_slope_str)
+
+                            # Second row of metrics
+                            m5, m6, m7, m8 = st.columns(4)
+                            m5.metric("ACC Strength", str(vwap_summary['acc_str']))
+                            m6.metric("DIST Strength", str(vwap_summary['dist_str']))
+                            m7.metric("Total BUY Signals", str(vwap_summary['total_buys']))
+                            m8.metric("Total SELL Signals", str(vwap_summary['total_sells']))
+
+                            # Create the three-panel chart (Price+VWAP, Volume, OBV)
+                            fig = make_subplots(
+                                rows=3, cols=1,
+                                shared_xaxes=True,
+                                vertical_spacing=0.06,
+                                row_heights=[0.5, 0.25, 0.25],
+                                subplot_titles=(f"{symbol} Price + VWAP with BUY/SELL Signals", "Volume", "OBV (Volume Momentum)")
+                            )
+
+                            # Sort by date for proper plotting
+                            plot_df = vwap_df.sort_values("Date").copy()
+
+                            # --- Row 1: Price + VWAP ---
+                            # Price line
+                            fig.add_trace(go.Scatter(
+                                x=plot_df["Date"],
+                                y=plot_df["Close"],
+                                mode="lines",
+                                name="Price",
+                                line=dict(color="rgba(0,0,0,0.7)", width=1.5),
+                            ), row=1, col=1)
+
+                            # VWAP line
+                            fig.add_trace(go.Scatter(
+                                x=plot_df["Date"],
+                                y=plot_df["VWAP"],
+                                mode="lines",
+                                name="VWAP",
+                                line=dict(color="#2196F3", width=2.5, dash="dash"),
+                            ), row=1, col=1)
+
+                            # BUY signals
+                            buys = plot_df[plot_df["BUY_MARK"]]
+                            if not buys.empty:
+                                fig.add_trace(go.Scatter(
+                                    x=buys["Date"],
+                                    y=buys["Close"],
+                                    mode="markers",
+                                    name="BUY Signal",
+                                    marker=dict(
+                                        symbol="triangle-up",
+                                        size=14,
+                                        color="#4CAF50",
+                                        line=dict(color="black", width=1),
+                                    ),
+                                ), row=1, col=1)
+
+                            # SELL signals
+                            sells = plot_df[plot_df["SELL_MARK"]]
+                            if not sells.empty:
+                                fig.add_trace(go.Scatter(
+                                    x=sells["Date"],
+                                    y=sells["Close"],
+                                    mode="markers",
+                                    name="SELL Signal",
+                                    marker=dict(
+                                        symbol="triangle-down",
+                                        size=14,
+                                        color="#f44336",
+                                        line=dict(color="black", width=1),
+                                    ),
+                                ), row=1, col=1)
+
+                            # --- Row 2: Volume (colored by up/down close) ---
+                            vol_colors = np.where(plot_df["Close"].diff() >= 0, "#4CAF50", "#f44336")
+                            fig.add_trace(go.Bar(
+                                x=plot_df["Date"],
+                                y=plot_df["Volume"],
+                                name="Volume",
+                                marker_color=vol_colors,
+                                opacity=0.7,
+                                showlegend=False,
+                            ), row=2, col=1)
+
+                            # --- Row 3: OBV ---
+                            fig.add_trace(go.Scatter(
+                                x=plot_df["Date"],
+                                y=plot_df["OBV"],
+                                mode="lines",
+                                name="OBV",
+                                line=dict(color="#4CAF50", width=1.5),
+                                showlegend=False,
+                            ), row=3, col=1)
+
+                            # Add current spot horizontal line
+                            last_close = vwap_summary['close']
+                            last_vwap = vwap_summary['vwap']
+                            last_date = plot_df["Date"].iloc[-1]
+
+                            # Latest point marker
+                            fig.add_trace(go.Scatter(
+                                x=[last_date],
+                                y=[last_close],
+                                mode="markers",
+                                marker=dict(size=12, color="white", line=dict(color="black", width=2)),
+                                name="Latest",
+                                showlegend=False,
+                            ), row=1, col=1)
+
+                            # Annotation for latest
+                            buy_sell_text = ""
+                            if vwap_summary['buy_signal']:
+                                buy_sell_text = "<br><b style='color:#4CAF50'>BUY ACTIVE</b>"
+                            elif vwap_summary['sell_signal']:
+                                buy_sell_text = "<br><b style='color:#f44336'>SELL ACTIVE</b>"
+
+                            fig.add_annotation(
+                                x=last_date,
+                                y=last_close,
+                                text=(
+                                    f"<b>LATEST</b><br>{pd.to_datetime(last_date).date()}<br>"
+                                    f"Close: ${last_close:.2f}<br>VWAP: ${last_vwap:.2f}" if last_vwap else f"<b>LATEST</b><br>{pd.to_datetime(last_date).date()}<br>Close: ${last_close:.2f}<br>VWAP: N/A"
+                                ) + buy_sell_text,
+                                showarrow=True,
+                                arrowhead=2,
+                                arrowcolor="#333",
+                                ax=-60,
+                                ay=-50,
+                                bgcolor="rgba(255,255,255,0.95)",
+                                bordercolor="#333",
+                                borderwidth=1,
+                                font=dict(color="#333", size=10),
+                                row=1, col=1,
+                            )
+
+                            fig.update_layout(
+                                height=750,
+                                margin=dict(l=10, r=80, t=60, b=10),
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                            )
+                            fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+                            fig.update_yaxes(title_text="Volume", row=2, col=1)
+                            fig.update_yaxes(title_text="OBV", row=3, col=1)
+                            fig.update_xaxes(title_text="Date", row=3, col=1)
+
+                            st_plot(fig)
+
+                            # Educational explanation
+                            st.markdown(
+                                """
+**What is VWAP?**
+VWAP (Volume Weighted Average Price) is the average price weighted by volume. It shows the "fair value" of
+a stock based on both price and volume activity. Price above VWAP suggests bullish sentiment; below VWAP suggests bearish.
+
+**What is OBV?**
+OBV (On-Balance Volume) is a cumulative volume indicator. When price closes up, volume is added; when it closes
+down, volume is subtracted. Rising OBV confirms uptrends; falling OBV confirms downtrends.
+
+**Signal Logic**
+- **ACC (Accumulation)**: Close ↑ AND OBV ↑ (buying pressure - smart money accumulating)
+- **DIST (Distribution)**: Close ↓ AND OBV ↓ (selling pressure - smart money distributing)
+
+**BUY Signal** triggers when:
+- Today is ACC + confirmed for multiple days
+- Price is above VWAP
+- VWAP is rising (positive slope)
+
+**SELL Signal** triggers when:
+- Today is DIST + confirmed for multiple days
+- Price is below VWAP
+- VWAP is falling (negative slope)
+
+**Volume Colors**
+- 🟢 Green: Price closed UP vs prior day (bulls controlled)
+- 🔴 Red: Price closed DOWN vs prior day (bears controlled)
+
+**Tuning Tips**
+- confirm_days = 1 → More signals (higher noise)
+- confirm_days = 3+ → Fewer signals (higher quality, may miss some moves)
+"""
+                            )
+
+                        except Exception as e:
+                            st.error(f"Error computing VWAP + OBV analysis: {e}")
 
     else:
         st.info("👆 Enter symbol/date/spot and click **Fetch Data**.")

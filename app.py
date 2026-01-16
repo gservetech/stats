@@ -2017,26 +2017,47 @@ def build_gamma_levels(gex_df: pd.DataFrame, spot: float, top_n: int = 5):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
+    # 1. Magnets: Strikes where absolute Net GEX is highest
     magnets = (
         df.assign(net_abs=df["net_gex"].abs())
         .sort_values("net_abs", ascending=False)
         .head(top_n)[["strike", "net_gex"]]
     )
 
-    call_walls = df.sort_values("call_gex", ascending=False).head(top_n)[["strike", "call_gex"]]
-    put_walls = df.sort_values("put_gex", ascending=False).head(top_n)[["strike", "put_gex"]]
+    # 2. Key Walls: High concentration of call/put gamma
+    # Increase pool to find nearest walls relative to spot
+    all_call_walls = df.sort_values("call_gex", ascending=False).head(15)[["strike", "call_gex"]]
+    all_put_walls = df.sort_values("put_gex", ascending=False).head(15)[["strike", "put_gex"]]
 
-    put_below = put_walls[put_walls["strike"] <= spot].sort_values("strike", ascending=False)
-    call_above = call_walls[call_walls["strike"] >= spot].sort_values("strike", ascending=True)
+    # Absolute Major Walls (the single biggest peak)
+    major_call_wall = float(all_call_walls.iloc[0]["strike"]) if not all_call_walls.empty else None
+    major_put_wall = float(all_put_walls.iloc[0]["strike"]) if not all_put_walls.empty else None
 
-    lower = float(put_below.iloc[0]["strike"]) if len(put_below) else None
-    upper = float(call_above.iloc[0]["strike"]) if len(call_above) else None
+    # Nearest significant walls (localized support/resistance)
+    put_below = all_put_walls[all_put_walls["strike"] <= spot].sort_values("strike", ascending=False)
+    call_above = all_call_walls[all_call_walls["strike"] >= spot].sort_values("strike", ascending=True)
+
+    nearest_lower = float(put_below.iloc[0]["strike"]) if not put_below.empty else major_put_wall
+    nearest_upper = float(call_above.iloc[0]["strike"]) if not call_above.empty else major_call_wall
+
+    # Zero Gamma approximation: Strike where net_gex is closest to 0 among large strikes
+    # (Simplified: find strike where sign of net_gex might flip)
+    zero_gamma = None
+    try:
+        df_range = df[df["strike"].between(spot * 0.8, spot * 1.2)].copy()
+        if not df_range.empty:
+            zero_gamma = float(df_range.loc[df_range["net_gex"].abs().idxmin()]["strike"])
+    except Exception:
+        pass
 
     return {
         "magnets": magnets,
-        "call_walls": call_walls,
-        "put_walls": put_walls,
-        "gamma_box": {"lower": lower, "upper": upper},
+        "major_call_wall": major_call_wall,
+        "major_put_wall": major_put_wall,
+        "nearest_lower": nearest_lower,
+        "nearest_upper": nearest_upper,
+        "zero_gamma": zero_gamma,
+        "gamma_box": {"lower": nearest_lower, "upper": nearest_upper},
     }
 
 
@@ -2047,39 +2068,66 @@ def plot_net_gex_map(gex_df: pd.DataFrame, spot: float, levels: dict):
     df = df.dropna(subset=["strike"]).sort_values("strike")
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["strike"], y=df["net_gex"], mode="lines+markers", name="Net GEX"))
+
+    # Draw the Gamma Box (shaded region between nearest walls)
+    lower = levels["gamma_box"]["lower"]
+    upper = levels["gamma_box"]["upper"]
+    if lower is not None and upper is not None:
+        fig.add_vrect(
+            x0=lower, x1=upper,
+            fillcolor="rgba(0, 168, 107, 0.1)",
+            layer="below", line_width=0,
+            annotation_text="Gamma Box",
+            annotation_position="top left"
+        )
+
+    fig.add_trace(go.Scatter(x=df["strike"], y=df["net_gex"], mode="lines+markers", name="Net GEX", 
+                             line=dict(color="#00d775", width=2)))
 
     fig.add_vline(
-        x=spot, line_width=2, line_dash="dash",
+        x=spot, line_width=3, line_dash="dash", line_color="white",
         annotation_text=f"Spot {spot:g}", annotation_position="top"
     )
 
-    for _, row in levels["magnets"].iterrows():
-        s = float(row["strike"])
+    # Main Magnet
+    if not levels["magnets"].empty:
+        main_mag = float(levels["magnets"].iloc[0]["strike"])
         fig.add_vline(
-            x=s, line_width=1, line_dash="dot",
-            annotation_text=f"Magnet {s:g}", annotation_position="bottom"
+            x=main_mag, line_width=2, line_dash="dot", line_color="#ffcc00",
+            annotation_text=f"Main Magnet {main_mag:g}", annotation_position="bottom"
         )
 
-    lower = levels["gamma_box"]["lower"]
-    upper = levels["gamma_box"]["upper"]
+    # Zero Gamma
+    if levels.get("zero_gamma") is not None:
+        zg = levels["zero_gamma"]
+        fig.add_vline(
+            x=zg, line_width=2, line_dash="dashdot", line_color="#00c3ff",
+            annotation_text=f"Zero Gamma {zg:g}", annotation_position="bottom right"
+        )
+
+    # Walls
     if lower is not None:
         fig.add_vline(
-            x=lower, line_width=2, line_dash="dash",
-            annotation_text=f"Lower wall {lower:g}", annotation_position="top left"
+            x=lower, line_width=2, line_dash="solid", line_color="#ff4757",
+            annotation_text=f"Put Wall {lower:g}", annotation_position="top left"
         )
     if upper is not None:
         fig.add_vline(
-            x=upper, line_width=2, line_dash="dash",
-            annotation_text=f"Upper wall {upper:g}", annotation_position="top right"
+            x=upper, line_width=2, line_dash="solid", line_color="#00a86b",
+            annotation_text=f"Call Wall {upper:g}", annotation_position="top right"
         )
+
+    # Add a horizontal zero line
+    fig.add_hline(y=0, line_width=1, line_color="rgba(255,255,255,0.3)")
 
     fig.update_layout(
         template="plotly_dark",
-        height=450,
+        height=500,
         title="🧲 Gamma Map (Net GEX by Strike)",
         xaxis_title="Strike",
-        yaxis_title="Net GEX"
+        yaxis_title="Net GEX (approx dollar gamma)",
+        hovermode="x unified",
+        margin=dict(l=10, r=10, t=50, b=10)
     )
     return fig
 
@@ -3468,7 +3516,8 @@ def build_vol_cone_analysis(
     # Add VWAP/OBV for direction
     df = add_vwap_obv_indicators(df)
     df["VWAP_SLOPE"] = df["VWAP"].diff()
-    df["OBV_SLOPE"] = df["OBV"].diff()
+    # Smooth OBV slope to reduce noise (last 5 days)
+    df["OBV_SLOPE"] = df["OBV"].diff(5) / 5.0
     
     # Build volatility cone
     close_series = df["Close"].dropna()
@@ -3971,11 +4020,18 @@ def main():
                             lower = levels["gamma_box"]["lower"]
                             upper = levels["gamma_box"]["upper"]
 
-                            cA, cB, cC = st.columns(3)
-                            cA.metric("Main Magnet", f"{float(levels['magnets'].iloc[0]['strike']):g}" if not levels[
-                                "magnets"].empty else "N/A")
-                            cB.metric("Lower Wall", f"{lower:g}" if lower is not None else "N/A")
-                            cC.metric("Upper Wall", f"{upper:g}" if upper is not None else "N/A")
+                            # Simplified wall metrics
+                            cA, cB, cC, cD = st.columns(4)
+                            
+                            mag = float(levels['magnets'].iloc[0]['strike']) if not levels["magnets"].empty else None
+                            lower = levels["gamma_box"]["lower"]
+                            upper = levels["gamma_box"]["upper"]
+                            zg = levels.get("zero_gamma")
+
+                            cA.metric("Main Magnet", f"{mag:g}" if mag is not None else "N/A")
+                            cB.metric("Put Wall (Lower)", f"{lower:g}" if lower is not None else "N/A")
+                            cC.metric("Call Wall (Upper)", f"{upper:g}" if upper is not None else "N/A")
+                            cD.metric("Zero Gamma", f"{zg:g}" if zg is not None else "N/A")
 
                             st_plot(plot_net_gex_map(gex_df, spot=spot, levels=levels))
 

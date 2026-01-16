@@ -3312,6 +3312,202 @@ def build_vwap_obv_analysis(
     return df, summary
 
 
+# =========================
+# VOLATILITY CONE ANALYSIS
+# =========================
+
+TRADING_DAYS = 252
+DEFAULT_VOL_WINDOWS = [5, 10, 20, 30, 60, 90, 120]
+DEFAULT_VOL_PCTS = [5, 25, 50, 75, 95]
+
+
+def annualized_realized_vol_series(close: pd.Series, window_days: int) -> pd.Series:
+    """
+    Calculate rolling annualized realized volatility from close prices.
+    
+    Args:
+        close: Series of close prices
+        window_days: Lookback window in trading days
+        
+    Returns:
+        Series of annualized realized volatility values
+    """
+    logret = np.log(close.astype(float)).diff()
+    return logret.rolling(window_days).std(ddof=0) * math.sqrt(TRADING_DAYS)
+
+
+def build_vol_cone(
+    close: pd.Series,
+    windows: list = None,
+    percentiles: list = None,
+) -> pd.DataFrame:
+    """
+    Build volatility cone showing RV percentiles across different lookback windows.
+    
+    Args:
+        close: Close price series
+        windows: List of lookback windows (in trading days)
+        percentiles: List of percentiles to calculate
+        
+    Returns:
+        DataFrame with index=window_days, columns=[latest_rv, p5, p25, p50, p75, p95, etc.]
+    """
+    if windows is None:
+        windows = DEFAULT_VOL_WINDOWS
+    if percentiles is None:
+        percentiles = DEFAULT_VOL_PCTS
+    
+    rows = []
+    for w in windows:
+        rv = annualized_realized_vol_series(close, w).dropna()
+        if rv.empty:
+            continue
+        row = {"window_days": w, "latest_rv": float(rv.iloc[-1])}
+        for p in percentiles:
+            row[f"p{p}"] = float(np.nanpercentile(rv.values, p))
+        rows.append(row)
+    
+    return pd.DataFrame(rows).set_index("window_days").sort_index()
+
+
+def vol_regime_for_window(latest_rv: float, row: pd.Series) -> tuple:
+    """
+    Determine volatility regime based on where latest RV falls in historical distribution.
+    
+    Returns:
+        Tuple of (vol_regime string, trade_type string)
+    """
+    p25 = float(row.get("p25", np.nan))
+    p75 = float(row.get("p75", np.nan))
+    
+    if np.isnan([p25, p75]).any():
+        return "UNKNOWN", "WAIT"
+    
+    if latest_rv <= p25:
+        return "VOL CHEAP (≤ p25)", "BUY OPTIONS"
+    if latest_rv >= p75:
+        return "VOL EXPENSIVE (≥ p75)", "SELL PREMIUM"
+    return "VOL NORMAL (p25–p75)", "SELECTIVE / WAIT"
+
+
+def direction_from_vwap_obv(close: float, vwap: float, vwap_slope: float, obv_slope: float) -> str:
+    """
+    Determine directional bias using VWAP and OBV slopes.
+    
+    Returns:
+        "BULLISH", "BEARISH", or "NEUTRAL"
+    """
+    bullish = (close > vwap) and (vwap_slope > 0) and (obv_slope > 0)
+    bearish = (close < vwap) and (vwap_slope < 0) and (obv_slope < 0)
+    
+    if bullish:
+        return "BULLISH"
+    if bearish:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def combine_vol_suggestion(vol_trade_type: str, direction: str) -> str:
+    """
+    Generate trade suggestion based on volatility regime and directional bias.
+    
+    Returns:
+        Suggestion string with specific options strategy
+    """
+    if vol_trade_type == "BUY OPTIONS":
+        if direction == "BULLISH":
+            return "Buy CALL or CALL DEBIT SPREAD (trend up + vol cheap)"
+        if direction == "BEARISH":
+            return "Buy PUT or PUT DEBIT SPREAD (trend down + vol cheap)"
+        return "Buy STRADDLE/STRANGLE (vol cheap but direction unclear)"
+    
+    if vol_trade_type == "SELL PREMIUM":
+        if direction == "BULLISH":
+            return "Sell PUT CREDIT SPREAD / CSP (bullish + vol expensive)"
+        if direction == "BEARISH":
+            return "Sell CALL CREDIT SPREAD / CC (bearish + vol expensive)"
+        return "Iron Condor (range + vol expensive)"
+    
+    return "WAIT / NO EDGE (vol normal or direction unclear)"
+
+
+def build_vol_cone_analysis(
+    hist: pd.DataFrame,
+    focus_window: int = 20,
+    windows: list = None,
+    percentiles: list = None,
+) -> tuple:
+    """
+    Build complete volatility cone analysis from OHLCV data.
+    
+    Args:
+        hist: DataFrame with OHLCV data
+        focus_window: Primary window for regime determination
+        windows: List of lookback windows
+        percentiles: List of percentiles
+        
+    Returns:
+        Tuple of (cone DataFrame, summary dict)
+    """
+    df = hist.copy()
+    
+    # Normalize columns if MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
+    
+    # Ensure Date column
+    if "Date" not in df.columns:
+        if df.index.name == "Date" or df.index.name == "Datetime":
+            df = df.reset_index()
+        else:
+            df["Date"] = df.index
+    
+    # Add VWAP/OBV for direction
+    df = add_vwap_obv_indicators(df)
+    df["VWAP_SLOPE"] = df["VWAP"].diff()
+    df["OBV_SLOPE"] = df["OBV"].diff()
+    
+    # Build volatility cone
+    close_series = df["Close"].dropna()
+    cone = build_vol_cone(close_series, windows=windows, percentiles=percentiles)
+    
+    if cone.empty:
+        raise ValueError("Could not build volatility cone - not enough data")
+    
+    # Determine focus window (use closest available if exact not in cone)
+    if focus_window not in cone.index:
+        focus_window = int(cone.index.values[len(cone) // 2])  # Use middle window
+    
+    focus_rv = float(cone.loc[focus_window, "latest_rv"])
+    vol_regime, trade_type = vol_regime_for_window(focus_rv, cone.loc[focus_window])
+    
+    # Get direction from VWAP/OBV
+    last = df.iloc[-1]
+    close = float(last["Close"])
+    vwap = float(last["VWAP"]) if pd.notna(last["VWAP"]) else close
+    vwap_slope = float(last["VWAP_SLOPE"]) if pd.notna(last["VWAP_SLOPE"]) else 0.0
+    obv_slope = float(last["OBV_SLOPE"]) if pd.notna(last["OBV_SLOPE"]) else 0.0
+    
+    direction = direction_from_vwap_obv(close, vwap, vwap_slope, obv_slope)
+    suggestion = combine_vol_suggestion(trade_type, direction)
+    
+    summary = {
+        "date": df["Date"].iloc[-1] if "Date" in df.columns else df.index[-1],
+        "close": close,
+        "vwap": vwap,
+        "vwap_slope": vwap_slope,
+        "obv_slope": obv_slope,
+        "focus_window": focus_window,
+        "focus_rv": focus_rv,
+        "vol_regime": vol_regime,
+        "trade_type": trade_type,
+        "direction": direction,
+        "suggestion": suggestion,
+    }
+    
+    return cone, summary, df
+
+
 def main():
     st.markdown(
         """
@@ -3599,8 +3795,8 @@ def main():
 
             st.success(f"✓ Loaded {len(df)} strikes for **{symbol}** expiring **{date}**")
 
-            tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-                ["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters", "🧮 Volatility & Greeks", "🏆 Pro Edge", "Market Folding", "📈 VWAP + OBV"]
+            tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+                ["📋 Options Chain", "📊 OI Charts", "📌 Weekly Gamma / GEX", "🧲 Gamma Map + Filters", "🧮 Volatility & Greeks", "🏆 Pro Edge", "Market Folding", "📈 VWAP + OBV", "🎯 Vol Cone"]
             )
 
             with tab1:
@@ -4926,6 +5122,200 @@ down, volume is subtracted. Rising OBV confirms uptrends; falling OBV confirms d
 
                         except Exception as e:
                             st.error(f"Error computing VWAP + OBV analysis: {e}")
+
+            with tab9:
+                st.subheader("Volatility Cone (Realized Vol Percentiles)")
+                st.caption("Analyzes where current volatility stands relative to historical norms across different lookback windows.")
+
+                vc_c1, vc_c2, vc_c3 = st.columns(3)
+                with vc_c1:
+                    vc_period_options = ["1y", "2y", "3y", "5y"]
+                    vc_period = st.selectbox("History Period", vc_period_options, index=3, key="vc_period",
+                                             help="Longer history = more reliable percentile bands")
+                with vc_c2:
+                    vc_focus_window = st.selectbox("Focus Window (days)", [5, 10, 20, 30, 60, 90, 120], index=2, key="vc_focus",
+                                                   help="Primary window for vol regime determination")
+                with vc_c3:
+                    vc_interval = st.selectbox("Interval", ["1d", "1wk"], index=0, key="vc_interval")
+
+                with st.spinner(f"Loading {symbol} data from Yahoo Finance..."):
+                    try:
+                        vc_hist = yf.download(symbol, period=vc_period, interval=vc_interval, auto_adjust=False, progress=False)
+                    except Exception as e:
+                        vc_hist = pd.DataFrame()
+                        st.error(f"Error fetching data: {e}")
+
+                if vc_hist is None or vc_hist.empty:
+                    st.warning("Yahoo Finance returned no data. Try a different symbol or period.")
+                else:
+                    # Normalize yfinance MultiIndex columns
+                    if isinstance(vc_hist.columns, pd.MultiIndex):
+                        vc_hist.columns = vc_hist.columns.droplevel(1)
+
+                    try:
+                        cone, vc_summary, vc_df = build_vol_cone_analysis(
+                            vc_hist, 
+                            focus_window=int(vc_focus_window),
+                        )
+
+                        # Display metrics
+                        vm1, vm2, vm3, vm4 = st.columns(4)
+                        vm1.metric("Close", f"${vc_summary['close']:.2f}")
+                        vm2.metric(f"RV {vc_summary['focus_window']}d", f"{vc_summary['focus_rv']:.1%}")
+                        
+                        # Vol regime with color coding
+                        vol_regime = vc_summary['vol_regime']
+                        if "CHEAP" in vol_regime:
+                            vm3.metric("Vol Regime", "📉 CHEAP", delta="Buy Options", delta_color="normal")
+                        elif "EXPENSIVE" in vol_regime:
+                            vm3.metric("Vol Regime", "📈 EXPENSIVE", delta="Sell Premium", delta_color="inverse")
+                        else:
+                            vm3.metric("Vol Regime", "➖ NORMAL", delta="Wait/Selective")
+                        
+                        direction = vc_summary['direction']
+                        if direction == "BULLISH":
+                            vm4.metric("Direction", "🔼 BULLISH", delta="Uptrend")
+                        elif direction == "BEARISH":
+                            vm4.metric("Direction", "🔽 BEARISH", delta="Downtrend", delta_color="inverse")
+                        else:
+                            vm4.metric("Direction", "➖ NEUTRAL")
+
+                        # Trade Suggestion Box
+                        suggestion = vc_summary['suggestion']
+                        if "WAIT" in suggestion or "NO EDGE" in suggestion:
+                            st.info(f"💡 **Suggestion:** {suggestion}")
+                        elif "Buy" in suggestion:
+                            st.success(f"💡 **Suggestion:** {suggestion}")
+                        else:
+                            st.warning(f"💡 **Suggestion:** {suggestion}")
+
+                        # Secondary metrics
+                        vm5, vm6, vm7, vm8 = st.columns(4)
+                        vm5.metric("VWAP", f"${vc_summary['vwap']:.2f}")
+                        vm6.metric("VWAP Slope", f"{vc_summary['vwap_slope']:.4f}")
+                        vm7.metric("OBV Slope", f"{vc_summary['obv_slope']:.2f}")
+                        vm8.metric("Trade Type", vc_summary['trade_type'])
+
+                        # Volatility Cone Chart
+                        fig_cone = go.Figure()
+
+                        x_windows = cone.index.values.astype(int)
+
+                        # Add percentile lines
+                        pct_colors = {
+                            "p5": "rgba(255, 99, 132, 0.7)",
+                            "p25": "rgba(255, 159, 64, 0.8)",
+                            "p50": "rgba(75, 192, 192, 0.9)",
+                            "p75": "rgba(54, 162, 235, 0.8)",
+                            "p95": "rgba(153, 102, 255, 0.7)",
+                        }
+
+                        for pct_col in ["p5", "p25", "p50", "p75", "p95"]:
+                            if pct_col in cone.columns:
+                                fig_cone.add_trace(go.Scatter(
+                                    x=x_windows,
+                                    y=cone[pct_col].values * 100,  # Convert to percentage
+                                    mode="lines+markers",
+                                    name=pct_col.upper(),
+                                    line=dict(color=pct_colors.get(pct_col, "gray"), width=2),
+                                    marker=dict(size=6),
+                                ))
+
+                        # Add latest RV line (the current volatility)
+                        fig_cone.add_trace(go.Scatter(
+                            x=x_windows,
+                            y=cone["latest_rv"].values * 100,
+                            mode="lines+markers",
+                            name="Latest RV",
+                            line=dict(color="#FF5722", width=3),
+                            marker=dict(size=10, symbol="diamond"),
+                        ))
+
+                        # Highlight focus window point
+                        focus_idx = vc_summary['focus_window']
+                        focus_rv = vc_summary['focus_rv'] * 100
+                        fig_cone.add_trace(go.Scatter(
+                            x=[focus_idx],
+                            y=[focus_rv],
+                            mode="markers+text",
+                            name=f"Focus ({focus_idx}d)",
+                            marker=dict(size=18, color="#FF5722", symbol="star", line=dict(color="black", width=2)),
+                            text=[f"{focus_rv:.1f}%"],
+                            textposition="top center",
+                            textfont=dict(size=12, color="black"),
+                        ))
+
+                        # Add filled area between p25 and p75 (the "normal" zone)
+                        if "p25" in cone.columns and "p75" in cone.columns:
+                            fig_cone.add_trace(go.Scatter(
+                                x=list(x_windows) + list(x_windows[::-1]),
+                                y=list(cone["p75"].values * 100) + list(cone["p25"].values[::-1] * 100),
+                                fill="toself",
+                                fillcolor="rgba(100, 100, 100, 0.15)",
+                                line=dict(color="rgba(0,0,0,0)"),
+                                name="Normal Zone (p25-p75)",
+                                showlegend=True,
+                            ))
+
+                        fig_cone.update_layout(
+                            height=500,
+                            title=f"{symbol} Volatility Cone - Realized Vol Percentiles",
+                            xaxis_title="Lookback Window (Trading Days)",
+                            yaxis_title="Annualized Volatility (%)",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                            margin=dict(l=10, r=10, t=60, b=10),
+                        )
+
+                        st_plot(fig_cone)
+
+                        # Show cone data table
+                        with st.expander("📊 Cone Data Table"):
+                            cone_display = cone.copy()
+                            # Format as percentages
+                            for col in cone_display.columns:
+                                cone_display[col] = cone_display[col].apply(lambda x: f"{x:.1%}")
+                            st_df(cone_display.reset_index())
+
+                        # Educational explanation
+                        st.markdown(
+                            """
+**What is a Volatility Cone?**
+A volatility cone shows the historical distribution of realized volatility (RV) across different lookback windows.
+Each line represents a percentile of historical RV values for that window length.
+
+**How to Read the Cone:**
+- **P5/P25**: Low volatility levels (historically cheap)
+- **P50**: Median volatility (typical level)
+- **P75/P95**: High volatility levels (historically expensive)
+- **Latest RV** (orange): Where current volatility sits for each window
+
+**Trade Type Logic:**
+- **VOL CHEAP (≤ p25)**: Volatility is historically low → **BUY OPTIONS** (premium is cheap)
+- **VOL EXPENSIVE (≥ p75)**: Volatility is historically high → **SELL PREMIUM** (premium is rich)
+- **VOL NORMAL (p25-p75)**: Wait or be selective
+
+**Direction Logic (VWAP + OBV):**
+- **BULLISH**: Price > VWAP AND VWAP rising AND OBV rising
+- **BEARISH**: Price < VWAP AND VWAP falling AND OBV falling
+- **NEUTRAL**: Mixed signals
+
+**Combined Suggestions:**
+| Vol Regime | Direction | Strategy |
+|------------|-----------|----------|
+| CHEAP | BULLISH | Buy CALL / Call Debit Spread |
+| CHEAP | BEARISH | Buy PUT / Put Debit Spread |
+| CHEAP | NEUTRAL | Buy Straddle/Strangle |
+| EXPENSIVE | BULLISH | Sell Put Credit Spread / CSP |
+| EXPENSIVE | BEARISH | Sell Call Credit Spread / CC |
+| EXPENSIVE | NEUTRAL | Iron Condor |
+| NORMAL | Any | Wait / No Edge |
+
+*This is educational only - not financial advice.*
+"""
+                        )
+
+                    except Exception as e:
+                        st.error(f"Error computing Volatility Cone: {e}")
 
     else:
         st.info("👆 Enter symbol/date/spot and click **Fetch Data**.")

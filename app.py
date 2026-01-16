@@ -4123,8 +4123,20 @@ def main():
                         #   r = risk-free rate (annual)
                         #   q = dividend yield (annual; 0 if you want to ignore dividends)
                         #   spot = current underlying price used for greeks
-                        r_in = st.number_input('Risk-free rate r (annual, decimal)', value=0.041, step=0.001, format='%.4f')
-                        q_in = st.number_input('Dividend yield q (annual, decimal)', value=0.004, step=0.001, format='%.4f')
+                        r_in = st.number_input(
+                            'Risk-free rate r (annual, decimal)',
+                            value=0.041,
+                            step=0.001,
+                            format='%.4f',
+                            key="r_in",
+                        )
+                        q_in = st.number_input(
+                            'Dividend yield q (annual, decimal)',
+                            value=0.004,
+                            step=0.001,
+                            format='%.4f',
+                            key="q_in",
+                        )
 
                         col_a, col_b = st.columns([1, 1])
                         with col_a:

@@ -28,6 +28,11 @@ import math
 from io import StringIO
 from time import time
 from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except Exception:
+    ZoneInfo = None
+    ZoneInfoNotFoundError = Exception
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query
@@ -80,6 +85,12 @@ SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
 _BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "2")) # Increased to 2 for production
 _BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
 _BROWSER_ACQUIRE_TIMEOUT = 100 # Max wait for a browser slot before erroring
+_EXPIRY_TZ = None
+if ZoneInfo:
+    try:
+        _EXPIRY_TZ = ZoneInfo(os.getenv("EXPIRY_TZ", "America/New_York"))
+    except ZoneInfoNotFoundError:
+        _EXPIRY_TZ = None
 
 # Request deduplication: prevent multiple identical scrapes
 _PENDING_OPTIONS = {}  # (symbol,date) -> asyncio.Event (signals when scrape completes)
@@ -597,9 +608,25 @@ def _iv_to_decimal(iv_str_or_num):
 
 
 def _years_to_expiry(date_yyyy_mm_dd: str) -> float:
-    now = datetime.now()
-    exp = datetime.strptime(date_yyyy_mm_dd, "%Y-%m-%d").replace(hour=16, minute=0, second=0, microsecond=0)
-    dt_seconds = (exp - now).total_seconds()
+    if _EXPIRY_TZ:
+        now = datetime.now(_EXPIRY_TZ)
+        exp = datetime.strptime(date_yyyy_mm_dd, "%Y-%m-%d").replace(
+            hour=16,
+            minute=0,
+            second=0,
+            microsecond=0,
+            tzinfo=_EXPIRY_TZ,
+        )
+        dt_seconds = (exp - now).total_seconds()
+    else:
+        now = datetime.now()
+        exp = datetime.strptime(date_yyyy_mm_dd, "%Y-%m-%d").replace(
+            hour=16,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        dt_seconds = (exp - now).total_seconds()
     return max(dt_seconds, 0.0) / (365.0 * 24 * 3600.0)
 
 

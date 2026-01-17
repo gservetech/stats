@@ -28,6 +28,11 @@ import math
 from io import StringIO
 from time import time
 from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except Exception:
+    ZoneInfo = None
+    ZoneInfoNotFoundError = Exception
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query
@@ -73,20 +78,104 @@ app.add_middleware(
 
 # ---------------- Cache (avoid double-scraping) ----------------
 _OPTIONS_CACHE = {}  # (symbol,date) -> {"ts": float, "rows": list}
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min default (was 5 min)
+CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "3600"))  # serve stale up to 1 hour
+_SPOT_CACHE = {}  # (symbol,date) -> {"ts": float, "data": dict}
+SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
+_BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "2")) # Increased to 2 for production
+_BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
+_BROWSER_ACQUIRE_TIMEOUT = 100 # Max wait for a browser slot before erroring
+_EXPIRY_TZ = None
+if ZoneInfo:
+    try:
+        _EXPIRY_TZ = ZoneInfo(os.getenv("EXPIRY_TZ", "America/New_York"))
+    except ZoneInfoNotFoundError:
+        _EXPIRY_TZ = None
+
+# Request deduplication: prevent multiple identical scrapes
+_PENDING_OPTIONS = {}  # (symbol,date) -> asyncio.Event (signals when scrape completes)
+_PENDING_OPTIONS_LOCK = asyncio.Lock()
 
 
 async def get_rows_cached(symbol: str, date: str):
+    """
+    Fetch options with:
+    1. Cache hit -> return immediately
+    2. Stale cache + busy browser -> return stale data (fast)
+    3. Request deduplication -> wait for in-flight scrape instead of starting new one
+    4. Otherwise -> scrape fresh data
+    """
     key = (symbol.upper().strip(), date.strip())
     now = time()
 
+    # 1. Fresh cache hit
     hit = _OPTIONS_CACHE.get(key)
     if hit and (now - hit["ts"]) < CACHE_TTL_SECONDS:
+        print(f"[CACHE] Fresh cache hit for {key}")
         return hit["rows"]
 
-    rows = await scrape_options(symbol, date)
-    _OPTIONS_CACHE[key] = {"ts": now, "rows": rows}
-    return rows
+    # 2. Stale cache available + browser busy -> return stale immediately
+    if hit and (now - hit["ts"]) < CACHE_STALE_SECONDS and _BROWSER_SEMAPHORE.locked():
+        print(f"[CACHE] Returning stale data for {key} (browser busy)")
+        return hit["rows"]
+
+    # 3. Check if another request is already scraping this key
+    async with _PENDING_OPTIONS_LOCK:
+        if key in _PENDING_OPTIONS:
+            # Wait for the other request to finish
+            event = _PENDING_OPTIONS[key]
+            print(f"[DEDUP] Waiting for in-flight scrape of {key}")
+    
+    # If there's an in-flight request, wait for it
+    if key in _PENDING_OPTIONS:
+        try:
+            await asyncio.wait_for(_PENDING_OPTIONS[key].wait(), timeout=120)
+        except asyncio.TimeoutError:
+            pass
+        # Check cache again after waiting
+        hit = _OPTIONS_CACHE.get(key)
+        if hit:
+            print(f"[DEDUP] Got result from parallel scrape for {key}")
+            return hit["rows"]
+
+    # 4. Start a new scrape (register as pending first)
+    event = asyncio.Event()
+    async with _PENDING_OPTIONS_LOCK:
+        _PENDING_OPTIONS[key] = event
+
+    try:
+        # Wait for the result with a timeout slightly shorter than the frontend timeout
+        async with asyncio.timeout(110): 
+            rows = await scrape_options(symbol, date)
+            _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows}
+            return rows
+    except asyncio.TimeoutError:
+        print(f"[TIMEOUT] Scrape for {key} took too long.")
+        raise HTTPException(status_code=504, detail="Scrape timed out. Please try again.")
+    finally:
+        # Signal other waiters that we're done
+        event.set()
+        async with _PENDING_OPTIONS_LOCK:
+            _PENDING_OPTIONS.pop(key, None)
+
+
+async def get_spot_cached(symbol: str, date: str | None):
+    key = (symbol.upper().strip(), (date or "").strip())
+    now = time()
+
+    hit = _SPOT_CACHE.get(key)
+    if hit and (now - hit["ts"]) < SPOT_TTL_SECONDS:
+        return hit["data"]
+    # If a browser slot is busy, return last known spot (even if stale)
+    # to avoid timing out callers.
+    if hit and _BROWSER_SEMAPHORE.locked():
+        data = dict(hit["data"])
+        data["stale"] = True
+        return data
+
+    data = await scrape_spot(symbol, date)
+    _SPOT_CACHE[key] = {"ts": now, "data": data}
+    return data
 
 
 # ---------------- JSON Sanitizer (fix NaN/Inf) ----------------
@@ -139,9 +228,12 @@ def _to_float(val, default=None):
         return default
 
 
-def _to_int(val, default=0):
+def _to_int(val, default: int | float | str | None = 0) -> int:
     f = _to_float(val, None)
-    return int(round(f)) if f is not None else default
+    if f is not None:
+        return int(round(f))
+    d = _to_float(default, None)
+    return int(round(d)) if d is not None else 0
 
 
 def _fmt_price(x):
@@ -276,21 +368,16 @@ def build_chrome_options() -> ChromiumOptions:
 
     # ---- args ----
     opts.add_argument("--headless=new")
+    # speed & stability
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-extensions")
-    opts.add_argument("--window-size=1920,1080")
-
-    # profile stability (OK to add; not default in pydoll)
-    opts.add_argument(f"--user-data-dir={user_data_dir.as_posix()}")
-
-    # crashpad / temp locks
-    opts.add_argument("--disable-breakpad")
-    opts.add_argument("--disable-crash-reporter")
-    opts.add_argument("--disable-features=Crashpad")
-
-    # Docker/Linux flags (safe on Windows too)
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-setuid-sandbox")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--proxy-server='direct://'")
+    opts.add_argument("--proxy-bypass-list=*")
+    opts.add_argument("--blink-settings=imagesEnabled=false") # don't load images
 
     # DO NOT force remote debugging port (pydoll handles this)
 
@@ -321,64 +408,187 @@ async def scrape_options(symbol: str, date: str):
         elif "/proxies/core-api/v1/options-expirations/get" in resp_url and "expirations" not in captured_requests:
             captured_requests["expirations"] = (params.get("requestId"), resp_url)
 
-    options = build_chrome_options()
+    async with _BROWSER_SEMAPHORE:
+        options = build_chrome_options()
 
-    print("[INFO] Starting browser (headless mode)...")
-    print("[INFO] Chrome binary:", getattr(options, "binary_location", None) or "(auto-detect)")
+        print("[INFO] Starting browser (headless mode)...")
+        print("[INFO] Chrome binary:", getattr(options, "binary_location", None) or "(auto-detect)")
 
-    async with Chrome(options=options) as browser:
-        tab = await browser.start()
+        async with Chrome(options=options) as browser:
+            tab = await browser.start()
 
-        await tab.enable_network_events()
-        await tab.on("Network.responseReceived", on_response)
+            await tab.enable_network_events()
+            await tab.on("Network.responseReceived", on_response)
 
-        try:
-            await tab.go_to(url)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
+            try:
+                # Add a timeout to the initial page load to avoid hanging the semaphore
+                await asyncio.wait_for(tab.go_to(url), timeout=45)
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail="Barchart took too long to respond.")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
 
-        print("[INFO] Waiting for network requests (max 45s)...")
-        for i in range(45):
-            await asyncio.sleep(1)
-            if "options" in captured_requests:
-                await asyncio.sleep(3)
-                break
+            print("[INFO] Waiting for network requests (max 30s)...")
+            # Poll much faster (every 0.2s) instead of every 1s
+            for _ in range(150): 
+                await asyncio.sleep(0.2)
+                if "options" in captured_requests:
+                    # Once request is seen, wait just a tiny bit for the body to be populateable
+                    await asyncio.sleep(0.5) 
+                    break
 
-        if "options" not in captured_requests:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Options data not found for {symbol} on {date}. "
-                    f"Verify symbol + expiration date, or Barchart may be blocking headless requests."
+            if "options" not in captured_requests:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Options data not found for {symbol} on {date}. "
+                        f"Verify symbol + expiration date, or Barchart may be blocking headless requests."
+                    )
                 )
-            )
 
-        request_id, _api_url = captured_requests["options"]
+            request_id, _api_url = captured_requests["options"]
 
+            try:
+                body_data = await tab.get_network_response_body(request_id)
+
+                if isinstance(body_data, dict):
+                    body = body_data.get("body", "")
+                    if body_data.get("base64Encoded"):
+                        body = base64.b64decode(body).decode("utf-8", errors="ignore")
+                else:
+                    body = body_data
+
+                opt_json = json.loads(body)
+                rows = process_options_data(opt_json)
+
+                if not rows:
+                    raise HTTPException(status_code=404, detail=f"No options data found for {symbol} on {date}.")
+
+                return rows
+
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=500, detail=f"Failed to parse options data: {str(e)}")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
+
+
+async def _query_text_any(tab, selectors: list[str]) -> str | None:
+    for selector in selectors:
         try:
-            body_data = await tab.get_network_response_body(request_id)
+            el = await tab.query(selector, timeout=0, raise_exc=False)
+        except Exception:
+            el = None
+        if el:
+            try:
+                text = (await el.text).strip()
+            except Exception:
+                text = ""
+            if text:
+                return text
+    return None
 
-            if isinstance(body_data, dict):
-                body = body_data.get("body", "")
-                if body_data.get("base64Encoded"):
-                    body = base64.b64decode(body).decode("utf-8", errors="ignore")
-            else:
-                body = body_data
 
-            opt_json = json.loads(body)
-            rows = process_options_data(opt_json)
+async def scrape_spot(symbol: str, date: str | None):
+    symbol_q = quote(symbol, safe="")
+    quote_url = f"https://www.barchart.com/stocks/quotes/{symbol_q}"
+    options_url = f"https://www.barchart.com/stocks/quotes/{symbol_q}/options?expiration={date}&view=sbs" if date else None
+    urls = [options_url, quote_url] if options_url else [quote_url]
 
-            if not rows:
-                raise HTTPException(status_code=404, detail=f"No options data found for {symbol} on {date}.")
+    last_error: Exception | None = None
 
-            return rows
+    async with _BROWSER_SEMAPHORE:
+        options = build_chrome_options()
 
-        except json.JSONDecodeError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to parse options data: {str(e)}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
+        async with Chrome(options=options) as browser:
+            tab = await browser.start()
+
+            for url in urls:
+                if not url:
+                    continue
+                print(f"[INFO] Scraping spot: {url}")
+                try:
+                    await tab.go_to(url)
+                except Exception as e:
+                    last_error = e
+                    continue
+
+                price_text = None
+                for _ in range(30):
+                    await asyncio.sleep(1)
+                    price_text = await _query_text_any(
+                        tab,
+                        [
+                            "span.last-change[data-ng-class*='lastPrice']",
+                            ".pricechangerow span.last-change",
+                        ],
+                    )
+                    if price_text:
+                        break
+
+                if not price_text:
+                    last_error = Exception("Spot price element not found")
+                    continue
+
+                change_text = await _query_text_any(
+                    tab,
+                    [
+                        "span.last-change[data-ng-class*='priceChange']",
+                        ".pricechangerow span.last-change.up",
+                        ".pricechangerow span.last-change.down",
+                    ],
+                )
+                percent_text = await _query_text_any(
+                    tab,
+                    [
+                        "span[data-ng-class*='percentChange']",
+                    ],
+                )
+                trade_time = await _query_text_any(
+                    tab,
+                    [
+                        ".pricechangerow span.symbol-trade-time[data-ng-class*='tradeTime']",
+                        ".pricechangerow span.symbol-trade-time",
+                    ],
+                )
+                exchange = await _query_text_any(
+                    tab,
+                    [
+                        ".pricechangerow span.symbol-trade-time + span.symbol-trade-time",
+                    ],
+                )
+                session = await _query_text_any(
+                    tab,
+                    [
+                        ".realtime-title-wrapper .session",
+                    ],
+                )
+                bid_text = await _query_text_any(tab, [".ask-bid-data .bid"])
+                ask_text = await _query_text_any(tab, [".ask-bid-data .ask"])
+
+                spot = _to_float(price_text, None)
+                change = _to_float(change_text, None)
+                percent_change = _to_float(percent_text, None)
+
+                return {
+                    "url": url,
+                    "spot": spot,
+                    "spot_text": price_text,
+                    "change": change,
+                    "change_text": change_text,
+                    "percent_change": percent_change,
+                    "percent_text": percent_text,
+                    "trade_time": trade_time,
+                    "exchange": exchange,
+                    "session": session,
+                    "bid_text": bid_text,
+                    "ask_text": ask_text,
+                }
+
+    if last_error:
+        raise HTTPException(status_code=500, detail=f"Failed to load page: {str(last_error)}")
+    raise HTTPException(status_code=404, detail=f"Spot price not found for {symbol}.")
 
 
 # ---------------- Gamma / GEX helpers ----------------
@@ -398,9 +608,25 @@ def _iv_to_decimal(iv_str_or_num):
 
 
 def _years_to_expiry(date_yyyy_mm_dd: str) -> float:
-    now = datetime.now()
-    exp = datetime.strptime(date_yyyy_mm_dd, "%Y-%m-%d").replace(hour=16, minute=0, second=0, microsecond=0)
-    dt_seconds = (exp - now).total_seconds()
+    if _EXPIRY_TZ:
+        now = datetime.now(_EXPIRY_TZ)
+        exp = datetime.strptime(date_yyyy_mm_dd, "%Y-%m-%d").replace(
+            hour=16,
+            minute=0,
+            second=0,
+            microsecond=0,
+            tzinfo=_EXPIRY_TZ,
+        )
+        dt_seconds = (exp - now).total_seconds()
+    else:
+        now = datetime.now()
+        exp = datetime.strptime(date_yyyy_mm_dd, "%Y-%m-%d").replace(
+            hour=16,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        dt_seconds = (exp - now).total_seconds()
     return max(dt_seconds, 0.0) / (365.0 * 24 * 3600.0)
 
 
@@ -408,14 +634,19 @@ def _norm_pdf(x: float) -> float:
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
 
-def _bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
+def _bs_gamma(S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
+    """
+    Standard Black-Scholes Gamma: e^(-qT) * N'(d1) / (S * sigma * sqrt(T))
+    """
     if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return float("nan")
-    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
-    return _norm_pdf(d1) / (S * sigma * math.sqrt(T))
+        return 0.0
+    
+    # d1 = (ln(S/K) + (r - q + 0.5*sigma^2)*T) / (sigma*sqrt(T))
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    return (math.exp(-q * T) * _norm_pdf(d1)) / (S * sigma * math.sqrt(T))
 
 
-def _compute_weekly_gex(rows, spot: float, date: str, r: float = 0.05, multiplier: int = 100) -> pd.DataFrame:
+def _compute_weekly_gex(rows, spot: float, date: str, r: float = 0.05, q: float = 0.0, multiplier: int = 100) -> pd.DataFrame:
     df = pd.DataFrame(rows).copy()
     if df.empty:
         return df
@@ -431,27 +662,46 @@ def _compute_weekly_gex(rows, spot: float, date: str, r: float = 0.05, multiplie
 
     T = _years_to_expiry(date)
 
-    def pick_iv(row):
-        return row["call_iv_dec"] if row["call_iv_dec"] is not None else row["put_iv_dec"]
+    # Calculate gamma separately for calls and puts to use their specific IVs (skew)
+    def calc_gamma(iv):
+        if iv is None or iv <= 0:
+            return 0.0
+        return _bs_gamma(spot, row["strike"], T, r, q, iv)
 
-    df["iv_used"] = df.apply(pick_iv, axis=1)
+    gammas_call = []
+    gammas_put = []
+    
+    for _, row in df.iterrows():
+        civ = row["call_iv_dec"]
+        piv = row["put_iv_dec"]
+        
+        # If one IV is missing, use the other as fallback
+        g_call = _bs_gamma(spot, row["strike"], T, r, q, civ) if civ else 0.0
+        g_put = _bs_gamma(spot, row["strike"], T, r, q, piv) if piv else 0.0
+        
+        if not g_call and g_put: g_call = g_put
+        if not g_put and g_call: g_put = g_call
+        
+        gammas_call.append(g_call)
+        gammas_put.append(g_put)
 
-    df["gamma"] = df.apply(
-        lambda row: _bs_gamma(spot, row["strike"], T, r, row["iv_used"]) if row["iv_used"] else float("nan"),
-        axis=1
-    )
+    df["gamma_call"] = gammas_call
+    df["gamma_put"] = gammas_put
 
+    # GEX = 0.01 * S^2 * Gamma * OI * Multiplier 
+    # (Representing dollar delta change for a 1% spot move)
     S2 = spot * spot
-    gamma_safe = df["gamma"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    df["call_gex"] = gamma_safe * df["call_oi"] * multiplier * S2
-    df["put_gex"] = gamma_safe * df["put_oi"] * multiplier * S2
+    df["call_gex"] = 0.01 * df["gamma_call"] * df["call_oi"] * multiplier * S2
+    df["put_gex"] = 0.01 * df["gamma_put"] * df["put_oi"] * multiplier * S2
+    
+    # Dealer Net GEX (Standard convention)
+    # Positive = Call Dominant (Supportive/Mean-Reverting)
+    # Negative = Put Dominant (Whipsaw/Acceleration)
     df["net_gex"] = df["call_gex"] - df["put_gex"]
 
     return df[[
         "strike",
-        "Call IV", "Put IV", "iv_used",
-        "gamma",
+        "Call IV", "Put IV", "gamma_call", "gamma_put",
         "call_oi", "put_oi",
         "call_vol", "put_vol",
         "call_gex", "put_gex", "net_gex"
@@ -469,6 +719,7 @@ async def root():
             "/options/csv": "GET - CSV download (params: symbol, date)",
             "/weekly/summary": "GET - PCR + GEX summary (params: symbol, date, spot)",
             "/weekly/gex": "GET - per-strike GEX (params: symbol, date, spot)",
+            "/spot": "GET - spot quote (params: symbol, date optional)",
             "/health": "GET - Health check"
         },
         "example": "/options?symbol=AAPL&date=2026-01-16"
@@ -482,8 +733,37 @@ async def health():
         "timestamp": datetime.now().isoformat(),
         "platform": sys.platform,
         "chrome_binary": os.getenv("CHROME_BINARY", ""),
-        "cache_ttl_seconds": CACHE_TTL_SECONDS
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "spot_ttl_seconds": SPOT_TTL_SECONDS,
+        "browser_concurrency": _BROWSER_CONCURRENCY,
     }
+
+
+@app.get("/spot")
+async def get_spot(
+    symbol: str = Query(..., description="Stock symbol (e.g., AAPL, $SPX, TSLA)"),
+    date: str | None = Query(None, description="Optional expiration date (YYYY-MM-DD)"),
+):
+    data = await get_spot_cached(symbol, date)
+    payload = {
+        "success": True,
+        "symbol": symbol,
+        "date": date,
+        "spot": data.get("spot"),
+        "spot_text": data.get("spot_text"),
+        "change": data.get("change"),
+        "change_text": data.get("change_text"),
+        "percent_change": data.get("percent_change"),
+        "percent_text": data.get("percent_text"),
+        "trade_time": data.get("trade_time"),
+        "exchange": data.get("exchange"),
+        "session": data.get("session"),
+        "bid_text": data.get("bid_text"),
+        "ask_text": data.get("ask_text"),
+        "url": data.get("url"),
+        "fetched_at": datetime.now().isoformat(),
+    }
+    return sanitize_json(payload)
 
 
 @app.get("/options")
@@ -527,10 +807,11 @@ async def weekly_summary(
     date: str = Query(..., description="Expiration date YYYY-MM-DD (example: 2026-01-16)"),
     spot: float = Query(..., description="Underlying spot price (required for gamma)"),
     r: float = Query(0.05, description="Risk-free rate (decimal), default 0.05"),
+    q: float = Query(0.0, description="Dividend yield (decimal), default 0.0"),
     multiplier: int = Query(100, description="Contract multiplier, default 100"),
 ):
     rows = await get_rows_cached(symbol, date)
-    gex_df = _compute_weekly_gex(rows, spot=spot, date=date, r=r, multiplier=multiplier)
+    gex_df = _compute_weekly_gex(rows, spot=spot, date=date, r=r, q=q, multiplier=multiplier)
     if gex_df.empty:
         raise HTTPException(status_code=404, detail="No data returned for GEX computation.")
 
@@ -578,10 +859,11 @@ async def weekly_gex(
     date: str = Query(...),
     spot: float = Query(...),
     r: float = Query(0.05),
+    q: float = Query(0.0),
     multiplier: int = Query(100),
 ):
     rows = await get_rows_cached(symbol, date)
-    gex_df = _compute_weekly_gex(rows, spot=spot, date=date, r=r, multiplier=multiplier)
+    gex_df = _compute_weekly_gex(rows, spot=spot, date=date, r=r, q=q, multiplier=multiplier)
     if gex_df.empty:
         raise HTTPException(status_code=404, detail="No data returned for GEX computation.")
 

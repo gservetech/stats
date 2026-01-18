@@ -1,5 +1,5 @@
 # stats_app/tabs/tab_friday_predictor.py
-"""Friday Expiry Predictor: AAPL 3-Engine Risk Book & Staged Timing"""
+"""Friday Expiry Predictor: 3-Engine Risk Book + Professional Playbook (no extra debug spam)"""
 
 import numpy as np
 import pandas as pd
@@ -11,9 +11,9 @@ from stats_app.helpers.api_client import API_BASE_URL
 from stats_app.helpers.ui_components import st_plot
 
 
-# -------------------------
-# 1. CORE DATA & GEX MATH
-# -------------------------
+# =========================================================
+# 1) CORE DATA & GEX
+# =========================================================
 
 def _fetch_weekly_gex_table(symbol: str, expiry_date: str, spot: float) -> pd.DataFrame:
     r = requests.get(
@@ -26,8 +26,10 @@ def _fetch_weekly_gex_table(symbol: str, expiry_date: str, spot: float) -> pd.Da
     rows = payload["data"] if isinstance(payload, dict) and "data" in payload else payload
     df = pd.DataFrame(rows)
     for c in ["strike", "call_gex", "put_gex", "net_gex"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["strike"]).sort_values("strike").reset_index(drop=True)
+    return df
 
 
 def _get_gamma_levels(gex_df: pd.DataFrame, spot: float) -> dict:
@@ -35,153 +37,350 @@ def _get_gamma_levels(gex_df: pd.DataFrame, spot: float) -> dict:
     d["abs_net"] = d["net_gex"].abs()
     d["dist"] = (d["strike"] - float(spot)).abs()
     d["pin_score"] = d["abs_net"] / (d["dist"] + 1.0)
+
     magnet_row = d.loc[d["pin_score"].idxmax()]
     put_wall_row = d.loc[d["put_gex"].idxmax()]
     call_wall_row = d.loc[d["call_gex"].idxmax()]
+
     return {
         "put_wall": float(put_wall_row["strike"]),
         "call_wall": float(call_wall_row["strike"]),
-        "magnet": float(magnet_row["strike"])
+        "magnet": float(magnet_row["strike"]),
     }
 
 
-def _nearest_strike(strikes, target, side="nearest"):
-    if len(strikes) == 0: return float(target)
+def _nearest_strike(strikes: np.ndarray, target: float, side: str = "nearest") -> float:
+    if strikes is None or len(strikes) == 0:
+        return float(target)
+
+    strikes = np.asarray(strikes, dtype=float)
+
     if side == "below":
         candidates = strikes[strikes <= target]
         return float(candidates.max()) if len(candidates) > 0 else float(strikes.min())
+
     if side == "above":
         candidates = strikes[strikes >= target]
         return float(candidates.min()) if len(candidates) > 0 else float(strikes.max())
-    return float(strikes[np.argmin(np.abs(strikes - target))])
+
+    idx = int(np.argmin(np.abs(strikes - target)))
+    return float(strikes[idx])
 
 
-# -------------------------
-# 2. TAB RENDERER
-# -------------------------
+def _to_friday(date_like) -> str:
+    """Return the Friday (YYYY-MM-DD) for the week of date_like (or same day if already Friday)."""
+    d = pd.to_datetime(date_like).normalize()
+    # weekday: Mon=0 ... Fri=4
+    delta = (4 - d.weekday()) % 7
+    return str((d + pd.Timedelta(days=int(delta))).date())
+
+
+def _add_weeks_to_friday(weekly_expiry: str, weeks: int = 3) -> str:
+    d = pd.to_datetime(weekly_expiry) + pd.Timedelta(days=int(weeks * 7))
+    return _to_friday(d)
+
+
+# =========================================================
+# 2) LIGHT TECH (VWAP proxy + ADL)
+# =========================================================
+
+def _anchored_vwap_proxy(hist_df: pd.DataFrame) -> tuple[float, str]:
+    """
+    No Finnhub required.
+    Anchored VWAP proxy blend (1d/3d) using daily closes.
+    """
+    recent = hist_df.tail(5)
+    vwap_1 = float(recent.tail(1)["Close"].mean())
+    vwap_3 = float(recent.tail(3)["Close"].mean())
+    vwap = 0.6 * vwap_1 + 0.4 * vwap_3
+    return vwap, "Anchored VWAP proxy blend (1d/3d)"
+
+
+def _adl_delta(hist_df: pd.DataFrame) -> float:
+    recent = hist_df.tail(120).copy()
+    hl = (recent["High"] - recent["Low"]).replace(0, np.nan)
+    clv = ((recent["Close"] - recent["Low"]) - (recent["High"] - recent["Close"])) / hl
+    clv = clv.replace([np.inf, -np.inf], 0).fillna(0)
+    adl = (clv * recent["Volume"]).cumsum()
+    return float(adl.diff().tail(10).mean())
+
+
+# =========================================================
+# 3) STRATEGY BUILDER (Weekly Condor + 3W Hedges)
+# =========================================================
+
+def _build_book(strikes: np.ndarray, levels: dict, wing_width: int, hedge_width: int) -> dict:
+    put_wall = float(levels["put_wall"])
+    call_wall = float(levels["call_wall"])
+    magnet = float(levels["magnet"])
+
+    box_low = min(put_wall, call_wall)
+    box_high = max(put_wall, call_wall)
+
+    # Weekly Iron Condor (income engine)
+    condor = {
+        "sell_put": _nearest_strike(strikes, box_low, "below"),
+        "buy_put": _nearest_strike(strikes, box_low - wing_width, "below"),
+        "sell_call": _nearest_strike(strikes, box_high, "above"),
+        "buy_call": _nearest_strike(strikes, box_high + wing_width, "above"),
+    }
+
+    # 3W Call Debit (upside hedge)
+    call_hedge = {
+        "buy_call": _nearest_strike(strikes, magnet, "nearest"),
+        "sell_call": _nearest_strike(strikes, magnet + hedge_width, "above"),
+    }
+
+    # 3W Put Debit (downside hedge)
+    put_hedge = {
+        "buy_put": _nearest_strike(strikes, box_low, "below"),
+        "sell_put": _nearest_strike(strikes, box_low - hedge_width, "below"),
+    }
+
+    return {
+        "box_low": box_low,
+        "box_high": box_high,
+        "condor": condor,
+        "call_hedge": call_hedge,
+        "put_hedge": put_hedge,
+    }
+
+
+# =========================================================
+# 4) TAB RENDERER
+# =========================================================
 
 def render_tab_friday_predictor(symbol: str, expiry_date: str, hist_df: pd.DataFrame, spot: float):
-    st.subheader(f"🧠 Professional Risk Book & Gamma Map: {symbol}")
+    st.subheader(f"🧠 Professional Risk Book & Playbook: {symbol}")
 
+    # -------- Sidebar controls (keep your style) --------
     with st.sidebar:
         st.header("🎯 Broker Sync")
-        # Updated to your AAPL Ameritrade VWAP
-        vwap_last = st.number_input("Ameritrade VWAP Pivot", value=255.33, step=0.01)
+        vwap_pivot = st.number_input(
+            "Broker VWAP Pivot (manual)",
+            value=float(spot) if spot else 0.0,
+            step=0.01,
+            help="Optional: paste your broker VWAP pivot here. Used for strength/weakness timing gates.",
+        )
         st.divider()
         st.header("⚙️ Book Construction")
-        wing_width = st.slider("Condor Wing Width", 5, 20, 10)
-        hedge_width = st.slider("Hedge Spread Width", 5, 30, 20)
+        wing_width = st.slider("Weekly Condor Wing Width", 5, 25, 10)
+        hedge_width = st.slider("3W Hedge Spread Width", 5, 40, 20)
 
     if hist_df is None or hist_df.empty:
         st.warning("Please fetch market data.")
         return
 
+    need_cols = {"High", "Low", "Close", "Volume"}
+    if not need_cols.issubset(hist_df.columns):
+        st.error(f"Missing columns in hist_df: {sorted(list(need_cols - set(hist_df.columns)))}")
+        return
+
+    # -------- Strength/Weakness gate (simple + consistent) --------
+    pivot = float(vwap_pivot) if vwap_pivot and vwap_pivot > 0 else float(spot)
+    strength_num = pivot * 1.002  # +0.2%
+    weakness_num = pivot          # pivot
+    is_strong = float(spot) >= strength_num
+    is_weak = float(spot) < weakness_num
+
+    # -------- GEX table + gamma levels --------
     try:
         gex_df = _fetch_weekly_gex_table(symbol, expiry_date, spot)
         levels = _get_gamma_levels(gex_df, spot)
-        strikes = gex_df["strike"].values
+        strikes = gex_df["strike"].values.astype(float)
     except Exception as e:
         st.error(f"GEX Error: {e}")
         return
 
-    # Strength threshold (0.2% buffer) and Weakness threshold
-    strength_threshold = vwap_last * 1.002
-    is_strong = spot >= strength_threshold
-    is_weak = spot < vwap_last
+    # -------- Build 3-engine book --------
+    book = _build_book(strikes, levels, wing_width=wing_width, hedge_width=hedge_width)
+    box_low = book["box_low"]
+    box_high = book["box_high"]
+    condor = book["condor"]
+    call_hedge = book["call_hedge"]
+    put_hedge = book["put_hedge"]
 
-    # --- 🧲 GAMMA MAP ---
-    st.write("### 🧲 Gamma Map (Magnets / Walls / Pivot)")
-    fig_map = go.Figure()
-    fig_map.add_vline(x=levels["put_wall"], line_dash="dash", line_color="red", annotation_text="Lower Wall")
-    fig_map.add_vline(x=levels["call_wall"], line_dash="dash", line_color="green", annotation_text="Upper Wall")
-    fig_map.add_vline(x=levels["magnet"], line_color="gold", line_width=4, annotation_text="Magnet")
-    fig_map.add_vline(x=vwap_last, line_dash="dot", line_color="white", annotation_text="VWAP Pivot")
-    fig_map.add_trace(go.Scatter(x=[spot], y=[0], mode="markers+text", text=[f"${spot:.2f}"],
-                                 marker=dict(size=15, color="cyan", symbol="diamond")))
-    fig_map.update_layout(template="plotly_dark", height=300, yaxis_visible=False, margin=dict(l=20, r=20, t=30, b=20))
-    st_plot(fig_map)
+    # -------- Expiries --------
+    weekly_expiry = str(expiry_date)
+    hedge_expiry = _add_weeks_to_friday(weekly_expiry, weeks=3)
 
-    # --- 📈 3-ENGINE PAYOFF ---
-    condor = {
-        "sell_put": _nearest_strike(strikes, levels["put_wall"], "below"),
-        "buy_put": _nearest_strike(strikes, levels["put_wall"] - wing_width, "below"),
-        "sell_call": _nearest_strike(strikes, levels["call_wall"], "above"),
-        "buy_call": _nearest_strike(strikes, levels["call_wall"] + wing_width, "above")
-    }
-    call_h = {"buy": _nearest_strike(strikes, levels["call_wall"], "nearest"),
-              "sell": _nearest_strike(strikes, levels["call_wall"] + hedge_width, "above")}
-    put_h = {"buy": _nearest_strike(strikes, levels["put_wall"], "nearest"),
-             "sell": _nearest_strike(strikes, levels["put_wall"] - hedge_width, "below")}
+    # -------- VWAP proxy + ADL (no Finnhub/AlphaV) --------
+    vwap_model, vwap_src = _anchored_vwap_proxy(hist_df)
+    adl_d = _adl_delta(hist_df)
+    money_flow = "🟢 Accumulation" if adl_d > 0 else "🔴 Distribution"
 
-    st.write("### 📈 3-Engine Payoff Diagram")
-    x_range = np.linspace(spot * 0.8, spot * 1.2, 300)
-    y_pl = np.zeros_like(x_range)
-    # IC Payoff Logic
-    y_pl += np.where(x_range < condor["sell_put"], x_range - condor["sell_put"], 0)
-    y_pl -= np.where(x_range < condor["buy_put"], x_range - condor["buy_put"], 0)
-    y_pl += np.where(x_range > condor["sell_call"], condor["sell_call"] - x_range, 0)
-    y_pl -= np.where(x_range > condor["buy_call"], condor["buy_call"] - x_range, 0)
-    # Hedge Logic
-    y_pl += np.where(x_range > call_h["buy"], x_range - call_h["buy"], 0)
-    y_pl -= np.where(x_range > call_h["sell"], x_range - call_h["sell"], 0)
-    y_pl -= np.where(x_range < put_h["buy"], put_h["buy"] - x_range, 0)
-    y_pl += np.where(x_range < put_h["sell"], put_h["sell"] - x_range, 0)
+    # -------- BEFORE GRAPH: show everything clearly --------
+    st.markdown("## ✅ This Week’s Plan (All Instructions BEFORE Charts)")
 
-    fig_pl = go.Figure()
-    fig_pl.add_trace(
-        go.Scatter(x=x_range, y=y_pl, fill='tozeroy', line=dict(color='cyan', width=3), name="Full Book P&L"))
-    fig_pl.update_layout(template="plotly_dark", height=400, xaxis_title="Expiry Price", yaxis_title="Risk Book P&L",
-                         margin=dict(l=20, r=20, t=20, b=20))
-    st_plot(fig_pl)
+    st.markdown(f"""
+### 1) Market Context
+- **Spot:** {spot:.2f}
+- **Broker Pivot (manual):** {pivot:.2f}
+- **Strength gate:** spot ≥ **{strength_num:.2f}**
+- **Weakness gate:** spot < **{weakness_num:.2f}**
+- **VWAP proxy:** {vwap_model:.2f}  _(src: {vwap_src})_
+- **Money flow:** {money_flow}
 
-    # --- 🧠 THE PROFESSIONAL SOLUTION: TIMING + STAGING ---
+### 2) Gamma Structure
+- **Put Wall:** {levels["put_wall"]:.0f}
+- **Call Wall:** {levels["call_wall"]:.0f}
+- **Magnet:** {levels["magnet"]:.0f}
+- **Box:** {box_low:.0f} → {box_high:.0f}
+""")
+
+    # -------- Timing + staging (AAPL style but dynamic) --------
+    status_txt = "✅ STRENGTH DETECTED" if is_strong else ("❌ WEAKNESS DETECTED" if is_weak else "⚪ NEUTRAL / MIXED")
+    st.markdown(f"### 3) Timing + Staging (Mon→Thu) — Status: **{status_txt}**")
+
+    # Keep it “rules”, not fluff. Also dynamic with your pivot.
+    timing_html = f"""
+    <div style="background:#0e1117;padding:16px;border-radius:10px;border:1px solid #30363d;">
+      <div style="color:#ff7b72;font-weight:700;">
+        Rule: Never sell put-side risk into weakness (&lt; {weakness_num:.2f}). Prefer selling put-side only after strength (&gt; {strength_num:.2f}).
+      </div>
+
+      <div style="display:flex;gap:12px;margin-top:12px;flex-wrap:wrap;">
+        <div style="flex:1;min-width:260px;background:#161b22;padding:12px;border-radius:8px;border:1px solid #30363d;">
+          <div style="color:#d29922;font-weight:700;">🥇 MONDAY (Discovery)</div>
+          <ul style="color:#c9d1d9;margin:8px 0 0 18px;">
+            <li><b>Do not</b> start with full condor.</li>
+            <li>Open <b>3W hedges</b> small (call + put) if you want protection early.</li>
+            <li>If you must start weekly: open <b>call-side only</b> first (less “catching knife” risk).</li>
+          </ul>
+        </div>
+
+        <div style="flex:1;min-width:260px;background:{'#23863622' if is_strong else '#da363322'};padding:12px;border-radius:8px;border:1px solid {'#238636' if is_strong else '#da3633'};">
+          <div style="color:{'#3fb950' if is_strong else '#f85149'};font-weight:700;">🥈 TUESDAY (Execution)</div>
+          <ul style="color:#c9d1d9;margin:8px 0 0 18px;">
+            <li>Status: <b>{'Strength' if is_strong else ('Weakness' if is_weak else 'Mixed')}</b></li>
+            <li>If <b>Strength</b>: add weekly <b>put-side</b> (complete condor gradually).</li>
+            <li>If <b>Weakness</b>: do <b>not</b> sell put-side; wait or move strikes lower.</li>
+          </ul>
+        </div>
+
+        <div style="flex:1;min-width:260px;background:#161b22;padding:12px;border-radius:8px;border:1px solid #30363d;">
+          <div style="color:#58a6ff;font-weight:700;">🥉 WEDNESDAY (Commit)</div>
+          <ul style="color:#c9d1d9;margin:8px 0 0 18px;">
+            <li>If price remains inside box: complete/hold the weekly condor.</li>
+            <li>If price trends toward a wall: reduce the threatened side early.</li>
+          </ul>
+        </div>
+
+        <div style="flex:1;min-width:260px;background:#161b22;padding:12px;border-radius:8px;border:1px solid #30363d;">
+          <div style="color:#f85149;font-weight:700;">🏁 THURSDAY (Defense)</div>
+          <ul style="color:#c9d1d9;margin:8px 0 0 18px;">
+            <li>Take profits early; avoid holding weekly risk late.</li>
+            <li>Trim or close if threatened; don’t “hope” into Friday.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div style="margin-top:12px;background:#161b22;padding:12px;border-radius:8px;border:1px solid #30363d;">
+        <div style="color:#f85149;font-weight:700;">🛑 Exit Rules (Mechanical)</div>
+        <ul style="color:#c9d1d9;margin:8px 0 0 18px;">
+          <li><b>Weekly condor:</b> take profit at <b>+70% to +80%</b> OR cut a side if it hits <b>2× credit</b>.</li>
+          <li><b>3W hedges:</b> take profit at <b>+80% to +150%</b> when they pay.</li>
+          <li><b>Safety:</b> avoid holding weekly risk past <b>Thursday afternoon</b>.</li>
+        </ul>
+      </div>
+    </div>
+    """
+    st.components.v1.html(timing_html, height=420)
+
+    # -------- Strategy table with expiries + legs --------
+    st.markdown("## 🧱 Strategy Levels (Weekly + 3W Risk Mitigation)")
+    df_levels = pd.DataFrame([
+        {
+            "Engine": "Weekly Condor (Put Credit Spread)",
+            "Expiry": weekly_expiry,
+            "Legs": f"Sell Put {condor['sell_put']:.0f} / Buy Put {condor['buy_put']:.0f}",
+        },
+        {
+            "Engine": "Weekly Condor (Call Credit Spread)",
+            "Expiry": weekly_expiry,
+            "Legs": f"Sell Call {condor['sell_call']:.0f} / Buy Call {condor['buy_call']:.0f}",
+        },
+        {
+            "Engine": "3W Upside Hedge (Call Debit Spread)",
+            "Expiry": hedge_expiry,
+            "Legs": f"Buy Call {call_hedge['buy_call']:.0f} / Sell Call {call_hedge['sell_call']:.0f}",
+        },
+        {
+            "Engine": "3W Downside Hedge (Put Debit Spread)",
+            "Expiry": hedge_expiry,
+            "Legs": f"Buy Put {put_hedge['buy_put']:.0f} / Sell Put {put_hedge['sell_put']:.0f}",
+        },
+    ])
+    st.table(df_levels)
+
     st.divider()
-    st.markdown("### 🧠 The Professional Solution: TIMING + STAGING")
-    st.markdown(
-        f"**Rule of Thumb**: Never sell puts into weakness (< {vwap_last:.2f}). Sell puts into strength (> {strength_threshold:.2f}).")
 
-    col_mon, col_tue = st.columns(2)
-    with col_mon:
-        st.markdown(f"""
-        #### 🥇 MONDAY (Discovery)
-        * **Action**: Do NOT sell the put spread yet.
-        * **Goal**: Let market show its hand.
-        * **Hedges**: 3W Call Spread can be opened early.
-        """)
+    # =========================================================
+    # NOW GRAPHS (everything above already displayed)
+    # =========================================================
+    st.write("### 🧲 Gamma Map + Weekly P&L Snapshot")
 
-    with col_tue:
-        if is_strong:
-            st.success(f"""
-            #### 🥈 TUESDAY (STRENGTH)
-            * **Status**: Price stable above {strength_threshold:.2f}.
-            * **Action**: ✅ Complete the Iron Condor structure.
-            * **Logic**: Market accepted higher prices; downside risk is lower.
-            """)
-        elif is_weak:
-            st.error(f"""
-            #### 🥈 TUESDAY (WEAKNESS)
-            * **Status**: Price below {vwap_last:.2f}.
-            * **Action**: ❌ **DO NOT** sell {condor['sell_put']} yet.
-            * **Action**: ✅ Wait for lower support or move strikes lower.
-            """)
-        else:
-            st.warning(
-                f"#### 🥈 TUESDAY (NEUTRAL)\n- **Status**: Price in 'No-Man's Land' (${vwap_last:.2f} - ${strength_threshold:.2f}).\n- **Action**: Wait for {strength_threshold:.2f} to break before selling puts.")
+    col_map, col_pl = st.columns(2)
 
-    # --- EXIT RULES & LEVELS ---
-    st.divider()
-    e1, e2 = st.columns(2)
-    with e1:
-        st.markdown("**🛑 CRITICAL EXIT RULES**")
-        st.markdown("- **Weekly Condor**: Close at +70-80% profit or if one side = 2x credit.")
-        st.markdown("- **3W Hedges**: Take profit at +80% to +150%.")
-        st.markdown("- **Safety**: Never hold past Thursday afternoon.")
-    with e2:
-        st.markdown("**🧱 Current GEX Strategy Levels**")
-        df_levels = pd.DataFrame([
-            {"Engine": "Weekly Condor (P)", "Sell/Buy Zone": f"{condor['sell_put']} / {condor['buy_put']}"},
-            {"Engine": "Weekly Condor (C)", "Sell/Buy Zone": f"{condor['sell_call']} / {condor['buy_call']}"},
-            {"Engine": "3W Call Hedge", "Sell/Buy Zone": f"{call_h['buy']} / {call_h['sell']}"},
-            {"Engine": "3W Put Hedge", "Sell/Buy Zone": f"{put_h['buy']} / {put_h['sell']}"}
-        ])
-        st.table(df_levels)
+    with col_map:
+        fig_map = go.Figure()
+
+        # Box shading
+        fig_map.add_vrect(x0=box_low, x1=box_high, fillcolor="rgba(0,255,0,0.06)", line_width=0)
+
+        fig_map.add_vline(x=levels["put_wall"], line_dash="dash", line_color="red", annotation_text="Put Wall")
+        fig_map.add_vline(x=levels["call_wall"], line_dash="dash", line_color="green", annotation_text="Call Wall")
+        fig_map.add_vline(x=levels["magnet"], line_color="gold", line_width=4, annotation_text="Magnet")
+
+        # Show all legs
+        leg_lines = [
+            ("W Sell Put", condor["sell_put"]),
+            ("W Buy Put", condor["buy_put"]),
+            ("W Sell Call", condor["sell_call"]),
+            ("W Buy Call", condor["buy_call"]),
+            ("3W Call Buy", call_hedge["buy_call"]),
+            ("3W Call Sell", call_hedge["sell_call"]),
+            ("3W Put Buy", put_hedge["buy_put"]),
+            ("3W Put Sell", put_hedge["sell_put"]),
+        ]
+        for name, x in leg_lines:
+            fig_map.add_vline(x=float(x), line_dash="dot", opacity=0.35, annotation_text=name)
+
+        fig_map.add_trace(
+            go.Scatter(
+                x=[spot],
+                y=[0],
+                mode="markers+text",
+                text=[f"Spot ${spot:.2f}"],
+                textposition="top center",
+                marker=dict(size=12, color="cyan"),
+            )
+        )
+
+        fig_map.update_layout(
+            template="plotly_dark",
+            height=360,
+            yaxis_visible=False,
+            title="Gamma Map + Strategy Legs",
+            margin=dict(l=10, r=10, t=45, b=10),
+        )
+        st_plot(fig_map)
+
+    with col_pl:
+        # Very simple payoff shape (educational shape, not real premium pricing)
+        x_range = np.linspace(spot * 0.85, spot * 1.15, 220)
+        y_pl = np.zeros_like(x_range)
+
+        # Approx “condor payoff shape” (not premium-aware)
+        y_pl += np.where(x_range < condor["sell_put"], x_range - condor["sell_put"], 0)
+        y_pl -= np.where(x_range < condor["buy_put"], x_range - condor["buy_put"], 0)
+        y_pl += np.where(x_range > condor["sell_call"], condor["sell_call"] - x_range, 0)
+        y_pl -= np.where(x_range > condor["buy_call"], condor["buy_call"] - x_range, 0)
+
+        fig_pl = go.Figure()
+        fig_pl.add_trace(go.Scatter(x=x_range, y=y_pl, fill="tozeroy"))
+        fig_pl.add_vline(x=spot, line_dash="dash", annotation_text="Spot")
+        fig_pl.add_vline(x=box_low, line_dash="dot", annotation_text="Box Low")
+        fig_pl.add_vline(x=box_high, line_dash="dot", annotation_text="Box High")
+        fig_pl.update_layout(template="plotly_dark", height=360, title="Weekly Income Shape (Condor)")
+        st_plot(fig_pl)

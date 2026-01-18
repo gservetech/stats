@@ -6,9 +6,64 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from io import StringIO  # ✅ added (needed for Stooq CSV)
 
 from stats_app.helpers.api_client import API_BASE_URL
 from stats_app.helpers.ui_components import st_plot
+
+
+# =========================================================
+# AAPL STREAMLIT CLOUD FIX (HISTORY FALLBACK ONLY IF hist_df EMPTY)
+# =========================================================
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _fetch_stooq_daily(symbol: str) -> pd.DataFrame:
+    """
+    Fallback daily OHLCV from Stooq (no API key).
+    Only used when Streamlit Cloud returns empty hist_df for AAPL.
+    """
+    sym = symbol.upper().strip()
+    url = f"https://stooq.com/q/d/l/?s={sym.lower()}.us&i=d"
+    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+
+    df = pd.read_csv(StringIO(r.text))
+    if df.empty or "Date" not in df.columns:
+        return pd.DataFrame()
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+
+    # Normalize to expected columns
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    need = ["High", "Low", "Close", "Volume"]
+    if not set(need).issubset(df.columns):
+        return pd.DataFrame()
+
+    return df.dropna(subset=need).copy()
+
+
+def _repair_hist_df_if_empty(symbol: str, hist_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Minimal repair: only if hist_df is empty AND symbol is AAPL.
+    """
+    if hist_df is not None and not hist_df.empty:
+        return hist_df
+
+    if symbol.upper().strip() != "AAPL":
+        return hist_df
+
+    try:
+        df = _fetch_stooq_daily("AAPL")
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        return hist_df
+
+    return hist_df
 
 
 # =========================================================
@@ -167,6 +222,9 @@ def render_tab_friday_predictor(symbol: str, expiry_date: str, hist_df: pd.DataF
         wing_width = st.slider("Weekly Condor Wing Width", 5, 25, 10)
         hedge_width = st.slider("3W Hedge Spread Width", 5, 40, 20)
 
+    # ✅ ONLY FIX: if AAPL hist_df is empty on Streamlit Cloud, repair it here
+    hist_df = _repair_hist_df_if_empty(symbol, hist_df)
+
     if hist_df is None or hist_df.empty:
         st.warning("Please fetch market data.")
         return
@@ -232,7 +290,6 @@ def render_tab_friday_predictor(symbol: str, expiry_date: str, hist_df: pd.DataF
     status_txt = "✅ STRENGTH DETECTED" if is_strong else ("❌ WEAKNESS DETECTED" if is_weak else "⚪ NEUTRAL / MIXED")
     st.markdown(f"### 3) Timing + Staging (Mon→Thu) — Status: **{status_txt}**")
 
-    # Keep it “rules”, not fluff. Also dynamic with your pivot.
     timing_html = f"""
     <div style="background:#0e1117;padding:16px;border-radius:10px;border:1px solid #30363d;">
       <div style="color:#ff7b72;font-weight:700;">
@@ -287,7 +344,6 @@ def render_tab_friday_predictor(symbol: str, expiry_date: str, hist_df: pd.DataF
     """
     st.components.v1.html(timing_html, height=420)
 
-    # -------- Strategy table with expiries + legs --------
     st.markdown("## 🧱 Strategy Levels (Weekly + 3W Risk Mitigation)")
     df_levels = pd.DataFrame([
         {
@@ -315,9 +371,6 @@ def render_tab_friday_predictor(symbol: str, expiry_date: str, hist_df: pd.DataF
 
     st.divider()
 
-    # =========================================================
-    # NOW GRAPHS (everything above already displayed)
-    # =========================================================
     st.write("### 🧲 Gamma Map + Weekly P&L Snapshot")
 
     col_map, col_pl = st.columns(2)
@@ -325,14 +378,12 @@ def render_tab_friday_predictor(symbol: str, expiry_date: str, hist_df: pd.DataF
     with col_map:
         fig_map = go.Figure()
 
-        # Box shading
         fig_map.add_vrect(x0=box_low, x1=box_high, fillcolor="rgba(0,255,0,0.06)", line_width=0)
 
         fig_map.add_vline(x=levels["put_wall"], line_dash="dash", line_color="red", annotation_text="Put Wall")
         fig_map.add_vline(x=levels["call_wall"], line_dash="dash", line_color="green", annotation_text="Call Wall")
         fig_map.add_vline(x=levels["magnet"], line_color="gold", line_width=4, annotation_text="Magnet")
 
-        # Show all legs
         leg_lines = [
             ("W Sell Put", condor["sell_put"]),
             ("W Buy Put", condor["buy_put"]),
@@ -367,11 +418,9 @@ def render_tab_friday_predictor(symbol: str, expiry_date: str, hist_df: pd.DataF
         st_plot(fig_map)
 
     with col_pl:
-        # Very simple payoff shape (educational shape, not real premium pricing)
         x_range = np.linspace(spot * 0.85, spot * 1.15, 220)
         y_pl = np.zeros_like(x_range)
 
-        # Approx “condor payoff shape” (not premium-aware)
         y_pl += np.where(x_range < condor["sell_put"], x_range - condor["sell_put"], 0)
         y_pl -= np.where(x_range < condor["buy_put"], x_range - condor["buy_put"], 0)
         y_pl += np.where(x_range > condor["sell_call"], condor["sell_call"] - x_range, 0)

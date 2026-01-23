@@ -835,7 +835,11 @@ async def weekly_summary(
 
     top_call = gex_df.sort_values("call_gex", ascending=False).head(5)[["strike", "call_gex", "call_oi", "call_vol"]]
     top_put = gex_df.sort_values("put_gex", ascending=False).head(5)[["strike", "put_gex", "put_oi", "put_vol"]]
-    top_net = gex_df.reindex(gex_df["net_gex"].abs().sort_values(ascending=False).index).head(5)[["strike", "net_gex"]]
+    net_abs = gex_df["net_gex"].abs()
+    top_net_idx = net_abs.nlargest(5).index
+    top_net = gex_df.loc[top_net_idx, ["strike", "net_gex"]].copy()
+    top_net["net_gex_abs"] = net_abs.loc[top_net_idx].values
+    top_net = top_net[["strike", "net_gex_abs", "net_gex"]]
 
     payload = {
         "success": True,

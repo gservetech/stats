@@ -34,9 +34,15 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net):
     with colC:
         st.markdown("**Top Net GEX (abs)**")
         if not top_net.empty:
+            top_net = top_net.copy()
+            if "net_gex_abs" not in top_net.columns and "net_gex" in top_net.columns:
+                top_net["net_gex_abs"] = top_net["net_gex"].abs()
+            if "net_gex_abs" in top_net.columns:
+                top_net = top_net.sort_values("net_gex_abs", ascending=False)
             st_df(top_net)
-            if {"strike", "net_gex"}.issubset(top_net.columns):
-                st_plot(create_top_strikes_chart(top_net, "strike", "net_gex", "Top Net GEX (abs)"))
+            y_col = "net_gex_abs" if "net_gex_abs" in top_net.columns else "net_gex"
+            if {"strike", y_col}.issubset(top_net.columns):
+                st_plot(create_top_strikes_chart(top_net, "strike", y_col, "Top Net GEX (abs)"))
         else:
             st.info("No top net GEX data returned.")
 

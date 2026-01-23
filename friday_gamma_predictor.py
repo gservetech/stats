@@ -42,7 +42,7 @@ def render_friday_predictor(symbol, expiry_date, weekly_data, hist_df, spot):
     try:
         r = requests.get(
             f"{API_BASE_URL}/weekly/gex",
-            params={"symbol": symbol, "expiry": expiry_date},
+            params={"symbol": symbol, "date": expiry_date, "spot": spot},
             timeout=60,
         )
         r.raise_for_status()

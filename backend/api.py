@@ -216,14 +216,25 @@ def _to_float(val, default=None):
             return float(val)
         except Exception:
             return default
-    s = str(val).strip()
-    if s in ("", "N/A", "na", "None"):
+    s = str(val).strip().lower()
+    if s in ("", "n/a", "na", "none"):
         return default
+    
+    # Handle multipliers (k/m) from display strings
+    multiplier = 1.0
+    if s.endswith("k"):
+        multiplier = 1000.0
+        s = s[:-1]
+    elif s.endswith("m"):
+        multiplier = 1000000.0
+        s = s[:-1]
+    
+    # Remove commas and other non-numeric chars
     s = re.sub(r"[^\d\.\-]", "", s)
     if s in ("", "-", "."):
         return default
     try:
-        return float(s)
+        return float(s) * multiplier
     except Exception:
         return default
 

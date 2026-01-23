@@ -40,9 +40,10 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net):
             if "net_gex_abs" in top_net.columns:
                 top_net = top_net.sort_values("net_gex_abs", ascending=False)
             st_df(top_net)
-            y_col = "net_gex_abs" if "net_gex_abs" in top_net.columns else "net_gex"
+            y_col = "net_gex"
+            title = "Top Net GEX (Directional)"
             if {"strike", y_col}.issubset(top_net.columns):
-                st_plot(create_top_strikes_chart(top_net, "strike", y_col, "Top Net GEX (abs)"))
+                st_plot(create_top_strikes_chart(top_net, "strike", y_col, title))
         else:
             st.info("No top net GEX data returned.")
 

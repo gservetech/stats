@@ -20,12 +20,14 @@
 # - Everything below is EDUCATIONAL, rule-based templates.
 # - It is NOT a signal, not financial advice.
 # - Your fills/prices are unknown here; sizing uses conservative MAX-LOSS math.
+# - Timing/expiry is presented as pattern-based education (common market tendencies).
 # ------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
+from datetime import date as _date, timedelta
 
 from ..helpers.api_client import fetch_weekly_gex
 from ..helpers.ui_components import st_plot
@@ -256,6 +258,203 @@ def _regime_sentence(spot: float, put_wall, call_wall, net_vanna: float, net_cha
 
 
 # ----------------------------
+# Timing + Expiry guidance (Educational, pattern-based)
+# ----------------------------
+
+def _next_friday(from_dt: _date) -> _date:
+    """Return the next Friday date (including today if Friday)."""
+    # Monday=0 ... Sunday=6, Friday=4
+    delta = (4 - from_dt.weekday()) % 7
+    return from_dt + timedelta(days=delta)
+
+
+def _add_weeks_to_friday(friday_dt: _date, weeks: int) -> _date:
+    return friday_dt + timedelta(days=7 * int(max(0, weeks)))
+
+
+def _infer_vol_regime(df: pd.DataFrame) -> str:
+    """
+    Super simple IV read:
+    - If IV exists, we compute median call/put IV near spot (already converted to decimal elsewhere).
+    - Return: "high_iv", "normal_iv", "unknown"
+    """
+    if df is None or df.empty:
+        return "unknown"
+    civ = pd.to_numeric(df.get("call_iv", np.nan), errors="coerce")
+    piv = pd.to_numeric(df.get("put_iv", np.nan), errors="coerce")
+    iv = pd.concat([civ, piv], ignore_index=True).dropna()
+    if iv.empty:
+        return "unknown"
+
+    # normalize "35" -> 0.35 if user forgot earlier conversion (defensive)
+    iv = iv.apply(lambda x: x / 100.0 if x > 3.0 else x)
+    med = float(iv.median())
+
+    # educational thresholds only (not "signals")
+    if med >= 0.55:
+        return "high_iv"
+    if med >= 0.30:
+        return "normal_iv"
+    return "low_iv"
+
+
+def _timing_expiry_guidance_block(symbol: str, df: pd.DataFrame, spot: float, put_wall, call_wall, magnet,
+                                 total_vanna: float, total_charm: float):
+    """
+    EDUCATIONAL:
+    Suggests an expiry BUCKET + common weekly timing windows based on:
+    - Regime: pinned/inside vs breakout vs breakdown
+    - Optional IV regime (high IV -> more time / avoid weeklies unless breakout)
+    This does NOT know your broker fills, news calendar, earnings, etc.
+    """
+    st.markdown("### 🗓️ Expiry + Timing Guidance (Educational patterns)")
+    st.caption(
+        "Not financial advice. This is a **pattern-matching helper** based on your own wall/magnet structure + proxies. "
+        "Always factor liquidity, news/earnings, and your personal risk plan."
+    )
+
+    S = float(spot)
+    step = _infer_strike_step(df["strike"]) if df is not None and not df.empty else 1.0
+    iv_regime = _infer_vol_regime(df)
+
+    if put_wall is None or call_wall is None:
+        st.info(
+            "Walls not detected (missing OI). Without walls, expiry/timing suggestions are weaker. "
+            "Education: if you expect chop, use **more time**; if you expect breakout, wait for confirmation then choose a defined-risk structure."
+        )
+        return
+
+    pw = float(put_wall)
+    cw = float(call_wall)
+    m = float(magnet) if magnet is not None else S
+
+    inside = (S >= pw) and (S <= cw)
+    pinned = inside and (abs(S - m) <= 2.0 * step)
+    breakout = S > cw
+    breakdown = S < pw
+
+    directional = (
+        "call-side pressure" if (total_charm > 0 and total_vanna > 0) else
+        "put-side pressure" if (total_charm < 0 and total_vanna < 0) else
+        "mixed pressure"
+    )
+
+    # date suggestions (bucketed): next Friday vs +2 weeks vs +3 weeks
+    today = _date.today()
+    nf = _next_friday(today)
+    f_plus_2 = _add_weeks_to_friday(nf, 2)
+    f_plus_3 = _add_weeks_to_friday(nf, 3)
+
+    # "best" expiry bucket (education)
+    if pinned:
+        expiry_bucket = "2–3 weeks out"
+        expiry_dates = f"{f_plus_2.isoformat()} or {f_plus_3.isoformat()}"
+        why = (
+            f"Price is near **magnet** `{m:.2f}` inside `{pw:.2f} → {cw:.2f}`. "
+            "Pinned/chop environments often punish very short-dated options (theta + whipsaw)."
+        )
+    elif breakout or breakdown:
+        expiry_bucket = "1–2 weeks out (or same-week ONLY after confirmation)"
+        expiry_dates = f"{nf.isoformat()} (aggressive) or {f_plus_2.isoformat()} (more forgiving)"
+        why = (
+            "Breakout/breakdown regimes can move faster. "
+            "Education: you can choose shorter expiries **only after** a clear break/hold; otherwise use more time."
+        )
+    else:
+        expiry_bucket = "1–3 weeks out (depends on conviction + IV)"
+        expiry_dates = f"{nf.isoformat()} / {f_plus_2.isoformat()} / {f_plus_3.isoformat()}"
+        why = (
+            f"Inside the range but not perfectly pinned. "
+            "Education: expiry depends on whether you expect rotation/chop (more time) or quick rejection/break (less time)."
+        )
+
+    # adjust for IV regime (education)
+    if iv_regime == "high_iv":
+        iv_note = "IV appears **high** → education: prefer **more time** and defined-risk structures; weeklies can decay quickly."
+        if "2–3 weeks" not in expiry_bucket:
+            expiry_bucket = "2–3 weeks out"
+            expiry_dates = f"{f_plus_2.isoformat()} or {f_plus_3.isoformat()}"
+    elif iv_regime == "low_iv":
+        iv_note = "IV appears **low** → education: time decay is slower; shorter expiries may behave cleaner (still risky)."
+    else:
+        iv_note = "IV not available/usable → guidance relies mostly on wall/magnet structure."
+
+    # timing windows (education, not instructions)
+    timing_md = """
+**Common timing tendencies (educational):**
+- **Avoid the first 5–15 minutes** after the open (spreads + whipsaws can be worst).
+- Many traders prefer **after the first pullback** or **after a clear reclaim/break** (confirmation > guessing).
+- If you're using **credit spreads** in chop: education often favors **after a rejection is visible** (not at the exact level).
+- If you're using **momentum/debit spreads**: education often favors **break + hold** (don’t front-run).
+- **Last 30–60 minutes** can show “pinning” toward magnets, but it can also be very fast/volatile.
+"""
+
+    # day-of-week tendencies (education)
+    dow_md = """
+**Day-of-week tendencies (educational, not always true):**
+- **Mon–Tue:** better for **2–3 week** positions if you want time for the thesis to play out.
+- **Wed:** can be “mid-week churn”; some avoid opening new risk unless a clean break is happening.
+- **Thu:** if targeting **next Friday**, education: this is when many start positioning (still depends on regime).
+- **Fri:** 0DTE/weekly can be very sensitive to pinning + gamma; education: sizing must be smaller and exits tighter.
+"""
+
+    # pattern rules specific to current structure
+    if pinned:
+        pattern = (
+            f"**Pattern match (current): PINNED** near magnet `{m:.2f}`. "
+            f"Bias tone: **{directional}**.\n\n"
+            f"Education: prioritize **range-friendly** templates (credit spreads) or wait for a confirmed break of `{cw:.2f}` / `{pw:.2f}`."
+        )
+    elif breakout:
+        pattern = (
+            f"**Pattern match (current): BREAKOUT** above call wall `{cw:.2f}`. Tone: **{directional}**.\n\n"
+            f"Education: momentum templates become more relevant **after** it holds above `{cw:.2f}`. "
+            "If it falls back inside the range, the breakout thesis weakens."
+        )
+    elif breakdown:
+        pattern = (
+            f"**Pattern match (current): BREAKDOWN** below put wall `{pw:.2f}`. Tone: **{directional}**.\n\n"
+            f"Education: downside momentum templates become more relevant **after** it stays below `{pw:.2f}`. "
+            "If it re-enters the range, breakdown thesis weakens."
+        )
+    else:
+        near_side = "call wall" if abs(S - cw) < abs(S - pw) else "put wall"
+        pattern = (
+            f"**Pattern match (current): INSIDE RANGE** (closer to **{near_side}**). Tone: **{directional}**.\n\n"
+            "Education: near resistance → bear-call/trim longs; near support → bull-put/trim shorts; "
+            "but confirmation beats guessing."
+        )
+
+    st.markdown(
+        f"""
+**Symbol:** `{symbol}`  
+**Spot:** `{S:.2f}`  
+**Put Wall:** `{pw:.2f}` | **Call Wall:** `{cw:.2f}` | **Magnet:** `{m:.2f}`  
+
+---
+
+### Suggested expiry bucket (educational)
+- **Bucket:** **{expiry_bucket}**
+- **Example Friday dates:** `{expiry_dates}`
+- **Why:** {why}
+
+**IV note:** {iv_note}
+
+---
+
+### Pattern match
+{pattern}
+"""
+    )
+    st.markdown(timing_md)
+    st.markdown(dow_md)
+
+    st.caption(
+        "Reminder: These are common tendencies, not guarantees. News, earnings, and liquidity can dominate the setup."
+    )
+
+
+# ----------------------------
 # Trade template helpers (Educational)
 # ----------------------------
 
@@ -269,7 +468,6 @@ def _infer_strike_step(strikes: pd.Series) -> float:
     if len(diffs) == 0:
         return 1.0
     step = float(np.median(diffs))
-    # keep it sane
     if step <= 0:
         step = 1.0
     return step
@@ -325,13 +523,6 @@ def _trade_templates_block(symbol: str, df: pd.DataFrame, spot: float, put_wall,
     step = _infer_strike_step(strikes)
     S = float(spot)
 
-    # pick "anchor" areas
-    # - bullish: choose put credit below spot (or near put_wall if close)
-    # - bearish: choose call credit above spot (or near call_wall if close)
-    # - debit alternatives: bull call (above magnet break), bear put (below magnet fail)
-    #
-    # We don't know your expiry preferences here; this is structural only.
-
     # offsets (in steps) so it works for 0.5 steps or 5 steps
     short_offset = 2
     long_offset = 5
@@ -344,15 +535,12 @@ def _trade_templates_block(symbol: str, df: pd.DataFrame, spot: float, put_wall,
     bear_long_call = _nearest_strike(strikes, _round_to_step(bear_short_call + long_offset * step, step))
 
     # Debit spreads keyed off magnet/walls
-    # - bull call: if break/hold above call_wall or magnet, use near ATM/ITM call long, short higher
-    # - bear put: if reject and lose magnet, use near ATM put long, short lower
     ref_up = float(call_wall) if call_wall is not None else (float(magnet) if magnet is not None else S)
-    ref_dn = float(put_wall) if put_wall is not None else (float(magnet) if magnet is not None else S)
 
     bull_call_long = _nearest_strike(strikes, _round_to_step(min(S, ref_up) - 1 * step, step))
     bull_call_short = _nearest_strike(strikes, _round_to_step(bull_call_long + 4 * step, step))
 
-    bear_put_long = _nearest_strike(strikes, _round_to_step(max(S, float(magnet) if magnet is not None else S) + 1 * step, step))
+    bear_put_long = _nearest_strike(strikes, _round_to_step((float(magnet) if magnet is not None else S) + 1 * step, step))
     bear_put_short = _nearest_strike(strikes, _round_to_step(bear_put_long - 4 * step, step))
 
     # Spread widths (strike distance)
@@ -361,7 +549,6 @@ def _trade_templates_block(symbol: str, df: pd.DataFrame, spot: float, put_wall,
     bull_call_width = abs(bull_call_short - bull_call_long)
     bear_put_width = abs(bear_put_long - bear_put_short)
 
-    # Risk budget inputs (user-controlled)
     colA, colB, colC = st.columns([1.2, 1.2, 1.6])
     with colA:
         risk_budget = st.number_input("Risk budget per trade (USD)", min_value=0.0, value=150.0, step=25.0)
@@ -371,12 +558,9 @@ def _trade_templates_block(symbol: str, df: pd.DataFrame, spot: float, put_wall,
         st.write("**Sizing uses max-loss math**")
         st.caption("Credit spreads: max loss ≈ (width − credit) × 100. If you leave credit=0, it’s worst-case sizing.")
 
-    # compute contract counts (educational)
     size_bull_put = _sizing_math(risk_budget, bull_put_width, credit_est=credit_est)
     size_bear_call = _sizing_math(risk_budget, bear_call_width, credit_est=credit_est)
 
-    # debit spreads: without debit price we can’t compute max loss precisely (it equals debit paid × 100)
-    # so we show structure only and remind user to size using paid debit.
     st.markdown("#### ✅ Bullish Templates")
     st.markdown(
         "\n".join([
@@ -415,7 +599,6 @@ def _trade_templates_block(symbol: str, df: pd.DataFrame, spot: float, put_wall,
         ])
     )
 
-    # Regime guidance as education (not a trade instruction)
     st.markdown("#### 🧭 How to choose a template (Educational logic)")
     if put_wall is None or call_wall is None:
         st.info(
@@ -429,16 +612,13 @@ def _trade_templates_block(symbol: str, df: pd.DataFrame, spot: float, put_wall,
     cw = float(call_wall)
     m = float(magnet) if magnet is not None else S
 
-    near_call = abs(S - cw) < abs(S - pw)
-    inside = (S >= pw) and (S <= cw)
-
     directional = (
         "call-side pressure" if (total_charm > 0 and total_vanna > 0) else
         "put-side pressure" if (total_charm < 0 and total_vanna < 0) else
         "mixed pressure"
     )
 
-    if inside and abs(S - m) <= 2 * step:
+    if (S >= pw) and (S <= cw) and abs(S - m) <= 2 * step:
         st.success(
             f"Pinning zone: spot `{S:.2f}` is near magnet `{m:.2f}` inside `{pw:.2f} → {cw:.2f}`. "
             f"Education: chop risk is higher; **credit spreads** often match range/pin conditions. "
@@ -469,7 +649,6 @@ def _trade_templates_block(symbol: str, df: pd.DataFrame, spot: float, put_wall,
 def render_tab_vanna_charm(symbol, date, spot, hist_df=None):
     st.subheader(f"🌊 Vanna & Charm (Proxy Map): {symbol}")
 
-    # Always show a reminder so you don't forget
     with st.expander("📌 Reminder (your API columns) + what this tab is doing", expanded=True):
         st.markdown(
             """
@@ -487,7 +666,6 @@ def render_tab_vanna_charm(symbol, date, spot, hist_df=None):
             """
         )
 
-    # Trend context panel
     if hist_df is not None:
         _trend_context_block(float(spot), hist_df)
     else:
@@ -497,7 +675,6 @@ def render_tab_vanna_charm(symbol, date, spot, hist_df=None):
             "If you add columns like MA20, MA50, MA200, this panel will explain the trend context automatically."
         )
 
-    # Fetch data (your existing /weekly/gex endpoint)
     with st.spinner("Fetching chain + computed exposure table..."):
         r_val = st.session_state.get("r_in", 0.05)
         q_val = st.session_state.get("q_in", 0.0)
@@ -531,11 +708,10 @@ def render_tab_vanna_charm(symbol, date, spot, hist_df=None):
         return
 
     # ----------------------------
-    # Build proxies (NO true greeks available)
+    # Build proxies
     # ----------------------------
     S = float(spot)
 
-    # Distance weighting: nearby strikes matter more
     width = max(S * 0.02, 1.0)  # 2% of spot, min 1.0
     dist = (df["strike"] - S).abs()
     w = np.exp(-((dist / width) ** 2))
@@ -543,29 +719,21 @@ def render_tab_vanna_charm(symbol, date, spot, hist_df=None):
     call_iv = pd.to_numeric(df["call_iv"], errors="coerce").fillna(0.0)
     put_iv = pd.to_numeric(df["put_iv"], errors="coerce").fillna(0.0)
 
-    # if IV is 35 instead of 0.35, convert to decimal
+    # normalize IV: 35 -> 0.35
     call_iv = np.where(call_iv > 3.0, call_iv / 100.0, call_iv)
     put_iv = np.where(put_iv > 3.0, put_iv / 100.0, put_iv)
 
-    # Proxy formulas (educational)
     df["vanna_proxy"] = w * ((df["call_oi"] * call_iv) - (df["put_oi"] * put_iv)) * S * 0.01
     df["charm_proxy"] = w * (df["call_oi"] - df["put_oi"])
 
     total_vanna = float(df["vanna_proxy"].sum())
     total_charm = float(df["charm_proxy"].sum())
 
-    # Dynamic levels
     put_wall, call_wall, magnet = _calc_levels(df, S)
 
-    # ----------------------------
-    # Summary line (meaningful sentence)
-    # ----------------------------
     st.markdown("### 🧭 Market Regime Summary")
     st.success(_regime_sentence(S, put_wall, call_wall, total_vanna, total_charm))
 
-    # ----------------------------
-    # Dynamic “How to read this” block (uses CURRENT values)
-    # ----------------------------
     with st.expander("📌 How to read this (using current levels)", expanded=True):
         if put_wall is None or call_wall is None:
             st.markdown(
@@ -622,6 +790,12 @@ Because support hedging is removed and selling can **cascade**.
 - They help you judge **stall/chop vs accelerate**
                 """
             )
+
+    # ----------------------------
+    # NEW: Expiry + Timing guidance (Educational)
+    # ----------------------------
+    with st.expander("🗓️ Expiry + Timing (Pattern Match) — Educational", expanded=True):
+        _timing_expiry_guidance_block(symbol, df, S, put_wall, call_wall, magnet, total_vanna, total_charm)
 
     # ----------------------------
     # Trade templates (Educational) - for ANY ticker
@@ -682,9 +856,9 @@ Because support hedging is removed and selling can **cascade**.
     def _apply_axis_layout(fig: go.Figure, title: str, ytitle: str):
         fig.update_layout(
             template="plotly_dark",
-            height=480,  # taller helps in 2-column view
+            height=480,
             title=dict(text=title, x=0.02, xanchor="left"),
-            margin=dict(l=55, r=20, t=55, b=110),  # room for rotated ticks
+            margin=dict(l=55, r=20, t=55, b=110),
             bargap=0.15,
             xaxis=dict(
                 title="Strike",
@@ -751,7 +925,6 @@ Because support hedging is removed and selling can **cascade**.
         fig_c = _apply_axis_layout(fig_c, "Charm (proxy)", "Charm (proxy)")
         st_plot(fig_c)
 
-    # Debug table
     with st.expander("Debug / Normalized inputs used (Strike, OI, IV)", expanded=False):
         show = df[["strike", "call_oi", "put_oi", "call_iv", "put_iv", "vanna_proxy", "charm_proxy"]].copy()
         st.dataframe(show, use_container_width=True)

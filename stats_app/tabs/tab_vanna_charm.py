@@ -4,17 +4,22 @@
 #
 # IMPORTANT:
 # Your Barchart chain does NOT contain true vanna/charm Greeks.
-# So this tab computes EDUCATIONAL PROXIES using only what you
-# actually have: Strike + Call OI + Put OI (+ IV if available).
+# This tab computes EDUCATIONAL PROXIES using only what you have:
+# Strike + Call OI + Put OI (+ IV if available).
 #
-# This file is robust to your API payload shapes:
+# Robust to API payload shapes:
 # - {"success":True, "data":[rows...]}
 # - {"success":True, "data":{"data":[rows...]}}
 # - {"success":True, "payload":{"data":[rows...]}}
 #
-# It also tolerates BOTH row formats:
+# Tolerates both row formats:
 # - /options (side-by-side chain): Strike, Call OI, Put OI, Call IV, Put IV...
 # - /weekly/gex (computed): strike, call_oi, put_oi, Call IV, Put IV...
+#
+# NOTE ON "TRADES" IN THIS TAB:
+# - Everything below is EDUCATIONAL, rule-based templates.
+# - It is NOT a signal, not financial advice.
+# - Your fills/prices are unknown here; sizing uses conservative MAX-LOSS math.
 # ------------------------------------------------------------
 
 import streamlit as st
@@ -221,11 +226,10 @@ def _calc_levels(df: pd.DataFrame, spot: float):
 def _regime_sentence(spot: float, put_wall, call_wall, net_vanna: float, net_charm: float):
     """
     One meaningful sentence you can glance at.
-    Uses dynamic walls + your proxy values (direction + magnitude).
+    Uses dynamic walls + proxy values (direction only, not "targets").
     """
     s = float(spot)
 
-    # If we don't have walls, fallback sentence
     if put_wall is None or call_wall is None:
         bias = "call-weighted" if net_charm > 0 else "put-weighted" if net_charm < 0 else "balanced"
         return f"Proxy flows are {bias}; focus on nearest high-OI strikes because the map suggests pinning/pressure around spot."
@@ -233,7 +237,6 @@ def _regime_sentence(spot: float, put_wall, call_wall, net_vanna: float, net_cha
     pw = float(put_wall)
     cw = float(call_wall)
 
-    # interpret direction from charm (OI imbalance) & vanna (OI×IV imbalance)
     directional = (
         "call-side pressure" if (net_charm > 0 and net_vanna > 0) else
         "put-side pressure" if (net_charm < 0 and net_vanna < 0) else
@@ -245,12 +248,218 @@ def _regime_sentence(spot: float, put_wall, call_wall, net_vanna: float, net_cha
     if s < pw:
         return f"🧨 Below Put Wall ({pw:.2f}): breakdown mode — {directional} can accelerate moves lower."
 
-    # inside walls
     dist_to_pw = abs(s - pw)
     dist_to_cw = abs(s - cw)
     near = f"near Call Wall ({cw:.2f})" if dist_to_cw < dist_to_pw else f"near Put Wall ({pw:.2f})"
 
-    return f"🧲 Inside walls ({pw:.2f} → {cw:.2f}) {near}: expect chop/pinning unless price breaks; {directional} tells which side may win on breakout."
+    return f"🧲 Inside walls ({pw:.2f} → {cw:.2f}) {near}: expect chop/pinning unless price breaks; {directional} hints which side may win on breakout."
+
+
+# ----------------------------
+# Trade template helpers (Educational)
+# ----------------------------
+
+def _infer_strike_step(strikes: pd.Series) -> float:
+    """Infer typical strike spacing (e.g., 0.5 / 1 / 2.5 / 5) from chain strikes."""
+    s = pd.to_numeric(strikes, errors="coerce").dropna().sort_values().unique()
+    if len(s) < 3:
+        return 1.0
+    diffs = np.diff(s)
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        return 1.0
+    step = float(np.median(diffs))
+    # keep it sane
+    if step <= 0:
+        step = 1.0
+    return step
+
+
+def _nearest_strike(strikes: pd.Series, x: float) -> float:
+    s = pd.to_numeric(strikes, errors="coerce").dropna()
+    if s.empty:
+        return float(x)
+    idx = (s - float(x)).abs().idxmin()
+    return float(s.loc[idx])
+
+
+def _round_to_step(x: float, step: float) -> float:
+    if step <= 0:
+        return float(x)
+    return float(round(float(x) / step) * step)
+
+
+def _format_spread(name: str, leg1: str, k1: float, leg2: str, k2: float) -> str:
+    return f"**{name}:** {leg1} `{k1:.2f}` / {leg2} `{k2:.2f}`"
+
+
+def _sizing_math(risk_budget_usd: float, spread_width: float, credit_est: float = 0.0) -> dict:
+    """
+    Conservative sizing:
+    - For credit spread: max_loss ≈ (width - credit) * 100
+    - If credit unknown, use credit_est=0 -> worst-case width*100
+    """
+    width = max(float(spread_width), 0.0)
+    credit = max(float(credit_est), 0.0)
+    max_loss_per_1 = max((width - credit) * 100.0, 0.0)
+    if max_loss_per_1 <= 0:
+        return {"max_loss_per_spread": 0.0, "contracts": 0}
+    contracts = int(np.floor(max(float(risk_budget_usd), 0.0) / max_loss_per_1))
+    return {"max_loss_per_spread": max_loss_per_1, "contracts": max(contracts, 0)}
+
+
+def _trade_templates_block(symbol: str, df: pd.DataFrame, spot: float, put_wall, call_wall, magnet, total_vanna: float, total_charm: float):
+    """
+    EDUCATIONAL spread templates (bull/bear) using dynamic strikes.
+    No premiums/fills here, so we provide:
+    - strike suggestions based on walls/magnet/spot
+    - sizing based on user risk budget and spread width (max loss)
+    """
+    st.markdown("### 🧩 Trade Templates (Educational, rule-based)")
+    st.caption(
+        "Not financial advice. These are **templates** that adapt to any ticker using: spot, strike step, walls, magnet. "
+        "Always check liquidity, bid/ask, and your own risk limits."
+    )
+
+    strikes = df["strike"]
+    step = _infer_strike_step(strikes)
+    S = float(spot)
+
+    # pick "anchor" areas
+    # - bullish: choose put credit below spot (or near put_wall if close)
+    # - bearish: choose call credit above spot (or near call_wall if close)
+    # - debit alternatives: bull call (above magnet break), bear put (below magnet fail)
+    #
+    # We don't know your expiry preferences here; this is structural only.
+
+    # offsets (in steps) so it works for 0.5 steps or 5 steps
+    short_offset = 2
+    long_offset = 5
+
+    # Choose short strikes relative to spot but snapped to chain
+    bull_short_put = _nearest_strike(strikes, _round_to_step(S - short_offset * step, step))
+    bull_long_put = _nearest_strike(strikes, _round_to_step(bull_short_put - long_offset * step, step))
+
+    bear_short_call = _nearest_strike(strikes, _round_to_step(S + short_offset * step, step))
+    bear_long_call = _nearest_strike(strikes, _round_to_step(bear_short_call + long_offset * step, step))
+
+    # Debit spreads keyed off magnet/walls
+    # - bull call: if break/hold above call_wall or magnet, use near ATM/ITM call long, short higher
+    # - bear put: if reject and lose magnet, use near ATM put long, short lower
+    ref_up = float(call_wall) if call_wall is not None else (float(magnet) if magnet is not None else S)
+    ref_dn = float(put_wall) if put_wall is not None else (float(magnet) if magnet is not None else S)
+
+    bull_call_long = _nearest_strike(strikes, _round_to_step(min(S, ref_up) - 1 * step, step))
+    bull_call_short = _nearest_strike(strikes, _round_to_step(bull_call_long + 4 * step, step))
+
+    bear_put_long = _nearest_strike(strikes, _round_to_step(max(S, float(magnet) if magnet is not None else S) + 1 * step, step))
+    bear_put_short = _nearest_strike(strikes, _round_to_step(bear_put_long - 4 * step, step))
+
+    # Spread widths (strike distance)
+    bull_put_width = abs(bull_short_put - bull_long_put)
+    bear_call_width = abs(bear_long_call - bear_short_call)
+    bull_call_width = abs(bull_call_short - bull_call_long)
+    bear_put_width = abs(bear_put_long - bear_put_short)
+
+    # Risk budget inputs (user-controlled)
+    colA, colB, colC = st.columns([1.2, 1.2, 1.6])
+    with colA:
+        risk_budget = st.number_input("Risk budget per trade (USD)", min_value=0.0, value=150.0, step=25.0)
+    with colB:
+        credit_est = st.number_input("Credit estimate (optional, per spread)", min_value=0.0, value=0.0, step=0.05)
+    with colC:
+        st.write("**Sizing uses max-loss math**")
+        st.caption("Credit spreads: max loss ≈ (width − credit) × 100. If you leave credit=0, it’s worst-case sizing.")
+
+    # compute contract counts (educational)
+    size_bull_put = _sizing_math(risk_budget, bull_put_width, credit_est=credit_est)
+    size_bear_call = _sizing_math(risk_budget, bear_call_width, credit_est=credit_est)
+
+    # debit spreads: without debit price we can’t compute max loss precisely (it equals debit paid × 100)
+    # so we show structure only and remind user to size using paid debit.
+    st.markdown("#### ✅ Bullish Templates")
+    st.markdown(
+        "\n".join([
+            _format_spread("Bull Put Credit (bullish / neutral)", "Sell Put", bull_short_put, "Buy Put", bull_long_put),
+            f"- Why: benefits if price **stays above** short strike; often fits **pinning / chop** regimes.\n"
+            f"- Strike step detected: `{step:.2f}`; width: `{bull_put_width:.2f}`",
+            f"- Conservative sizing (educational): max loss ≈ `${size_bull_put['max_loss_per_spread']:.0f}` per 1 contract → "
+            f"**{size_bull_put['contracts']}** contract(s) for `${risk_budget:.0f}` risk budget."
+        ])
+    )
+
+    st.markdown(
+        "\n".join([
+            _format_spread("Bull Call Debit (bullish momentum)", "Buy Call", bull_call_long, "Sell Call", bull_call_short),
+            "- Why: used when you expect **break & hold above magnet/call wall** (momentum regime).",
+            "- Sizing: max loss = **debit paid × 100**. Use your broker’s mid price to compute contracts."
+        ])
+    )
+
+    st.markdown("#### ✅ Bearish Templates")
+    st.markdown(
+        "\n".join([
+            _format_spread("Bear Call Credit (bearish / neutral)", "Sell Call", bear_short_call, "Buy Call", bear_long_call),
+            f"- Why: benefits if price **stays below** short strike; often fits **resistance / rejection** regimes.\n"
+            f"- Strike step detected: `{step:.2f}`; width: `{bear_call_width:.2f}`",
+            f"- Conservative sizing (educational): max loss ≈ `${size_bear_call['max_loss_per_spread']:.0f}` per 1 contract → "
+            f"**{size_bear_call['contracts']}** contract(s) for `${risk_budget:.0f}` risk budget."
+        ])
+    )
+
+    st.markdown(
+        "\n".join([
+            _format_spread("Bear Put Debit (bearish momentum)", "Buy Put", bear_put_long, "Sell Put", bear_put_short),
+            "- Why: used when you expect **lose magnet / break lower** (momentum downside).",
+            "- Sizing: max loss = **debit paid × 100**. Use your broker’s mid price to compute contracts."
+        ])
+    )
+
+    # Regime guidance as education (not a trade instruction)
+    st.markdown("#### 🧭 How to choose a template (Educational logic)")
+    if put_wall is None or call_wall is None:
+        st.info(
+            "Walls were not detected (missing OI). In that case, prefer: "
+            "• If price is ranging: credit spreads (wider, small size) "
+            "• If price is breaking: debit spreads (defined risk)."
+        )
+        return
+
+    pw = float(put_wall)
+    cw = float(call_wall)
+    m = float(magnet) if magnet is not None else S
+
+    near_call = abs(S - cw) < abs(S - pw)
+    inside = (S >= pw) and (S <= cw)
+
+    directional = (
+        "call-side pressure" if (total_charm > 0 and total_vanna > 0) else
+        "put-side pressure" if (total_charm < 0 and total_vanna < 0) else
+        "mixed pressure"
+    )
+
+    if inside and abs(S - m) <= 2 * step:
+        st.success(
+            f"Pinning zone: spot `{S:.2f}` is near magnet `{m:.2f}` inside `{pw:.2f} → {cw:.2f}`. "
+            f"Education: chop risk is higher; **credit spreads** often match range/pin conditions. "
+            f"Proxy tone: {directional}."
+        )
+    elif S > cw:
+        st.warning(
+            f"Breakout regime: spot `{S:.2f}` is above call wall `{cw:.2f}`. "
+            f"Education: momentum conditions can favor **bull call debit** templates; manage risk if it re-enters the range."
+        )
+    elif S < pw:
+        st.warning(
+            f"Breakdown regime: spot `{S:.2f}` is below put wall `{pw:.2f}`. "
+            f"Education: momentum conditions can favor **bear put debit** templates; manage risk if it re-enters the range."
+        )
+    else:
+        st.info(
+            f"Inside range but not pinned: `{pw:.2f} → {cw:.2f}`. "
+            f"Education: use **where price is** (near resistance vs support) to select bear-call vs bull-put templates. "
+            f"Proxy tone: {directional}."
+        )
 
 
 # ----------------------------
@@ -326,7 +535,7 @@ def render_tab_vanna_charm(symbol, date, spot, hist_df=None):
     # ----------------------------
     S = float(spot)
 
-    # weight nearby strikes more (so 400 matters when spot=398)
+    # Distance weighting: nearby strikes matter more
     width = max(S * 0.02, 1.0)  # 2% of spot, min 1.0
     dist = (df["strike"] - S).abs()
     w = np.exp(-((dist / width) ** 2))
@@ -415,7 +624,13 @@ Because support hedging is removed and selling can **cascade**.
             )
 
     # ----------------------------
-    # Metrics (with explanations beside them)
+    # Trade templates (Educational) - for ANY ticker
+    # ----------------------------
+    with st.expander("🧩 Trade Templates (Bull/Bear Spreads + Sizing Math) — Educational", expanded=True):
+        _trade_templates_block(symbol, df, S, put_wall, call_wall, magnet, total_vanna, total_charm)
+
+    # ----------------------------
+    # Metrics
     # ----------------------------
     c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 2, 2])
 
@@ -475,8 +690,8 @@ Because support hedging is removed and selling can **cascade**.
                 title="Strike",
                 type="linear",
                 tickmode="auto",
-                nticks=9,             # fewer ticks = less overlap
-                tickangle=-45,        # rotate labels
+                nticks=9,
+                tickangle=-45,
                 automargin=True,
                 tickfont=dict(size=11),
                 tickformat=".0f",
@@ -493,7 +708,6 @@ Because support hedging is removed and selling can **cascade**.
         return fig
 
     def _add_vline(fig: go.Figure, x: float, label: str, dash: str, color: str, xshift: int = 0):
-        # Put annotations with a semi-transparent background to prevent "overwriting"
         fig.add_vline(
             x=x,
             line_dash=dash,

@@ -179,6 +179,8 @@ def _trend_context_block(spot: float, hist_df: pd.DataFrame):
 
     if np.isfinite(ma200):
         bullets.append("• Price is **above MA200** → long-term bias stronger." if spot > ma200 else "• Price is **below MA200** → long-term bias weaker.")
+    else:
+        bullets.append("• MA200 not available (not enough history).")
 
     st.markdown("  \n".join(bullets))
     st.caption("⚠️ This is context, not a prediction.")
@@ -231,13 +233,12 @@ def _regime_sentence(spot: float, put_wall, call_wall, net_vanna: float, net_cha
     pw = float(put_wall)
     cw = float(call_wall)
 
-    # define "high" as relative (no hard-coded symbol), using combined magnitude
-    mag = abs(net_vanna) + abs(net_charm)
-    is_high = mag > 0  # always true, but we’ll message as “higher” using relative words
-    # We’ll keep it simple: interpret direction from charm (OI imbalance) & vanna (OI×IV imbalance)
-    directional = "call-side pressure" if (net_charm > 0 and net_vanna > 0) else \
-                  "put-side pressure" if (net_charm < 0 and net_vanna < 0) else \
-                  "mixed pressure"
+    # interpret direction from charm (OI imbalance) & vanna (OI×IV imbalance)
+    directional = (
+        "call-side pressure" if (net_charm > 0 and net_vanna > 0) else
+        "put-side pressure" if (net_charm < 0 and net_vanna < 0) else
+        "mixed pressure"
+    )
 
     if s > cw:
         return f"🚀 Above Call Wall ({cw:.2f}): breakout mode — {directional} can accelerate moves higher."
@@ -245,7 +246,6 @@ def _regime_sentence(spot: float, put_wall, call_wall, net_vanna: float, net_cha
         return f"🧨 Below Put Wall ({pw:.2f}): breakdown mode — {directional} can accelerate moves lower."
 
     # inside walls
-    # closer to which wall?
     dist_to_pw = abs(s - pw)
     dist_to_cw = abs(s - cw)
     near = f"near Call Wall ({cw:.2f})" if dist_to_cw < dist_to_pw else f"near Put Wall ({pw:.2f})"
@@ -282,9 +282,11 @@ def render_tab_vanna_charm(symbol, date, spot, hist_df=None):
     if hist_df is not None:
         _trend_context_block(float(spot), hist_df)
     else:
-        # user asked to show this message if MAs not detected / no history
         st.markdown("### 📊 Trend Context (Educational)")
-        st.info("📊 Trend Context: Moving average columns were not detected in this table.\n\nIf you add columns like MA20, MA50, MA200, this panel will explain the trend context automatically.")
+        st.info(
+            "📊 Trend Context: Moving average columns were not detected in this table.\n\n"
+            "If you add columns like MA20, MA50, MA200, this panel will explain the trend context automatically."
+        )
 
     # Fetch data (your existing /weekly/gex endpoint)
     with st.spinner("Fetching chain + computed exposure table..."):
@@ -458,32 +460,81 @@ Because support hedging is removed and selling can **cascade**.
     )
 
     # ----------------------------
-    # Charts
+    # Charts (FIXED: labels + annotations no longer overlap)
     # ----------------------------
     left, right = st.columns(2)
+
+    def _apply_axis_layout(fig: go.Figure, title: str, ytitle: str):
+        fig.update_layout(
+            template="plotly_dark",
+            height=480,  # taller helps in 2-column view
+            title=dict(text=title, x=0.02, xanchor="left"),
+            margin=dict(l=55, r=20, t=55, b=110),  # room for rotated ticks
+            bargap=0.15,
+            xaxis=dict(
+                title="Strike",
+                type="linear",
+                tickmode="auto",
+                nticks=9,             # fewer ticks = less overlap
+                tickangle=-45,        # rotate labels
+                automargin=True,
+                tickfont=dict(size=11),
+                tickformat=".0f",
+                showgrid=False,
+            ),
+            yaxis=dict(
+                title=ytitle,
+                automargin=True,
+                showgrid=True,
+                zeroline=True,
+            ),
+            showlegend=False,
+        )
+        return fig
+
+    def _add_vline(fig: go.Figure, x: float, label: str, dash: str, color: str, xshift: int = 0):
+        # Put annotations with a semi-transparent background to prevent "overwriting"
+        fig.add_vline(
+            x=x,
+            line_dash=dash,
+            line_color=color,
+            line_width=2,
+            annotation_text=label,
+            annotation_position="top",
+            annotation_yshift=18,
+            annotation_xshift=xshift,
+            annotation_font_size=10,
+            annotation_bgcolor="rgba(0,0,0,0.55)",
+            annotation_bordercolor="rgba(255,255,255,0.25)",
+            annotation_borderpad=3,
+        )
 
     with left:
         st.write("### Net Dealer Vanna (proxy) by Strike")
         fig_v = go.Figure(go.Bar(x=df["strike"], y=df["vanna_proxy"], name="Vanna (proxy)"))
-        fig_v.add_vline(x=S, line_dash="dash", line_color="white", annotation_text="SPOT")
+
+        _add_vline(fig_v, S, "SPOT", "dash", "white", xshift=0)
         if call_wall is not None:
-            fig_v.add_vline(x=float(call_wall), line_dash="dot", line_color="orange", annotation_text="CALL WALL")
+            _add_vline(fig_v, float(call_wall), "CALL WALL", "dot", "orange", xshift=20)
         if put_wall is not None:
-            fig_v.add_vline(x=float(put_wall), line_dash="dot", line_color="red", annotation_text="PUT WALL")
-        fig_v.update_layout(template="plotly_dark", height=420, xaxis_title="Strike", yaxis_title="Vanna (proxy)")
+            _add_vline(fig_v, float(put_wall), "PUT WALL", "dot", "red", xshift=-20)
+
+        fig_v = _apply_axis_layout(fig_v, "Vanna (proxy)", "Vanna (proxy)")
         st_plot(fig_v)
 
     with right:
         st.write("### Net Dealer Charm (proxy) by Strike")
         fig_c = go.Figure(go.Bar(x=df["strike"], y=df["charm_proxy"], name="Charm (proxy)"))
-        fig_c.add_vline(x=S, line_dash="dash", line_color="white", annotation_text="SPOT")
+
+        _add_vline(fig_c, S, "SPOT", "dash", "white", xshift=0)
         if magnet is not None:
-            fig_c.add_vline(x=float(magnet), line_dash="dot", line_color="cyan", annotation_text="MAGNET")
+            _add_vline(fig_c, float(magnet), "MAGNET", "dot", "cyan", xshift=20)
         if call_wall is not None:
-            fig_c.add_vline(x=float(call_wall), line_dash="dot", line_color="orange", annotation_text="CALL WALL")
+            _add_vline(fig_c, float(call_wall), "CALL WALL", "dot", "orange", xshift=40)
         if put_wall is not None:
-            fig_c.add_vline(x=float(put_wall), line_dash="dot", line_color="red", annotation_text="PUT WALL")
-        fig_c.update_layout(template="plotly_dark", height=420, xaxis_title="Strike", yaxis_title="Charm (proxy)")
+            _add_vline(fig_c, float(put_wall), "PUT WALL", "dot", "red", xshift=-20)
+
+        fig_c = _apply_axis_layout(fig_c, "Charm (proxy)", "Charm (proxy)")
         st_plot(fig_c)
 
     # Debug table

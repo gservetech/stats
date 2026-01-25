@@ -139,19 +139,24 @@ def render_symbol_chart(symbol: str):
             vol_series = df["close"].diff().abs().fillna(0)
         vol_label = "Activity (price-range proxy)"
 
-    # Scale volume for visibility (sqrt + robust cap to avoid one huge spike)
+    # Scale volume for visibility (sqrt + robust min/max scaling)
     vol_scaled = np.sqrt(vol_series.astype(float).clip(lower=0))
     if len(vol_scaled):
-        cap = np.percentile(vol_scaled, 95)
-        cap = cap if cap > 0 else float(vol_scaled.max())
+        vmin = float(np.percentile(vol_scaled, 5))
+        vmax = float(np.percentile(vol_scaled, 95))
+        if vmax - vmin < 1e-9:
+            vmin = float(vol_scaled.min())
+            vmax = float(vol_scaled.max())
     else:
-        cap = 0.0
-    if cap and cap > 0:
-        vol_norm = (vol_scaled / cap).clip(0, 1.0)
+        vmin = 0.0
+        vmax = 0.0
+    if vmax - vmin > 0:
+        vol_norm = ((vol_scaled - vmin) / (vmax - vmin)).clip(0, 1.0)
     else:
         vol_norm = vol_scaled
+    vol_display = vol_norm * 100.0
 
-    # Price axis (bars will be scaled into a band at the bottom)
+    # Price axis bounds (avoid 0 baseline flattening)
     if "low" in df.columns and df["low"].notna().any():
         price_min = float(df["low"].min())
     else:
@@ -160,9 +165,7 @@ def render_symbol_chart(symbol: str):
         price_max = float(df["high"].max())
     else:
         price_max = float(df["close"].max())
-    price_range = max(price_max - price_min, 1e-6)
-    vol_band = price_range * 0.28
-    vol_heights = vol_norm * vol_band
+    price_pad = max((price_max - price_min) * 0.05, 0.5)
 
     # Up/Down coloring for volume bars
     if "open" in df.columns and df["open"].notna().any():
@@ -171,52 +174,96 @@ def render_symbol_chart(symbol: str):
         up_mask = df["close"] >= df["close"].shift(1)
     vol_colors = np.where(up_mask, "rgba(0,215,117,0.85)", "rgba(255,75,75,0.85)")
 
-    # Plotly Figure (volume only)
-    fig = go.Figure()
+    # Bar width based on median time gap (thicker look)
+    bar_kwargs = {}
+    if len(df) > 1:
+        gaps = df["date"].astype("int64").diff().dropna()
+        if len(gaps) > 0:
+            bar_kwargs["width"] = int(gaps.median() * 0.8)
 
-    fig.add_trace(
+    # Price chart
+    price_fig = go.Figure()
+    price_fig.add_trace(
+        go.Scatter(
+            x=df["date"],
+            y=df["close"],
+            mode="lines",
+            fill="tozeroy",
+            line=dict(color=color, width=2.5),
+            fillcolor=f'rgba({0 if color=="#ff4b4b" else 0}, {215 if color=="#00d775" else 75}, {117 if color=="#00d775" else 75}, 0.15)',
+            name=symbol,
+            hovertemplate="%{y:.2f}",
+        )
+    )
+    price_fig.update_layout(
+        template="plotly_dark",
+        height=480,
+        margin=dict(l=0, r=0, t=10, b=0),
+        hovermode="x unified",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
+    price_fig.update_xaxes(
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.05)",
+        showline=False,
+        zeroline=False,
+        tickfont=dict(color="#888"),
+    )
+    price_fig.update_yaxes(
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.06)",
+        side="right",
+        showline=False,
+        zeroline=False,
+        tickfont=dict(color="#888"),
+        tickprefix="",
+        tickformat=".2f",
+        range=[price_min - price_pad, price_max + price_pad],
+    )
+
+    # Volume chart (separate)
+    volume_fig = go.Figure()
+    volume_fig.add_trace(
         go.Bar(
             x=df["date"],
-            y=vol_heights,
-            base=price_min,
+            y=vol_display,
             marker_color=vol_colors,
             name=vol_label,
             customdata=vol_series,
             hovertemplate=f"{vol_label}: %{{customdata:,.0f}}",
             opacity=0.95,
             marker_line_width=0,
+            **bar_kwargs,
         )
     )
-
-    fig.update_layout(
+    volume_fig.update_layout(
         template="plotly_dark",
-        height=600,
+        height=360,
         margin=dict(l=0, r=0, t=10, b=0),
-        bargap=0.02,
+        bargap=0.0,
         bargroupgap=0.0,
-        xaxis=dict(
-            showgrid=True,
-            gridcolor="rgba(255,255,255,0.05)",
-            showline=False,
-            zeroline=False,
-            tickfont=dict(color="#888"),
-        ),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor="rgba(255,255,255,0.06)",
-            side="right",
-            showline=False,
-            zeroline=False,
-            tickfont=dict(color="#888"),
-            tickprefix="",
-            tickformat=".2f",
-        ),
         hovermode="x unified",
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        showlegend=False
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
     )
-    fig.update_yaxes(range=[price_min, price_max], showticklabels=True, ticks="")
+    volume_fig.update_xaxes(
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.05)",
+        showline=False,
+        zeroline=False,
+        tickfont=dict(color="#888"),
+    )
+    vol_max = float(np.nanmax(vol_display)) if len(vol_display) else 0.0
+    vol_upper = max(vol_max * 1.1, 10.0)
+    volume_fig.update_yaxes(
+        range=[0, vol_upper],
+        showgrid=False,
+        showticklabels=False,
+        ticks="",
+    )
 
     # Range indicator (vertical lines for day break if 5D)
     if current_tf == "5D":
@@ -224,11 +271,18 @@ def render_symbol_chart(symbol: str):
         days = df['date'].dt.date.unique()
         for day in days[1:]:
             day_start = pd.to_datetime(day)
-            fig.add_vline(
+            price_fig.add_vline(
+                x=day_start,
+                line_width=1,
+                line_dash="dash",
+                line_color="rgba(255,255,255,0.1)",
+            )
+            volume_fig.add_vline(
                 x=day_start,
                 line_width=1,
                 line_dash="dash",
                 line_color="rgba(255,255,255,0.1)",
             )
 
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    st.plotly_chart(price_fig, use_container_width=True, config={'displayModeBar': False})
+    st.plotly_chart(volume_fig, use_container_width=True, config={'displayModeBar': False})

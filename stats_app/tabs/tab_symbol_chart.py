@@ -151,6 +151,23 @@ def render_symbol_chart(symbol: str):
     else:
         vol_display = vol_scaled
 
+    def _format_compact(n: float) -> str:
+        n = float(n)
+        a = abs(n)
+        if a >= 1_000_000_000:
+            return f"{n/1_000_000_000:.1f}B"
+        if a >= 1_000_000:
+            return f"{n/1_000_000:.1f}M"
+        if a >= 1_000:
+            return f"{n/1_000:.1f}K"
+        return f"{n:.0f}"
+
+    tickvals = None
+    ticktext = None
+    if cap and cap > 0:
+        tickvals = [0, 25, 50, 75, 100]
+        ticktext = [_format_compact((cap * (v / 100.0)) ** 2) for v in tickvals]
+
     # Up/Down coloring for volume bars
     if "open" in df.columns and df["open"].notna().any():
         up_mask = df["close"] >= df["open"]
@@ -196,13 +213,16 @@ def render_symbol_chart(symbol: str):
             tickfont=dict(color="#888"),
             tickprefix="",
             tickformat="",
+            title=dict(text=vol_label, font=dict(color="#888", size=12)),
+            tickvals=tickvals,
+            ticktext=ticktext,
         ),
         hovermode="x unified",
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         showlegend=False
     )
-    fig.update_yaxes(range=[0, 100], showticklabels=False, ticks="")
+    fig.update_yaxes(range=[0, 100], showticklabels=True, ticks="")
 
     # Range indicator (vertical lines for day break if 5D)
     if current_tf == "5D":

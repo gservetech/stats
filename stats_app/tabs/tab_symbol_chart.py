@@ -147,26 +147,22 @@ def render_symbol_chart(symbol: str):
     else:
         cap = 0.0
     if cap and cap > 0:
-        vol_display = (vol_scaled / cap).clip(0, 1.0) * 100.0
+        vol_norm = (vol_scaled / cap).clip(0, 1.0)
     else:
-        vol_display = vol_scaled
+        vol_norm = vol_scaled
 
-    def _format_compact(n: float) -> str:
-        n = float(n)
-        a = abs(n)
-        if a >= 1_000_000_000:
-            return f"{n/1_000_000_000:.1f}B"
-        if a >= 1_000_000:
-            return f"{n/1_000_000:.1f}M"
-        if a >= 1_000:
-            return f"{n/1_000:.1f}K"
-        return f"{n:.0f}"
-
-    tickvals = None
-    ticktext = None
-    if cap and cap > 0:
-        tickvals = [0, 25, 50, 75, 100]
-        ticktext = [_format_compact((cap * (v / 100.0)) ** 2) for v in tickvals]
+    # Price axis (bars will be scaled into a band at the bottom)
+    if "low" in df.columns and df["low"].notna().any():
+        price_min = float(df["low"].min())
+    else:
+        price_min = float(df["close"].min())
+    if "high" in df.columns and df["high"].notna().any():
+        price_max = float(df["high"].max())
+    else:
+        price_max = float(df["close"].max())
+    price_range = max(price_max - price_min, 1e-6)
+    vol_band = price_range * 0.28
+    vol_heights = vol_norm * vol_band
 
     # Up/Down coloring for volume bars
     if "open" in df.columns and df["open"].notna().any():
@@ -181,7 +177,8 @@ def render_symbol_chart(symbol: str):
     fig.add_trace(
         go.Bar(
             x=df["date"],
-            y=vol_display,
+            y=vol_heights,
+            base=price_min,
             marker_color=vol_colors,
             name=vol_label,
             customdata=vol_series,
@@ -212,17 +209,14 @@ def render_symbol_chart(symbol: str):
             zeroline=False,
             tickfont=dict(color="#888"),
             tickprefix="",
-            tickformat="",
-            title=dict(text=vol_label, font=dict(color="#888", size=12)),
-            tickvals=tickvals,
-            ticktext=ticktext,
+            tickformat=".2f",
         ),
         hovermode="x unified",
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         showlegend=False
     )
-    fig.update_yaxes(range=[0, 100], showticklabels=True, ticks="")
+    fig.update_yaxes(range=[price_min, price_max], showticklabels=True, ticks="")
 
     # Range indicator (vertical lines for day break if 5D)
     if current_tf == "5D":

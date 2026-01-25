@@ -139,22 +139,7 @@ def render_symbol_chart(symbol: str):
             vol_series = df["close"].diff().abs().fillna(0)
         vol_label = "Activity (price-range proxy)"
 
-    # Scale volume for visibility (sqrt + robust min/max scaling)
-    vol_scaled = np.sqrt(vol_series.astype(float).clip(lower=0))
-    if len(vol_scaled):
-        vmin = float(np.percentile(vol_scaled, 5))
-        vmax = float(np.percentile(vol_scaled, 95))
-        if vmax - vmin < 1e-9:
-            vmin = float(vol_scaled.min())
-            vmax = float(vol_scaled.max())
-    else:
-        vmin = 0.0
-        vmax = 0.0
-    if vmax - vmin > 0:
-        vol_norm = ((vol_scaled - vmin) / (vmax - vmin)).clip(0, 1.0)
-    else:
-        vol_norm = vol_scaled
-    vol_display = vol_norm * 100.0
+    vol_display = vol_series.astype(float)
 
     # Price axis bounds (avoid 0 baseline flattening)
     if "low" in df.columns and df["low"].notna().any():
@@ -179,7 +164,8 @@ def render_symbol_chart(symbol: str):
     if len(df) > 1:
         gaps = df["date"].astype("int64").diff().dropna()
         if len(gaps) > 0:
-            bar_kwargs["width"] = int(gaps.median() * 0.8)
+            gap_ms = float(gaps.median()) / 1_000_000.0
+            bar_kwargs["width"] = max(int(gap_ms * 0.8), 1)
 
     # Price chart
     price_fig = go.Figure()
@@ -260,9 +246,14 @@ def render_symbol_chart(symbol: str):
     vol_upper = max(vol_max * 1.1, 10.0)
     volume_fig.update_yaxes(
         range=[0, vol_upper],
-        showgrid=False,
-        showticklabels=False,
-        ticks="",
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.06)",
+        side="right",
+        showline=False,
+        zeroline=False,
+        tickfont=dict(color="#888"),
+        tickformat="~s",
+        title=dict(text=vol_label, font=dict(color="#888", size=12)),
     )
 
     # Range indicator (vertical lines for day break if 5D)

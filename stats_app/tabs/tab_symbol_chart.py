@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from stats_app.helpers.data_fetching import fetch_cnbc_chart_data
 
@@ -126,47 +127,82 @@ def render_symbol_chart(symbol: str):
             </div>
         """, unsafe_allow_html=True)
 
-    # Plotly Figure
+    # Volume (or proxy) series for bottom bars
+    has_volume = "volume" in df.columns and df["volume"].notna().any()
+    if has_volume:
+        vol_series = df["volume"].fillna(0)
+        vol_label = "Volume"
+    else:
+        if "high" in df.columns and "low" in df.columns:
+            vol_series = (df["high"] - df["low"]).abs().fillna(0)
+        else:
+            vol_series = df["close"].diff().abs().fillna(0)
+        vol_label = "Activity (price-range proxy)"
+
+    # Scale volume for visibility (sqrt + robust cap to avoid one huge spike)
+    vol_scaled = np.sqrt(vol_series.astype(float).clip(lower=0))
+    if len(vol_scaled):
+        cap = np.percentile(vol_scaled, 95)
+        cap = cap if cap > 0 else float(vol_scaled.max())
+    else:
+        cap = 0.0
+    if cap and cap > 0:
+        vol_display = (vol_scaled / cap).clip(0, 1.0) * 100.0
+    else:
+        vol_display = vol_scaled
+
+    # Up/Down coloring for volume bars
+    if "open" in df.columns and df["open"].notna().any():
+        up_mask = df["close"] >= df["open"]
+    else:
+        up_mask = df["close"] >= df["close"].shift(1)
+    vol_colors = np.where(up_mask, "rgba(0,215,117,0.85)", "rgba(255,75,75,0.85)")
+
+    # Plotly Figure (volume only)
     fig = go.Figure()
 
-    # Mountain Area
-    fig.add_trace(go.Scatter(
-        x=df['date'],
-        y=df['close'],
-        mode='lines',
-        fill='tozeroy',
-        line=dict(color=color, width=2.5),
-        fillcolor=f'rgba({0 if color=="#ff4b4b" else 0}, {215 if color=="#00d775" else 75}, {117 if color=="#00d775" else 75}, 0.15)',
-        name=symbol,
-        hovertemplate='%{y:.2f}'
-    ))
+    fig.add_trace(
+        go.Bar(
+            x=df["date"],
+            y=vol_display,
+            marker_color=vol_colors,
+            name=vol_label,
+            customdata=vol_series,
+            hovertemplate=f"{vol_label}: %{{customdata:,.0f}}",
+            opacity=0.95,
+            marker_line_width=0,
+        )
+    )
 
     fig.update_layout(
         template="plotly_dark",
-        height=500,
+        height=600,
         margin=dict(l=0, r=0, t=10, b=0),
+        bargap=0.02,
+        bargroupgap=0.0,
         xaxis=dict(
             showgrid=True,
             gridcolor="rgba(255,255,255,0.05)",
             showline=False,
             zeroline=False,
-            tickfont=dict(color="#888")
+            tickfont=dict(color="#888"),
         ),
         yaxis=dict(
             showgrid=True,
-            gridcolor="rgba(255,255,255,0.05)",
+            gridcolor="rgba(255,255,255,0.06)",
             side="right",
             showline=False,
             zeroline=False,
             tickfont=dict(color="#888"),
             tickprefix="",
-            tickformat=".2f"
+            tickformat="",
         ),
         hovermode="x unified",
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         showlegend=False
     )
+    fig.update_yaxes(range=[0, 100], showticklabels=False, ticks="")
 
     # Range indicator (vertical lines for day break if 5D)
     if current_tf == "5D":
@@ -174,6 +210,11 @@ def render_symbol_chart(symbol: str):
         days = df['date'].dt.date.unique()
         for day in days[1:]:
             day_start = pd.to_datetime(day)
-            fig.add_vline(x=day_start, line_width=1, line_dash="dash", line_color="rgba(255,255,255,0.1)")
+            fig.add_vline(
+                x=day_start,
+                line_width=1,
+                line_dash="dash",
+                line_color="rgba(255,255,255,0.1)",
+            )
 
     st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})

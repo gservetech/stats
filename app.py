@@ -37,11 +37,7 @@ from stats_app.tabs.tab_friday_predictor import render_tab_friday_predictor
 from stats_app.tabs.tab_friday_predictor_plus import render_tab_friday_predictor_plus
 from stats_app.tabs.tab_vanna_charm import render_tab_vanna_charm
 from stats_app.tabs.tab_interpretation_engine import render_tab_interpretation_engine
-
-
-# OPTIONAL: if you add the vanna tab in your UI
-# from stats_app.tabs.tab_vanna_charm import render_tab_vanna_charm
-
+from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -107,16 +103,20 @@ def main():
 
         live_spot_data = st.session_state[spot_key]
         live_spot = live_spot_data["spot"] if live_spot_data else None
-        
+
         if live_spot_data:
             source_name = live_spot_data.get("source", "Source")
             st.success(f"📈 {source_name}: ${live_spot:.2f}")
-            
+
             if "after_hours" in live_spot_data and live_spot_data["after_hours"]:
                 ah = live_spot_data["after_hours"]
                 st.info(f"🌙 After Hours: ${ah['price']:.2f} ({ah['change']:+.2f})")
 
-        spot_input = st.number_input("Spot Price (manual fallback)", value=float(live_spot or 260.0), step=0.50)
+        spot_input = st.number_input(
+            "Spot Price (manual fallback)",
+            value=float(live_spot or 260.0),
+            step=0.50
+        )
         spot = float(live_spot) if live_spot else float(spot_input)
 
         fetch_btn = st_btn("🔄 Fetch Data", disabled=not api_ok)
@@ -169,8 +169,8 @@ def main():
 
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}**")
 
-        # Tabs
-        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13 = st.tabs(
+        # Tabs (14 labels for 14 tab variables)
+        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14 = st.tabs(
             [
                 "📋 Chain",
                 "📊 OI",
@@ -184,6 +184,7 @@ def main():
                 "🔮 Friday Predictor",
                 "🧠 Friday Predictor+",
                 "🌊 Vanna/Charm",
+                "📊 Orderflow/Delta",   # ✅ added (was missing)
                 "🧠 Interpretation",
             ]
         )
@@ -213,9 +214,9 @@ def main():
         with t12:
             render_tab_vanna_charm(symbol, date, spot, hist_df)
         with t13:
+            render_tab_orderflow_delta(symbol, hist_df, spot)
+        with t14:
             render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
-
-
 
     else:
         st.info("Query a symbol and click 'Fetch Data' to begin.")

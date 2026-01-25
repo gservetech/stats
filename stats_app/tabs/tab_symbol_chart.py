@@ -1,0 +1,179 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from stats_app.helpers.data_fetching import fetch_cnbc_chart_data
+
+@st.fragment
+def render_symbol_chart(symbol: str):
+    # Timeframe selection matching the user's list
+    timeframes = ["1D", "5D", "1M", "3M", "6M", "YTD", "1Y", "5Y", "ALL"]
+    
+    # Initialize session state for timeframe if not present
+    if "selected_chart_tf" not in st.session_state:
+        st.session_state["selected_chart_tf"] = "1D"
+        
+    current_tf = st.session_state["selected_chart_tf"]
+
+    # Header with Timeframe selector
+    st.markdown("""
+        <style>
+        .tf-container {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #3d4450;
+            padding-bottom: 10px;
+        }
+        .tf-btn {
+            background: none;
+            border: none;
+            color: #b0b5bc;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            padding: 5px 10px;
+            border-radius: 4px;
+        }
+        .tf-btn:hover {
+            color: white;
+            background: #2a2e39;
+        }
+        .tf-btn.active {
+            color: #00d775;
+            background: rgba(0, 215, 117, 0.1);
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # Timeframe selector row
+    cols = st.columns(len(timeframes) + 2)
+    for i, tf in enumerate(timeframes):
+        if cols[i].button(tf, key=f"tf_btn_{tf}", use_container_width=True, 
+                          type="primary" if current_tf == tf else "secondary"):
+            st.session_state["selected_chart_tf"] = tf
+            # No st.rerun() needed - fragment auto-reruns on widget interaction
+
+    # Add a spacer and a full-screen icon lookalike (placeholder)
+    cols[-1].markdown("""
+        <div style="text-align: right; color: #b0b5bc; font-size: 20px; cursor: pointer; padding-top: 5px;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+        </div>
+    """, unsafe_allow_html=True)
+
+    # Fetch data
+    with st.spinner(f"Fetching {symbol} ({current_tf})..."):
+        data = fetch_cnbc_chart_data(symbol, current_tf)
+        
+    if not data or "priceBars" not in data or not data["priceBars"]:
+        st.warning(f"No chart data available for {symbol} ({current_tf})")
+        return
+
+    bars = data["priceBars"]
+    df = pd.DataFrame(bars)
+    
+    if df.empty:
+        st.info("The data pool for this symbol is currently empty.")
+        return
+
+    # Process data
+    df['close'] = pd.to_numeric(df['close'])
+    df['high'] = pd.to_numeric(df['high'])
+    df['low'] = pd.to_numeric(df['low'])
+    df['open'] = pd.to_numeric(df['open'])
+    if 'volume' in df.columns:
+        df['volume'] = pd.to_numeric(df['volume'])
+        
+    # Find the date column
+    date_col = None
+    for col in ['tradeTime', 'tradeTimeinMills', 'dateTime']:
+        if col in df.columns:
+            date_col = col
+            break
+            
+    if date_col == 'tradeTime':
+        df['date'] = pd.to_datetime(df['tradeTime'], format='%Y%m%d%H%M%S', errors='coerce')
+    elif date_col == 'tradeTimeinMills':
+        df['date'] = pd.to_datetime(pd.to_numeric(df['tradeTimeinMills']), unit='ms', errors='coerce')
+    elif date_col == 'dateTime':
+        try:
+            df['date'] = pd.to_datetime(df['dateTime'], format='%Y%m%d%H%M%S', errors='coerce')
+        except:
+            df['date'] = pd.to_datetime(df['dateTime'], errors='coerce')
+    else:
+        st.error(f"Could not find timestamp column in data. Keys: {list(df.columns)}")
+        return
+
+    df = df.sort_values('date')
+
+    # Chart Header (Symbol + Price)
+    last_price = df['close'].iloc[-1]
+    prev_price = df['close'].iloc[0]
+    change = last_price - prev_price
+    pct_change = (change / prev_price) * 100 if prev_price != 0 else 0
+    
+    color = "#00d775" if change >= 0 else "#ff4b4b"
+    arrow = "▲" if change >= 0 else "▼"
+    
+    col1, col2 = st.columns([2, 5])
+    with col1:
+        st.markdown(f"""
+            <div style="padding: 10px 0;">
+                <span style="font-size: 24px; font-weight: 700;">{symbol}</span>
+                <span style="font-size: 24px; font-weight: 400; margin-left: 10px;">{last_price:,.2f}</span>
+                <div style="color: {color}; font-size: 16px; margin-top: -5px;">
+                    {arrow} {abs(change):.2f} ({abs(pct_change):.2f}%)
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+    # Plotly Figure
+    fig = go.Figure()
+
+    # Mountain Area
+    fig.add_trace(go.Scatter(
+        x=df['date'],
+        y=df['close'],
+        mode='lines',
+        fill='tozeroy',
+        line=dict(color=color, width=2.5),
+        fillcolor=f'rgba({0 if color=="#ff4b4b" else 0}, {215 if color=="#00d775" else 75}, {117 if color=="#00d775" else 75}, 0.15)',
+        name=symbol,
+        hovertemplate='%{y:.2f}'
+    ))
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=500,
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.05)",
+            showline=False,
+            zeroline=False,
+            tickfont=dict(color="#888")
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.05)",
+            side="right",
+            showline=False,
+            zeroline=False,
+            tickfont=dict(color="#888"),
+            tickprefix="",
+            tickformat=".2f"
+        ),
+        hovermode="x unified",
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        showlegend=False
+    )
+
+    # Range indicator (vertical lines for day break if 5D)
+    if current_tf == "5D":
+        # Add subtle vertical lines at day boundaries
+        days = df['date'].dt.date.unique()
+        for day in days[1:]:
+            day_start = pd.to_datetime(day)
+            fig.add_vline(x=day_start, line_width=1, line_dash="dash", line_color="rgba(255,255,255,0.1)")
+
+    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})

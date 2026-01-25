@@ -365,6 +365,8 @@ def _strategy_ideas(spot: float, levels: StructureLevels) -> List[str]:
     return ideas
 
 
+from stats_app.tabs.tab_symbol_chart import render_symbol_chart
+
 def render_tab_interpretation_engine(
     symbol: str,
     spot: float,
@@ -372,6 +374,8 @@ def render_tab_interpretation_engine(
     hist_df: Optional[pd.DataFrame] = None,
     expiry_date: Optional[str] = None,
 ):
+    render_symbol_chart(symbol)
+    
     st.markdown("## 🧠 Interpretation Engine (Any Symbol)")
     st.caption(
         "Educational context only — not investment advice. "

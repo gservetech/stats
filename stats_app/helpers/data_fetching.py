@@ -8,6 +8,45 @@ import yfinance as yf
 from bs4 import BeautifulSoup
 from .api_client import safe_cache_data
 
+@safe_cache_data(ttl=900, show_spinner=False)
+def fetch_cnbc_chart_data(symbol: str, time_range: str = "1D") -> dict | None:
+    """
+    Fetches chart data from CNBC GraphQL API.
+    Time ranges: 1D, 5D, 1M, 3M, 6M, YTD, 1Y, 5Y, ALL
+    """
+    url = "https://webql-redesign.cnbcfm.com/graphql"
+    # Ensure symbol is uppercase
+    symbol = symbol.upper().strip()
+    
+    # Map time range to CNBC format if needed (though they seem to match the display labels)
+    # 1D, 5D, 1M, 3M, 6M, YTD, 1Y, 5Y, ALL
+    
+    params = {
+        "operationName": "getQuoteChartData",
+        "variables": f'{{"symbol":"{symbol}","timeRange":"{time_range}"}}',
+        "extensions": '{"persistedQuery":{"version":1,"sha256Hash":"9e1670c29a10707c417a1efd327d4b2b1d456b77f1426e7e84fb7d399416bb6b"}}'
+    }
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"CNBC API Error: Status {resp.status_code}, Body: {resp.text[:200]}")
+            return {}
+        data = resp.json()
+        if "errors" in data:
+            print(f"CNBC GraphQL Errors: {data['errors']}")
+            return {}
+        
+        # The key in the 'data' object usually matches the operation name, 
+        # but in some redesign versions it is simply 'chartData'
+        data_obj = data.get("data", {})
+        return data_obj.get("getQuoteChartData") or data_obj.get("chartData") or {}
+    except Exception as e:
+        print(f"CNBC API Exception: {e}")
+        return {}
+
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
 def _pick_first_series(obj):

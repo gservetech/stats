@@ -36,6 +36,7 @@ from stats_app.tabs.tab_vol_cone import render_tab_vol_cone
 from stats_app.tabs.tab_friday_predictor import render_tab_friday_predictor
 from stats_app.tabs.tab_friday_predictor_plus import render_tab_friday_predictor_plus
 from stats_app.tabs.tab_vanna_charm import render_tab_vanna_charm
+from stats_app.tabs.tab_interpretation_engine import render_tab_interpretation_engine
 
 
 # OPTIONAL: if you add the vanna tab in your UI
@@ -162,7 +163,7 @@ def main():
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}**")
 
         # Tabs
-        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11,t12 = st.tabs(
+        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13 = st.tabs(
             [
                 "📋 Chain",
                 "📊 OI",
@@ -176,6 +177,7 @@ def main():
                 "🔮 Friday Predictor",
                 "🧠 Friday Predictor+",
                 "🌊 Vanna/Charm",
+                "🧠 Interpretation",
             ]
         )
 
@@ -203,6 +205,8 @@ def main():
             render_tab_friday_predictor_plus(symbol, w, hist_df, spot)
         with t12:
             render_tab_vanna_charm(symbol, date, spot, hist_df)
+        with t13:
+            render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
 
 
 

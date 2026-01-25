@@ -5,6 +5,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
 from .api_client import safe_cache_data
 
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
@@ -24,9 +25,93 @@ def get_finnhub_api_key() -> str | None:
         pass
     return os.getenv("FINNHUB_API_KEY")
 
+def get_spot_from_cnbc(symbol: str) -> dict | None:
+    """
+    Scrapes CNBC for live quote data.
+    Ported from user-provided scraping sample.
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol: return None
+    
+    url = f"https://www.cnbc.com/quotes/{symbol}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Target the main QuoteStrip container
+        strip = soup.find(id="quote-page-strip")
+        if not strip:
+            strip = soup.find(class_="QuoteStrip-container")
+            
+        if not strip:
+            return None
+
+        def extract_price_group(container):
+            if not container: return None
+            data = {}
+            price_tag = container.find(class_="QuoteStrip-lastPrice")
+            if not price_tag: return None
+            
+            data['price'] = float(price_tag.get_text(strip=True).replace(",", ""))
+            
+            change_tag = (container.find(class_="QuoteStrip-changeUp") or 
+                          container.find(class_="QuoteStrip-changeDown") or 
+                          container.find(class_="QuoteStrip-unchanged"))
+            
+            if change_tag:
+                parts = [s.get_text(strip=True) for s in change_tag.find_all("span") if s.get_text(strip=True)]
+                try: 
+                    data['change'] = float(parts[0].replace(",", "").replace("+", ""))
+                except: data['change'] = 0.0
+                try: 
+                    data['percent_change'] = float(parts[1].replace(",", "").replace("+", "").replace("%", "").replace("(", "").replace(")", ""))
+                except: data['percent_change'] = 0.0
+            else:
+                data['change'] = 0.0
+                data['percent_change'] = 0.0
+
+            return data
+
+        # Try regular market data first
+        reg_market = strip.find(class_="QuoteStrip-extendedHours")
+        market_data = extract_price_group(reg_market)
+        
+        # If not found, try the main price tag directly in strip (sometimes it's there)
+        if not market_data:
+            market_data = extract_price_group(strip)
+
+        if not market_data:
+            return None
+
+        # After Hours Data (optional)
+        after_hours_div = strip.find(class_="QuoteStrip-extendedDataContainer")
+        after_hours_data = extract_price_group(after_hours_div)
+
+        return {
+            "spot": market_data['price'],
+            "change": market_data['change'],
+            "percent_change": market_data['percent_change'],
+            "after_hours": after_hours_data if after_hours_data else None,
+            "source": "CNBC"
+        }
+    except Exception:
+        pass
+    return None
+
 def get_spot_from_finnhub(symbol: str) -> dict | None:
     symbol = (symbol or "").strip().upper()
     if not symbol: return None
+    
+    # Try CNBC first as requested
+    cnbc_data = get_spot_from_cnbc(symbol)
+    if cnbc_data:
+        return cnbc_data
+
     api_key = get_finnhub_api_key()
     if not api_key: return None
     try:

@@ -44,6 +44,8 @@ from pathlib import Path
 
 import pandas as pd
 import numpy as np
+import requests
+from bs4 import BeautifulSoup
 from pydoll.browser import Chrome
 from pydoll.browser.options import ChromiumOptions
 
@@ -501,105 +503,89 @@ async def _query_text_any(tab, selectors: list[str]) -> str | None:
     return None
 
 
-async def scrape_spot(symbol: str, date: str | None):
-    symbol_q = quote(symbol, safe="")
-    quote_url = f"https://www.barchart.com/stocks/quotes/{symbol_q}"
-    options_url = f"https://www.barchart.com/stocks/quotes/{symbol_q}/options?expiration={date}&view=sbs" if date else None
-    urls = [options_url, quote_url] if options_url else [quote_url]
+async def scrape_spot(symbol: str, date: str | None = None):
+    """
+    Scrapes CNBC for live quote data.
+    Ported from user-provided scraping sample.
+    """
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+    
+    url = f"https://www.cnbc.com/quotes/{symbol}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
 
-    last_error: Exception | None = None
+    try:
+        # Run requests in thread to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, lambda: requests.get(url, headers=headers, timeout=15))
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-    async with _BROWSER_SEMAPHORE:
-        options = build_chrome_options()
+        # Target the main QuoteStrip container
+        strip = soup.find(id="quote-page-strip")
+        if not strip:
+            strip = soup.find(class_="QuoteStrip-container")
+            
+        if not strip:
+            raise HTTPException(status_code=404, detail=f"Quote container not found for {symbol}")
 
-        async with Chrome(options=options) as browser:
-            tab = await browser.start()
+        def extract_price_group(container):
+            if not container: return None
+            data = {}
+            price_tag = container.find(class_="QuoteStrip-lastPrice")
+            if not price_tag: return None
+            
+            data['price'] = float(price_tag.get_text(strip=True).replace(",", ""))
+            
+            change_tag = (container.find(class_="QuoteStrip-changeUp") or 
+                          container.find(class_="QuoteStrip-changeDown") or 
+                          container.find(class_="QuoteStrip-unchanged"))
+            
+            if change_tag:
+                parts = [s.get_text(strip=True) for s in change_tag.find_all("span") if s.get_text(strip=True)]
+                try: 
+                    data['change'] = float(parts[0].replace(",", "").replace("+", ""))
+                except: data['change'] = 0.0
+                try: 
+                    data['percent_change'] = float(parts[1].replace(",", "").replace("+", "").replace("%", "").replace("(", "").replace(")", ""))
+                except: data['percent_change'] = 0.0
+            else:
+                data['change'] = 0.0
+                data['percent_change'] = 0.0
 
-            for url in urls:
-                if not url:
-                    continue
-                print(f"[INFO] Scraping spot: {url}")
-                try:
-                    await tab.go_to(url)
-                except Exception as e:
-                    last_error = e
-                    continue
+            return data
 
-                price_text = None
-                for _ in range(30):
-                    await asyncio.sleep(1)
-                    price_text = await _query_text_any(
-                        tab,
-                        [
-                            "span.last-change[data-ng-class*='lastPrice']",
-                            ".pricechangerow span.last-change",
-                        ],
-                    )
-                    if price_text:
-                        break
+        # Try regular market data first
+        reg_market = strip.find(class_="QuoteStrip-extendedHours")
+        market_data = extract_price_group(reg_market)
+        
+        # If not found, try the main price tag directly in strip
+        if not market_data:
+            market_data = extract_price_group(strip)
 
-                if not price_text:
-                    last_error = Exception("Spot price element not found")
-                    continue
+        if not market_data:
+            raise HTTPException(status_code=404, detail=f"Price data not found for {symbol}")
 
-                change_text = await _query_text_any(
-                    tab,
-                    [
-                        "span.last-change[data-ng-class*='priceChange']",
-                        ".pricechangerow span.last-change.up",
-                        ".pricechangerow span.last-change.down",
-                    ],
-                )
-                percent_text = await _query_text_any(
-                    tab,
-                    [
-                        "span[data-ng-class*='percentChange']",
-                    ],
-                )
-                trade_time = await _query_text_any(
-                    tab,
-                    [
-                        ".pricechangerow span.symbol-trade-time[data-ng-class*='tradeTime']",
-                        ".pricechangerow span.symbol-trade-time",
-                    ],
-                )
-                exchange = await _query_text_any(
-                    tab,
-                    [
-                        ".pricechangerow span.symbol-trade-time + span.symbol-trade-time",
-                    ],
-                )
-                session = await _query_text_any(
-                    tab,
-                    [
-                        ".realtime-title-wrapper .session",
-                    ],
-                )
-                bid_text = await _query_text_any(tab, [".ask-bid-data .bid"])
-                ask_text = await _query_text_any(tab, [".ask-bid-data .ask"])
+        # After Hours Data (optional)
+        after_hours_div = strip.find(class_="QuoteStrip-extendedDataContainer")
+        after_hours_data = extract_price_group(after_hours_div)
 
-                spot = _to_float(price_text, None)
-                change = _to_float(change_text, None)
-                percent_change = _to_float(percent_text, None)
-
-                return {
-                    "url": url,
-                    "spot": spot,
-                    "spot_text": price_text,
-                    "change": change,
-                    "change_text": change_text,
-                    "percent_change": percent_change,
-                    "percent_text": percent_text,
-                    "trade_time": trade_time,
-                    "exchange": exchange,
-                    "session": session,
-                    "bid_text": bid_text,
-                    "ask_text": ask_text,
-                }
-
-    if last_error:
-        raise HTTPException(status_code=500, detail=f"Failed to load page: {str(last_error)}")
-    raise HTTPException(status_code=404, detail=f"Spot price not found for {symbol}.")
+        return {
+            "url": url,
+            "spot": market_data['price'],
+            "change": market_data['change'],
+            "percent_change": market_data['percent_change'],
+            "after_hours": after_hours_data,
+            "source": "CNBC"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scraping error: {str(e)}")
 
 
 # ---------------- Gamma / GEX helpers ----------------

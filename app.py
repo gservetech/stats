@@ -91,10 +91,10 @@ def main():
     with st.sidebar:
         st.markdown("## 🔍 Options Query")
         symbol = st.text_input("Symbol", value="MU").upper().strip()
-        expiry_date = st.date_input("Expiration Date", value=dt.date(2026, 1, 23))
+        expiry_date = st.date_input("Expiration Date", value=dt.date.today())
         date = expiry_date.isoformat()
 
-        spot_source = st.selectbox("Spot Price Source", options=["Finnhub (spot only)", "Manual"])
+        spot_source = st.selectbox("Spot Price Source", options=["CNBC (Scraping)", "Manual"])
         refresh_spot_btn = st_btn("🔄 Refresh Spot")
 
         # --------- per-symbol spot cache (prevents symbol cross-talk) ---------
@@ -105,9 +105,16 @@ def main():
         if (refresh_spot_btn or (st.session_state[spot_key] is None)) and spot_source != "Manual" and symbol:
             st.session_state[spot_key] = get_spot_from_finnhub(symbol)
 
-        live_spot = st.session_state[spot_key]["spot"] if st.session_state[spot_key] else None
-        if live_spot:
-            st.success(f"📈 Finnhub: ${live_spot:.2f}")
+        live_spot_data = st.session_state[spot_key]
+        live_spot = live_spot_data["spot"] if live_spot_data else None
+        
+        if live_spot_data:
+            source_name = live_spot_data.get("source", "Source")
+            st.success(f"📈 {source_name}: ${live_spot:.2f}")
+            
+            if "after_hours" in live_spot_data and live_spot_data["after_hours"]:
+                ah = live_spot_data["after_hours"]
+                st.info(f"🌙 After Hours: ${ah['price']:.2f} ({ah['change']:+.2f})")
 
         spot_input = st.number_input("Spot Price (manual fallback)", value=float(live_spot or 260.0), step=0.50)
         spot = float(live_spot) if live_spot else float(spot_input)

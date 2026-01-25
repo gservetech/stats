@@ -94,7 +94,7 @@ def main():
         expiry_date = st.date_input("Expiration Date", value=dt.date.today())
         date = expiry_date.isoformat()
 
-        spot_source = st.selectbox("Spot Price Source", options=["CNBC (Scraping)", "Manual"])
+        spot_source = st.selectbox("Spot Price Source", options=["CNBC", "Manual"])
         refresh_spot_btn = st_btn("🔄 Refresh Spot")
 
         # --------- per-symbol spot cache (prevents symbol cross-talk) ---------

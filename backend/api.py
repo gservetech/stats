@@ -81,8 +81,10 @@ app.add_middleware(
 _OPTIONS_CACHE = {}  # (symbol,date) -> {"ts": float, "rows": list}
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min default (was 5 min)
 CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "3600"))  # serve stale up to 1 hour
-_SPOT_CACHE = {}  # Deprecated: spot caching removed for real-time refresh
+# Spot cache: short TTL for "real-time" with stale fallback for stability.
+_SPOT_CACHE = {}  # symbol -> {"ts": float, "data": dict}
 SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
+SPOT_STALE_SECONDS = int(os.getenv("SPOT_STALE_SECONDS", "60"))
 CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
 _BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "2")) # Increased to 2 for production
 _BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
@@ -97,6 +99,8 @@ if ZoneInfo:
 # Request deduplication: prevent multiple identical scrapes
 _PENDING_OPTIONS = {}  # (symbol,date) -> asyncio.Event (signals when scrape completes)
 _PENDING_OPTIONS_LOCK = asyncio.Lock()
+_PENDING_SPOT = {}  # symbol -> asyncio.Event (signals when spot fetch completes)
+_PENDING_SPOT_LOCK = asyncio.Lock()
 
 
 async def get_rows_cached(symbol: str, date: str):
@@ -162,8 +166,65 @@ async def get_rows_cached(symbol: str, date: str):
 
 
 async def get_spot_cached(symbol: str, date: str | None):
-    # No caching: always fetch fresh spot data
-    return await scrape_spot(symbol, date)
+    """
+    Fetch spot with a short TTL cache + stale fallback.
+    This reduces intermittent failures and rate limiting while keeping data fresh.
+    """
+    key = (symbol or "").strip().upper()
+    now = time()
+
+    hit = _SPOT_CACHE.get(key)
+    if hit and (now - hit["ts"]) < SPOT_TTL_SECONDS:
+        data = dict(hit["data"])
+        data["cached"] = True
+        data["stale"] = False
+        return data
+
+    # If another request is already fetching this symbol, wait briefly.
+    async with _PENDING_SPOT_LOCK:
+        if key in _PENDING_SPOT:
+            event = _PENDING_SPOT[key]
+        else:
+            event = None
+
+    if event is not None:
+        try:
+            await asyncio.wait_for(event.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            pass
+        hit = _SPOT_CACHE.get(key)
+        if hit:
+            data = dict(hit["data"])
+            data["cached"] = True
+            data["stale"] = (now - hit["ts"]) >= SPOT_TTL_SECONDS
+            return data
+
+    # Register in-flight fetch
+    event = asyncio.Event()
+    async with _PENDING_SPOT_LOCK:
+        _PENDING_SPOT[key] = event
+
+    try:
+        data = await scrape_spot(symbol, date)
+        _SPOT_CACHE[key] = {"ts": time(), "data": data}
+        data = dict(data)
+        data["cached"] = False
+        data["stale"] = False
+        return data
+    except HTTPException:
+        # Serve stale value if we have one
+        hit = _SPOT_CACHE.get(key)
+        if hit and (now - hit["ts"]) < SPOT_STALE_SECONDS:
+            data = dict(hit["data"])
+            data["cached"] = True
+            data["stale"] = True
+            data["stale_age_seconds"] = int(now - hit["ts"])
+            return data
+        raise
+    finally:
+        event.set()
+        async with _PENDING_SPOT_LOCK:
+            _PENDING_SPOT.pop(key, None)
 
 
 # ---------------- JSON Sanitizer (fix NaN/Inf) ----------------
@@ -802,6 +863,10 @@ async def get_spot(
         "bid_text": data.get("bid_text"),
         "ask_text": data.get("ask_text"),
         "url": data.get("url"),
+        "source": data.get("source"),
+        "cached": data.get("cached"),
+        "stale": data.get("stale"),
+        "stale_age_seconds": data.get("stale_age_seconds"),
         "fetched_at": datetime.now().isoformat(),
     }
     return sanitize_json(payload)

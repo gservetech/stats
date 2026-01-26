@@ -5,7 +5,28 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from .api_client import safe_cache_data
+
+_SPOT_SESSION = None
+
+def _spot_session() -> requests.Session:
+    global _SPOT_SESSION
+    if _SPOT_SESSION is None:
+        s = requests.Session()
+        retry = Retry(
+            total=2,
+            backoff_factor=0.4,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _SPOT_SESSION = s
+    return _SPOT_SESSION
 
 @safe_cache_data(ttl=900, show_spinner=False)
 def fetch_cnbc_chart_data(symbol: str, time_range: str = "1D") -> dict | None:
@@ -129,7 +150,7 @@ def get_spot_from_cnbc(symbol: str) -> dict | None:
     }
 
     try:
-        response = requests.get(CNBC_QUOTE_URL, params=params, headers=headers, timeout=15)
+        response = _spot_session().get(CNBC_QUOTE_URL, params=params, headers=headers, timeout=15)
         response.raise_for_status()
         data = response.json()
         quote = _find_cnbc_quote(data)
@@ -182,7 +203,7 @@ def get_spot_from_finnhub(symbol: str) -> dict | None:
     try:
         url = f"{FINNHUB_BASE_URL}/quote"
         params = {"symbol": symbol, "token": api_key}
-        resp = requests.get(url, params=params, timeout=10)
+        resp = _spot_session().get(url, params=params, timeout=10)
         resp.raise_for_status()
         quote = resp.json()
         if quote and quote.get('c') is not None and float(quote.get('c', 0)) > 0:

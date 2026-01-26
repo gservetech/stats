@@ -9,19 +9,25 @@ if ROOT_DIR not in sys.path:
 import streamlit as st
 import pandas as pd
 import datetime as dt
+import time
 import plotly.graph_objects as go
 import numpy as np
 import requests
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
 
 # Import modular components (ABSOLUTE imports only)
 from stats_app.styles import apply_custom_styles
 from stats_app.helpers.api_client import (
     check_api,
+    fetch_spot_quote,
     fetch_options,
     fetch_weekly_summary,
     API_BASE_URL,
 )
-from stats_app.helpers.data_fetching import get_spot_from_finnhub, fetch_price_history
+from stats_app.helpers.data_fetching import get_spot_from_finnhub, get_finnhub_api_key, fetch_price_history
 from stats_app.helpers.ui_components import st_plot, st_btn, st_df
 
 from stats_app.tabs.tab_options_chain import render_tab_options_chain
@@ -92,25 +98,76 @@ def main():
 
         spot_source = st.selectbox("Spot Price Source", options=["CNBC", "Manual"])
         refresh_spot_btn = st_btn("🔄 Refresh Spot")
+        auto_refresh = st.checkbox("Auto-refresh spot", value=False)
+        refresh_interval = st.slider("Refresh interval (sec)", 5, 60, 15, step=5)
+        if auto_refresh and st_autorefresh:
+            st_autorefresh(interval=refresh_interval * 1000, key=f"spot_refresh_{symbol}")
+        elif auto_refresh and not st_autorefresh:
+            st.info("Auto-refresh unavailable (missing streamlit-autorefresh).")
 
         # --------- per-symbol spot cache (prevents symbol cross-talk) ---------
         spot_key = f"spot_data_{symbol}"
+        spot_ts_key = f"spot_ts_{symbol}"
+        spot_err_key = f"spot_err_{symbol}"
         if spot_key not in st.session_state:
             st.session_state[spot_key] = None
+        if spot_ts_key not in st.session_state:
+            st.session_state[spot_ts_key] = 0.0
+        if spot_err_key not in st.session_state:
+            st.session_state[spot_err_key] = None
 
-        if (refresh_spot_btn or (st.session_state[spot_key] is None)) and spot_source != "Manual" and symbol:
-            st.session_state[spot_key] = get_spot_from_finnhub(symbol)
+        should_refresh = (
+            refresh_spot_btn
+            or (st.session_state[spot_key] is None)
+            or (auto_refresh and (time.time() - st.session_state[spot_ts_key] >= refresh_interval))
+        )
+
+        if should_refresh and spot_source != "Manual" and symbol:
+            spot_data = None
+            spot_error = None
+
+            # 1) Prefer backend /spot (cached + stable)
+            backend = fetch_spot_quote(symbol, date)
+            if backend and backend.get("success"):
+                spot_data = backend.get("data")
+                if spot_data and not spot_data.get("source"):
+                    spot_data["source"] = "Backend"
+            else:
+                spot_error = backend.get("error") if backend else "Backend spot fetch failed"
+
+            # 2) Fallback to direct CNBC/Finnhub
+            if not spot_data:
+                spot_data = get_spot_from_finnhub(symbol)
+                if not spot_data and not get_finnhub_api_key():
+                    if spot_error:
+                        spot_error = f"{spot_error}; FINNHUB_API_KEY missing"
+                    else:
+                        spot_error = "FINNHUB_API_KEY missing"
+
+            if spot_data:
+                st.session_state[spot_key] = spot_data
+                st.session_state[spot_ts_key] = time.time()
+                st.session_state[spot_err_key] = None
+            else:
+                st.session_state[spot_err_key] = spot_error or "Spot fetch failed"
 
         live_spot_data = st.session_state[spot_key]
+        spot_error = st.session_state.get(spot_err_key)
         live_spot = live_spot_data["spot"] if live_spot_data else None
 
         if live_spot_data:
             source_name = live_spot_data.get("source", "Source")
-            st.success(f"📈 {source_name}: ${live_spot:.2f}")
+            stale_tag = " (stale)" if live_spot_data.get("stale") else ""
+            st.success(f"📈 {source_name}{stale_tag}: ${live_spot:.2f}")
+            last_ts = st.session_state.get(spot_ts_key, 0.0)
+            if last_ts:
+                st.caption(f"Last update: {dt.datetime.fromtimestamp(last_ts).strftime('%H:%M:%S')}")
 
             if "after_hours" in live_spot_data and live_spot_data["after_hours"]:
                 ah = live_spot_data["after_hours"]
                 st.info(f"🌙 After Hours: ${ah['price']:.2f} ({ah['change']:+.2f})")
+        elif spot_error:
+            st.warning(spot_error)
 
         spot_input = st.number_input(
             "Spot Price (manual fallback)",

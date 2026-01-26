@@ -81,7 +81,7 @@ app.add_middleware(
 _OPTIONS_CACHE = {}  # (symbol,date) -> {"ts": float, "rows": list}
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min default (was 5 min)
 CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "3600"))  # serve stale up to 1 hour
-_SPOT_CACHE = {}  # (symbol,date) -> {"ts": float, "data": dict}
+_SPOT_CACHE = {}  # Deprecated: spot caching removed for real-time refresh
 SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
 CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
 _BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "2")) # Increased to 2 for production
@@ -162,22 +162,8 @@ async def get_rows_cached(symbol: str, date: str):
 
 
 async def get_spot_cached(symbol: str, date: str | None):
-    key = (symbol.upper().strip(), (date or "").strip())
-    now = time()
-
-    hit = _SPOT_CACHE.get(key)
-    if hit and (now - hit["ts"]) < SPOT_TTL_SECONDS:
-        return hit["data"]
-    # If a browser slot is busy, return last known spot (even if stale)
-    # to avoid timing out callers.
-    if hit and _BROWSER_SEMAPHORE.locked():
-        data = dict(hit["data"])
-        data["stale"] = True
-        return data
-
-    data = await scrape_spot(symbol, date)
-    _SPOT_CACHE[key] = {"ts": now, "data": data}
-    return data
+    # No caching: always fetch fresh spot data
+    return await scrape_spot(symbol, date)
 
 
 # ---------------- JSON Sanitizer (fix NaN/Inf) ----------------
@@ -790,7 +776,6 @@ async def health():
         "platform": sys.platform,
         "chrome_binary": os.getenv("CHROME_BINARY", ""),
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
-        "spot_ttl_seconds": SPOT_TTL_SECONDS,
         "browser_concurrency": _BROWSER_CONCURRENCY,
     }
 

@@ -89,6 +89,9 @@ CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolT
 _BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "2")) # Increased to 2 for production
 _BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
 _BROWSER_ACQUIRE_TIMEOUT = 100 # Max wait for a browser slot before erroring
+OPTIONS_PAGELOAD_TIMEOUT = int(os.getenv("OPTIONS_PAGELOAD_TIMEOUT", "60"))
+OPTIONS_WAIT_SECONDS = int(os.getenv("OPTIONS_WAIT_SECONDS", "45"))
+OPTIONS_RETRY_COUNT = int(os.getenv("OPTIONS_RETRY_COUNT", "1"))
 _EXPIRY_TZ = None
 if ZoneInfo:
     try:
@@ -151,13 +154,25 @@ async def get_rows_cached(symbol: str, date: str):
 
     try:
         # Wait for the result with a timeout slightly shorter than the frontend timeout
-        async with asyncio.timeout(110): 
+        async with asyncio.timeout(110):
             rows = await scrape_options(symbol, date)
             _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows}
             return rows
     except asyncio.TimeoutError:
         print(f"[TIMEOUT] Scrape for {key} took too long.")
+        # Serve stale if we have it
+        hit = _OPTIONS_CACHE.get(key)
+        if hit and (now - hit["ts"]) < CACHE_STALE_SECONDS:
+            print(f"[STALE] Returning stale options for {key} after timeout.")
+            return hit["rows"]
         raise HTTPException(status_code=504, detail="Scrape timed out. Please try again.")
+    except HTTPException:
+        # Serve stale if we have it
+        hit = _OPTIONS_CACHE.get(key)
+        if hit and (now - hit["ts"]) < CACHE_STALE_SECONDS:
+            print(f"[STALE] Returning stale options for {key} after scrape error.")
+            return hit["rows"]
+        raise
     finally:
         # Signal other waiters that we're done
         event.set()
@@ -517,83 +532,98 @@ async def scrape_options(symbol: str, date: str):
     url = f"https://www.barchart.com/stocks/quotes/{symbol_q}/options?expiration={date}&view=sbs"
     print(f"[INFO] Scraping: {url}")
 
-    captured_requests = {}
+    for attempt in range(OPTIONS_RETRY_COUNT + 1):
+        captured_requests = {}
 
-    async def on_response(response_log):
-        params = response_log.get("params", {})
-        response = params.get("response", {})
-        resp_url = response.get("url", "")
+        async def on_response(response_log):
+            params = response_log.get("params", {})
+            response = params.get("response", {})
+            resp_url = response.get("url", "")
 
-        if "/proxies/core-api/v1/options/get" in resp_url and "options" not in captured_requests:
-            captured_requests["options"] = (params.get("requestId"), resp_url)
+            if "/proxies/core-api/v1/options/get" in resp_url and "options" not in captured_requests:
+                captured_requests["options"] = (params.get("requestId"), resp_url)
 
-        elif "/proxies/core-api/v1/options-expirations/get" in resp_url and "expirations" not in captured_requests:
-            captured_requests["expirations"] = (params.get("requestId"), resp_url)
+            elif "/proxies/core-api/v1/options-expirations/get" in resp_url and "expirations" not in captured_requests:
+                captured_requests["expirations"] = (params.get("requestId"), resp_url)
 
-    async with _BROWSER_SEMAPHORE:
-        options = build_chrome_options()
+        try:
+            async with _BROWSER_SEMAPHORE:
+                options = build_chrome_options()
 
-        print("[INFO] Starting browser (headless mode)...")
-        print("[INFO] Chrome binary:", getattr(options, "binary_location", None) or "(auto-detect)")
+                print("[INFO] Starting browser (headless mode)...")
+                print("[INFO] Chrome binary:", getattr(options, "binary_location", None) or "(auto-detect)")
 
-        async with Chrome(options=options) as browser:
-            tab = await browser.start()
+                async with Chrome(options=options) as browser:
+                    tab = await browser.start()
 
-            await tab.enable_network_events()
-            await tab.on("Network.responseReceived", on_response)
+                    await tab.enable_network_events()
+                    await tab.on("Network.responseReceived", on_response)
 
-            try:
-                # Add a timeout to the initial page load to avoid hanging the semaphore
-                await asyncio.wait_for(tab.go_to(url), timeout=45)
-            except asyncio.TimeoutError:
-                raise HTTPException(status_code=504, detail="Barchart took too long to respond.")
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
+                    try:
+                        # Add a timeout to the initial page load to avoid hanging the semaphore
+                        await asyncio.wait_for(tab.go_to(url), timeout=OPTIONS_PAGELOAD_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        raise HTTPException(status_code=504, detail="Barchart took too long to respond.")
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
 
-            print("[INFO] Waiting for network requests (max 30s)...")
-            # Poll much faster (every 0.2s) instead of every 1s
-            for _ in range(150): 
-                await asyncio.sleep(0.2)
-                if "options" in captured_requests:
-                    # Once request is seen, wait just a tiny bit for the body to be populateable
-                    await asyncio.sleep(0.5) 
-                    break
+                    print(f"[INFO] Waiting for network requests (max {OPTIONS_WAIT_SECONDS}s)...")
+                    poll_interval = 0.25
+                    polls = max(1, int(OPTIONS_WAIT_SECONDS / poll_interval))
+                    for _ in range(polls):
+                        await asyncio.sleep(poll_interval)
+                        if "options" in captured_requests:
+                            # Once request is seen, wait just a tiny bit for the body to be populateable
+                            await asyncio.sleep(0.5)
+                            break
 
-            if "options" not in captured_requests:
-                raise HTTPException(
-                    status_code=404,
-                    detail=(
-                        f"Options data not found for {symbol} on {date}. "
-                        f"Verify symbol + expiration date, or Barchart may be blocking headless requests."
-                    )
-                )
+                    if "options" not in captured_requests:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=(
+                                f"Options data not found for {symbol} on {date}. "
+                                f"Verify symbol + expiration date, or Barchart may be blocking headless requests."
+                            )
+                        )
 
-            request_id, _api_url = captured_requests["options"]
+                    request_id, _api_url = captured_requests["options"]
 
-            try:
-                body_data = await tab.get_network_response_body(request_id)
+                    try:
+                        body_data = await tab.get_network_response_body(request_id)
 
-                if isinstance(body_data, dict):
-                    body = body_data.get("body", "")
-                    if body_data.get("base64Encoded"):
-                        body = base64.b64decode(body).decode("utf-8", errors="ignore")
-                else:
-                    body = body_data
+                        if isinstance(body_data, dict):
+                            body = body_data.get("body", "")
+                            if body_data.get("base64Encoded"):
+                                body = base64.b64decode(body).decode("utf-8", errors="ignore")
+                        else:
+                            body = body_data
 
-                opt_json = json.loads(body)
-                rows = process_options_data(opt_json)
+                        opt_json = json.loads(body)
+                        rows = process_options_data(opt_json)
 
-                if not rows:
-                    raise HTTPException(status_code=404, detail=f"No options data found for {symbol} on {date}.")
+                        if not rows:
+                            raise HTTPException(status_code=404, detail=f"No options data found for {symbol} on {date}.")
 
-                return rows
+                        return rows
 
-            except json.JSONDecodeError as e:
-                raise HTTPException(status_code=500, detail=f"Failed to parse options data: {str(e)}")
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
+                    except json.JSONDecodeError as e:
+                        raise HTTPException(status_code=500, detail=f"Failed to parse options data: {str(e)}")
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
+        except HTTPException as e:
+            if attempt < OPTIONS_RETRY_COUNT and e.status_code in (404, 500, 502, 503, 504):
+                print(f"[RETRY] scrape_options failed ({e.status_code}). Retrying ({attempt + 1}/{OPTIONS_RETRY_COUNT})...")
+                await asyncio.sleep(1 + attempt)
+                continue
+            raise
+        except Exception as e:
+            if attempt < OPTIONS_RETRY_COUNT:
+                print(f"[RETRY] scrape_options error ({type(e).__name__}). Retrying ({attempt + 1}/{OPTIONS_RETRY_COUNT})...")
+                await asyncio.sleep(1 + attempt)
+                continue
+            raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
 
 
 async def _query_text_any(tab, selectors: list[str]) -> str | None:

@@ -9,7 +9,11 @@ services:
       - TZ=UTC
       - PYTHONUNBUFFERED=1
       - SPOT_TTL_SECONDS=15
+      - SPOT_STALE_SECONDS=60
       - BROWSER_CONCURRENCY=1
+      - OPTIONS_PAGELOAD_TIMEOUT=60
+      - OPTIONS_WAIT_SECONDS=45
+      - OPTIONS_RETRY_COUNT=1
     # Chrome needs extra shared memory
     shm_size: "2gb"
     # Security options for Chrome

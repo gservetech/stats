@@ -133,6 +133,16 @@ docker-compose up -d --build
 docker stats barchart-api
 ```
 
+## Performance Tuning (Optional)
+
+Update environment variables in `docker-compose.yml` to balance speed vs reliability:
+
+- `BROWSER_CONCURRENCY=1` (lower = fewer bans, higher = more throughput)
+- `OPTIONS_PAGELOAD_TIMEOUT=60` (page load timeout in seconds)
+- `OPTIONS_WAIT_SECONDS=45` (wait for network requests in seconds)
+- `OPTIONS_RETRY_COUNT=1` (retries for transient failures)
+- `SPOT_TTL_SECONDS=15` / `SPOT_STALE_SECONDS=60` (spot freshness vs stability)
+
 ## API Endpoints
 
 | Endpoint                                                             | Method | Description  |

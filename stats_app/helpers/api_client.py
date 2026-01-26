@@ -24,6 +24,7 @@ def get_api_base_url() -> str:
 
 API_BASE_URL = get_api_base_url()
 
+@safe_cache_data(ttl=15, show_spinner=False)
 def check_api() -> bool:
     try:
         r = requests.get(f"{API_BASE_URL}/health", timeout=5)

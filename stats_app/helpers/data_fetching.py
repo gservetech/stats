@@ -5,7 +5,6 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
-from bs4 import BeautifulSoup
 from .api_client import safe_cache_data
 
 @safe_cache_data(ttl=900, show_spinner=False)
@@ -48,6 +47,7 @@ def fetch_cnbc_chart_data(symbol: str, time_range: str = "1D") -> dict | None:
         return {}
 
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
+CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
 
 def _pick_first_series(obj):
     if isinstance(obj, pd.DataFrame):
@@ -55,6 +55,49 @@ def _pick_first_series(obj):
             return obj.iloc[:, 0]
         return pd.Series(dtype="float64")
     return obj
+
+def _parse_float(val, default=None):
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        try:
+            return float(val)
+        except Exception:
+            return default
+    s = str(val).strip()
+    if not s:
+        return default
+    s = s.replace(",", "").replace("%", "").replace("+", "").replace("(", "").replace(")", "")
+    try:
+        return float(s)
+    except Exception:
+        return default
+
+def _first_present(d: dict, keys: list[str]):
+    for key in keys:
+        if key in d and d[key] not in (None, ""):
+            return d[key]
+    return None
+
+def _find_cnbc_quote(obj):
+    if isinstance(obj, dict):
+        for key in ("QuickQuoteResult", "FormattedQuoteResult", "ExtendedQuoteResult"):
+            if key in obj:
+                found = _find_cnbc_quote(obj.get(key))
+                if found:
+                    return found
+        if any(k in obj for k in ("last", "lastPrice", "last_price", "price", "lastTrade", "lastSale")):
+            return obj
+        for val in obj.values():
+            found = _find_cnbc_quote(val)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_cnbc_quote(item)
+            if found:
+                return found
+    return None
 
 def get_finnhub_api_key() -> str | None:
     try:
@@ -66,75 +109,58 @@ def get_finnhub_api_key() -> str | None:
 
 def get_spot_from_cnbc(symbol: str) -> dict | None:
     """
-    Scrapes CNBC for live quote data.
-    Ported from user-provided scraping sample.
+    Fetches CNBC quote data via the quote JSON endpoint.
     """
     symbol = (symbol or "").strip().upper()
     if not symbol: return None
     
-    url = f"https://www.cnbc.com/quotes/{symbol}"
+    params = {
+        "symbols": symbol,
+        "requestMethod": "itv",
+        "noform": 1,
+        "partnerId": 2,
+        "fund": 1,
+        "exthrs": 1,
+        "output": "json",
+        "events": 1,
+    }
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(CNBC_QUOTE_URL, params=params, headers=headers, timeout=15)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        # Target the main QuoteStrip container
-        strip = soup.find(id="quote-page-strip")
-        if not strip:
-            strip = soup.find(class_="QuoteStrip-container")
-            
-        if not strip:
+        data = response.json()
+        quote = _find_cnbc_quote(data)
+        if not quote:
             return None
 
-        def extract_price_group(container):
-            if not container: return None
-            data = {}
-            price_tag = container.find(class_="QuoteStrip-lastPrice")
-            if not price_tag: return None
-            
-            data['price'] = float(price_tag.get_text(strip=True).replace(",", ""))
-            
-            change_tag = (container.find(class_="QuoteStrip-changeUp") or 
-                          container.find(class_="QuoteStrip-changeDown") or 
-                          container.find(class_="QuoteStrip-unchanged"))
-            
-            if change_tag:
-                parts = [s.get_text(strip=True) for s in change_tag.find_all("span") if s.get_text(strip=True)]
-                try: 
-                    data['change'] = float(parts[0].replace(",", "").replace("+", ""))
-                except: data['change'] = 0.0
-                try: 
-                    data['percent_change'] = float(parts[1].replace(",", "").replace("+", "").replace("%", "").replace("(", "").replace(")", ""))
-                except: data['percent_change'] = 0.0
-            else:
-                data['change'] = 0.0
-                data['percent_change'] = 0.0
-
-            return data
-
-        # Try regular market data first
-        reg_market = strip.find(class_="QuoteStrip-extendedHours")
-        market_data = extract_price_group(reg_market)
-        
-        # If not found, try the main price tag directly in strip (sometimes it's there)
-        if not market_data:
-            market_data = extract_price_group(strip)
-
-        if not market_data:
+        price_raw = _first_present(quote, ["last", "lastPrice", "last_price", "price", "lastTrade", "lastSale", "regularMarketLast", "regularMarketPrice"])
+        price = _parse_float(price_raw)
+        if price is None:
             return None
 
-        # After Hours Data (optional)
-        after_hours_div = strip.find(class_="QuoteStrip-extendedDataContainer")
-        after_hours_data = extract_price_group(after_hours_div)
+        change_raw = _first_present(quote, ["change", "priceChange", "netChange", "changePoints", "lastChange"])
+        pct_raw = _first_present(quote, ["change_pct", "changePct", "changePercent", "percentChange", "pctChange", "percent_change"])
+
+        after_price_raw = _first_present(quote, ["alt_last", "altLast", "extendedHoursLast", "afterHoursLast", "afterHoursPrice"])
+        after_change_raw = _first_present(quote, ["alt_change", "altChange", "extendedHoursChange", "afterHoursChange"])
+        after_pct_raw = _first_present(quote, ["alt_change_pct", "altChangePct", "altChangePercent", "extendedHoursChangePct", "afterHoursChangePct"])
+
+        after_hours_data = None
+        after_price = _parse_float(after_price_raw)
+        if after_price is not None:
+            after_hours_data = {
+                "price": after_price,
+                "change": _parse_float(after_change_raw, 0.0),
+                "percent_change": _parse_float(after_pct_raw, 0.0),
+            }
 
         return {
-            "spot": market_data['price'],
-            "change": market_data['change'],
-            "percent_change": market_data['percent_change'],
+            "spot": price,
+            "change": _parse_float(change_raw, 0.0),
+            "percent_change": _parse_float(pct_raw, 0.0),
             "after_hours": after_hours_data if after_hours_data else None,
             "source": "CNBC"
         }

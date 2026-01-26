@@ -33,7 +33,7 @@ try:
 except Exception:
     ZoneInfo = None
     ZoneInfoNotFoundError = Exception
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -45,7 +45,6 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import requests
-from bs4 import BeautifulSoup
 from pydoll.browser import Chrome
 from pydoll.browser.options import ChromiumOptions
 
@@ -84,6 +83,7 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min default
 CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "3600"))  # serve stale up to 1 hour
 _SPOT_CACHE = {}  # (symbol,date) -> {"ts": float, "data": dict}
 SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
+CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
 _BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "2")) # Increased to 2 for production
 _BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
 _BROWSER_ACQUIRE_TIMEOUT = 100 # Max wait for a browser slot before erroring
@@ -239,6 +239,68 @@ def _to_float(val, default=None):
         return float(s) * multiplier
     except Exception:
         return default
+
+
+def _first_present(d: dict, keys: list[str]):
+    for key in keys:
+        if key in d and d[key] not in (None, ""):
+            return d[key]
+    return None
+
+
+def _find_cnbc_quote(obj):
+    if isinstance(obj, dict):
+        for key in ("QuickQuoteResult", "FormattedQuoteResult", "ExtendedQuoteResult"):
+            if key in obj:
+                found = _find_cnbc_quote(obj.get(key))
+                if found:
+                    return found
+        if any(k in obj for k in ("last", "lastPrice", "last_price", "price", "lastTrade", "lastSale")):
+            return obj
+        for val in obj.values():
+            found = _find_cnbc_quote(val)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_cnbc_quote(item)
+            if found:
+                return found
+    return None
+
+
+def _to_iso_time(val):
+    if val is None:
+        return None
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        num = _to_float(s, None)
+        if num is None:
+            return s
+        ts = num
+    else:
+        ts = _to_float(val, None)
+        if ts is None:
+            return None
+    if ts > 1e10:
+        ts = ts / 1000.0
+    try:
+        return datetime.fromtimestamp(ts).isoformat()
+    except Exception:
+        return None
+
+
+def _format_percent_text(val):
+    if val is None:
+        return None
+    if isinstance(val, str) and "%" in val:
+        return val.strip()
+    num = _to_float(val, None)
+    if num is None:
+        return str(val)
+    return f"{num:.2f}%"
 
 
 def _to_int(val, default: int | float | str | None = 0) -> int:
@@ -505,14 +567,23 @@ async def _query_text_any(tab, selectors: list[str]) -> str | None:
 
 async def scrape_spot(symbol: str, date: str | None = None):
     """
-    Scrapes CNBC for live quote data.
-    Ported from user-provided scraping sample.
+    Fetches CNBC quote data via the quote JSON endpoint.
     """
     symbol = (symbol or "").strip().upper()
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
     
-    url = f"https://www.cnbc.com/quotes/{symbol}"
+    params = {
+        "symbols": symbol,
+        "requestMethod": "itv",
+        "noform": 1,
+        "partnerId": 2,
+        "fund": 1,
+        "exthrs": 1,
+        "output": "json",
+        "events": 1,
+    }
+    url = f"{CNBC_QUOTE_URL}?{urlencode(params)}"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
@@ -520,66 +591,54 @@ async def scrape_spot(symbol: str, date: str | None = None):
     try:
         # Run requests in thread to avoid blocking event loop
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, lambda: requests.get(url, headers=headers, timeout=15))
+        response = await loop.run_in_executor(None, lambda: requests.get(CNBC_QUOTE_URL, params=params, headers=headers, timeout=15))
         response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
+        data = response.json()
+        quote = _find_cnbc_quote(data)
+        if not quote:
+            raise HTTPException(status_code=404, detail=f"Quote data not found for {symbol}")
 
-        # Target the main QuoteStrip container
-        strip = soup.find(id="quote-page-strip")
-        if not strip:
-            strip = soup.find(class_="QuoteStrip-container")
-            
-        if not strip:
-            raise HTTPException(status_code=404, detail=f"Quote container not found for {symbol}")
-
-        def extract_price_group(container):
-            if not container: return None
-            data = {}
-            price_tag = container.find(class_="QuoteStrip-lastPrice")
-            if not price_tag: return None
-            
-            data['price'] = float(price_tag.get_text(strip=True).replace(",", ""))
-            
-            change_tag = (container.find(class_="QuoteStrip-changeUp") or 
-                          container.find(class_="QuoteStrip-changeDown") or 
-                          container.find(class_="QuoteStrip-unchanged"))
-            
-            if change_tag:
-                parts = [s.get_text(strip=True) for s in change_tag.find_all("span") if s.get_text(strip=True)]
-                try: 
-                    data['change'] = float(parts[0].replace(",", "").replace("+", ""))
-                except: data['change'] = 0.0
-                try: 
-                    data['percent_change'] = float(parts[1].replace(",", "").replace("+", "").replace("%", "").replace("(", "").replace(")", ""))
-                except: data['percent_change'] = 0.0
-            else:
-                data['change'] = 0.0
-                data['percent_change'] = 0.0
-
-            return data
-
-        # Try regular market data first
-        reg_market = strip.find(class_="QuoteStrip-extendedHours")
-        market_data = extract_price_group(reg_market)
-        
-        # If not found, try the main price tag directly in strip
-        if not market_data:
-            market_data = extract_price_group(strip)
-
-        if not market_data:
+        price_raw = _first_present(quote, ["last", "lastPrice", "last_price", "price", "lastTrade", "lastSale", "regularMarketLast", "regularMarketPrice"])
+        price = _to_float(price_raw, None)
+        if price is None:
             raise HTTPException(status_code=404, detail=f"Price data not found for {symbol}")
 
-        # After Hours Data (optional)
-        after_hours_div = strip.find(class_="QuoteStrip-extendedDataContainer")
-        after_hours_data = extract_price_group(after_hours_div)
+        change_raw = _first_present(quote, ["change", "priceChange", "netChange", "changePoints", "lastChange"])
+        pct_raw = _first_present(quote, ["change_pct", "changePct", "changePercent", "percentChange", "pctChange", "percent_change"])
+
+        after_price_raw = _first_present(quote, ["alt_last", "altLast", "extendedHoursLast", "afterHoursLast", "afterHoursPrice"])
+        after_change_raw = _first_present(quote, ["alt_change", "altChange", "extendedHoursChange", "afterHoursChange"])
+        after_pct_raw = _first_present(quote, ["alt_change_pct", "altChangePct", "altChangePercent", "extendedHoursChangePct", "afterHoursChangePct"])
+
+        after_price = _to_float(after_price_raw, None)
+        after_hours_data = None
+        if after_price is not None:
+            after_hours_data = {
+                "price": after_price,
+                "change": _to_float(after_change_raw, 0.0),
+                "percent_change": _to_float(after_pct_raw, 0.0),
+            }
+
+        trade_time = _first_present(quote, ["last_time", "last_time_msec", "lastTime", "lastTimeMsec", "lastTradeTime", "tradeTime"])
+        exchange = _first_present(quote, ["exchange", "exchangeName", "exchange_name"])
+        session = _first_present(quote, ["session", "sessionStatus", "marketStatus", "market_status"])
+        bid_raw = _first_present(quote, ["bid", "bidPrice", "bid_price", "bestBid"])
+        ask_raw = _first_present(quote, ["ask", "askPrice", "ask_price", "bestAsk"])
 
         return {
             "url": url,
-            "spot": market_data['price'],
-            "change": market_data['change'],
-            "percent_change": market_data['percent_change'],
+            "spot": price,
+            "spot_text": str(price_raw) if price_raw is not None else None,
+            "change": _to_float(change_raw, 0.0),
+            "change_text": str(change_raw) if change_raw is not None else None,
+            "percent_change": _to_float(pct_raw, 0.0),
+            "percent_text": _format_percent_text(pct_raw),
             "after_hours": after_hours_data,
+            "trade_time": _to_iso_time(trade_time),
+            "exchange": exchange,
+            "session": session,
+            "bid_text": str(bid_raw) if bid_raw is not None else None,
+            "ask_text": str(ask_raw) if ask_raw is not None else None,
             "source": "CNBC"
         }
     except HTTPException:

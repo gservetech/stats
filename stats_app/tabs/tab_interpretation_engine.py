@@ -27,6 +27,7 @@ class StructureLevels:
     put_wall: Optional[float] = None
     call_wall: Optional[float] = None
     magnet: Optional[float] = None
+    zero_gamma: Optional[float] = None
     box_low: Optional[float] = None
     box_high: Optional[float] = None
 
@@ -147,6 +148,8 @@ def _compute_gex_levels(symbol: str, expiry_date: Optional[str], spot: float) ->
         out.put_wall = float(levels["major_put_wall"])
     if out.call_wall is None and levels.get("major_call_wall") is not None:
         out.call_wall = float(levels["major_call_wall"])
+    if levels.get("zero_gamma") is not None:
+        out.zero_gamma = float(levels["zero_gamma"])
 
     if out.put_wall is not None and out.call_wall is not None:
         out.box_low = float(min(out.put_wall, out.call_wall))
@@ -424,7 +427,7 @@ def render_tab_interpretation_engine(
     st.markdown("## 🧠 Interpretation Engine (Any Symbol)")
     st.caption(
         "Educational context only — not investment advice. "
-        "This uses proxies (walls/magnet from GEX when available; regime from spot vs walls; "
+        "This uses proxies (walls/magnet from GEX levels; regime from spot vs walls; "
         "pressure from price+VWAP+volume proxy)."
     )
 
@@ -434,7 +437,8 @@ def render_tab_interpretation_engine(
 
     levels = _compute_gex_levels(symbol, expiry_date, spot)
     if levels is None:
-        levels = _compute_walls_and_magnet(chain_df)
+        st.warning("GEX levels unavailable for this symbol/date. Try Fetch Data again.")
+        return
     regime, regime_note = _market_regime(spot, levels)
     pressure, pressure_note, pressure_score = _pressure_proxy(hist_df, spot)
     vwap = _compute_vwap_proxy(hist_df) if hist_df is not None else None
@@ -443,11 +447,11 @@ def render_tab_interpretation_engine(
     with c1:
         st.metric("Spot", f"{spot:.2f}")
     with c2:
-        st.metric("Put Wall (Lower)", "—" if levels.put_wall is None else f"{levels.put_wall:.2f}")
+        st.metric("Put Wall (max Put OI)", "—" if levels.put_wall is None else f"{levels.put_wall:.2f}")
     with c3:
-        st.metric("Call Wall (Upper)", "—" if levels.call_wall is None else f"{levels.call_wall:.2f}")
+        st.metric("Call Wall (max Call OI)", "—" if levels.call_wall is None else f"{levels.call_wall:.2f}")
     with c4:
-        st.metric("Main Magnet", "—" if levels.magnet is None else f"{levels.magnet:.2f}")
+        st.metric("Magnet (max total OI)", "—" if levels.magnet is None else f"{levels.magnet:.2f}")
 
     if vwap is not None:
         st.write(f"**VWAP / MA proxy:** `{vwap:.2f}`")

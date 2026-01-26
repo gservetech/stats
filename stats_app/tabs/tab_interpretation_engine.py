@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from stats_app.helpers.api_client import fetch_weekly_gex
+from stats_app.helpers.calculations import build_gamma_levels
 
 # ---------------------------
 # Interpretation Engine (Educational)
@@ -108,6 +110,49 @@ def _compute_walls_and_magnet(chain_df: pd.DataFrame) -> StructureLevels:
         levels.box_high = float(max(levels.put_wall, levels.call_wall))
 
     return levels
+
+
+def _compute_gex_levels(symbol: str, expiry_date: Optional[str], spot: float) -> Optional[StructureLevels]:
+    if not symbol or not expiry_date or spot is None:
+        return None
+
+    r_val = st.session_state.get("r_in", 0.041)
+    q_val = st.session_state.get("q_in", 0.004)
+    gex_result = fetch_weekly_gex(symbol, expiry_date, spot, r=r_val, q=q_val)
+    if not gex_result.get("success"):
+        return None
+
+    gex_payload = gex_result.get("data", {})
+    gex_df = pd.DataFrame(gex_payload.get("data", []) or [])
+    if gex_df.empty:
+        return None
+
+    levels = build_gamma_levels(gex_df, spot=spot, top_n=5)
+    if not levels:
+        return None
+
+    out = StructureLevels()
+
+    magnets = levels.get("magnets")
+    if isinstance(magnets, pd.DataFrame) and not magnets.empty:
+        out.magnet = float(magnets.iloc[0]["strike"])
+
+    box = levels.get("gamma_box") or {}
+    if box.get("lower") is not None:
+        out.put_wall = float(box["lower"])
+    if box.get("upper") is not None:
+        out.call_wall = float(box["upper"])
+
+    if out.put_wall is None and levels.get("major_put_wall") is not None:
+        out.put_wall = float(levels["major_put_wall"])
+    if out.call_wall is None and levels.get("major_call_wall") is not None:
+        out.call_wall = float(levels["major_call_wall"])
+
+    if out.put_wall is not None and out.call_wall is not None:
+        out.box_low = float(min(out.put_wall, out.call_wall))
+        out.box_high = float(max(out.put_wall, out.call_wall))
+
+    return out
 
 
 def _safe_pct(x: Optional[float], y: Optional[float]) -> Optional[float]:
@@ -379,14 +424,17 @@ def render_tab_interpretation_engine(
     st.markdown("## 🧠 Interpretation Engine (Any Symbol)")
     st.caption(
         "Educational context only — not investment advice. "
-        "This uses proxies (walls/magnet from OI; regime from spot vs walls; pressure from price+VWAP+volume proxy)."
+        "This uses proxies (walls/magnet from GEX when available; regime from spot vs walls; "
+        "pressure from price+VWAP+volume proxy)."
     )
 
     if chain_df is None or chain_df.empty:
         st.info("No options chain data found for this symbol/date yet.")
         return
 
-    levels = _compute_walls_and_magnet(chain_df)
+    levels = _compute_gex_levels(symbol, expiry_date, spot)
+    if levels is None:
+        levels = _compute_walls_and_magnet(chain_df)
     regime, regime_note = _market_regime(spot, levels)
     pressure, pressure_note, pressure_score = _pressure_proxy(hist_df, spot)
     vwap = _compute_vwap_proxy(hist_df) if hist_df is not None else None
@@ -395,11 +443,11 @@ def render_tab_interpretation_engine(
     with c1:
         st.metric("Spot", f"{spot:.2f}")
     with c2:
-        st.metric("Put Wall (max Put OI)", "—" if levels.put_wall is None else f"{levels.put_wall:.2f}")
+        st.metric("Put Wall (Lower)", "—" if levels.put_wall is None else f"{levels.put_wall:.2f}")
     with c3:
-        st.metric("Call Wall (max Call OI)", "—" if levels.call_wall is None else f"{levels.call_wall:.2f}")
+        st.metric("Call Wall (Upper)", "—" if levels.call_wall is None else f"{levels.call_wall:.2f}")
     with c4:
-        st.metric("Magnet (max total OI)", "—" if levels.magnet is None else f"{levels.magnet:.2f}")
+        st.metric("Main Magnet", "—" if levels.magnet is None else f"{levels.magnet:.2f}")
 
     if vwap is not None:
         st.write(f"**VWAP / MA proxy:** `{vwap:.2f}`")

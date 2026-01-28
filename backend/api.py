@@ -695,6 +695,26 @@ async def scrape_spot(symbol: str, date: str | None = None):
                 "change": _to_float(after_change_raw, 0.0),
                 "percent_change": _to_float(after_pct_raw, 0.0),
             }
+        else:
+            ext = (
+                quote.get("ExtendedMktQuote")
+                or quote.get("extendedMktQuote")
+                or quote.get("ExtendedMarketQuote")
+                or quote.get("extendedMarketQuote")
+            )
+            if isinstance(ext, dict):
+                ext_last_raw = _first_present(ext, ["last", "lastPrice", "last_price", "price", "lastTrade", "lastSale"])
+                ext_change_raw = _first_present(ext, ["change", "priceChange", "netChange", "changePoints", "lastChange"])
+                ext_pct_raw = _first_present(ext, ["change_pct", "changePct", "changePercent", "percentChange", "pctChange", "percent_change"])
+                ext_last = _to_float(ext_last_raw, None)
+                if ext_last is not None:
+                    after_hours_data = {
+                        "price": ext_last,
+                        "change": _to_float(ext_change_raw, 0.0),
+                        "percent_change": _to_float(ext_pct_raw, 0.0),
+                        "session": ext.get("type"),
+                        "time": ext.get("last_time") or ext.get("last_timedate"),
+                    }
 
         trade_time = _first_present(quote, ["last_time", "last_time_msec", "lastTime", "lastTimeMsec", "lastTradeTime", "tradeTime"])
         exchange = _first_present(quote, ["exchange", "exchangeName", "exchange_name"])
@@ -887,6 +907,7 @@ async def get_spot(
         "change_text": data.get("change_text"),
         "percent_change": data.get("percent_change"),
         "percent_text": data.get("percent_text"),
+        "after_hours": data.get("after_hours"),
         "trade_time": data.get("trade_time"),
         "exchange": data.get("exchange"),
         "session": data.get("session"),

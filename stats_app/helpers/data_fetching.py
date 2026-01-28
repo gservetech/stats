@@ -177,6 +177,26 @@ def get_spot_from_cnbc(symbol: str) -> dict | None:
                 "change": _parse_float(after_change_raw, 0.0),
                 "percent_change": _parse_float(after_pct_raw, 0.0),
             }
+        else:
+            ext = (
+                quote.get("ExtendedMktQuote")
+                or quote.get("extendedMktQuote")
+                or quote.get("ExtendedMarketQuote")
+                or quote.get("extendedMarketQuote")
+            )
+            if isinstance(ext, dict):
+                ext_last_raw = _first_present(ext, ["last", "lastPrice", "last_price", "price", "lastTrade", "lastSale"])
+                ext_change_raw = _first_present(ext, ["change", "priceChange", "netChange", "changePoints", "lastChange"])
+                ext_pct_raw = _first_present(ext, ["change_pct", "changePct", "changePercent", "percentChange", "pctChange", "percent_change"])
+                ext_last = _parse_float(ext_last_raw)
+                if ext_last is not None:
+                    after_hours_data = {
+                        "price": ext_last,
+                        "change": _parse_float(ext_change_raw, 0.0),
+                        "percent_change": _parse_float(ext_pct_raw, 0.0),
+                        "session": ext.get("type"),
+                        "time": ext.get("last_time") or ext.get("last_timedate"),
+                    }
 
         return {
             "spot": price,

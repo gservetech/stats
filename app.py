@@ -93,8 +93,19 @@ def main():
     with st.sidebar:
         st.markdown("## 🔍 Options Query")
         symbol = st.text_input("Symbol", value="MU").upper().strip()
-        expiry_date = st.date_input("Expiration Date", value=dt.date.today())
-        date = expiry_date.isoformat()
+        def _next_friday(d: dt.date) -> dt.date:
+            days_ahead = (4 - d.weekday()) % 7
+            return d + dt.timedelta(days=days_ahead)
+
+        today = dt.date.today()
+        default_friday = _next_friday(today)
+        expiry_date = st.date_input("Expiration Date", value=default_friday)
+
+        # Always use the next Friday for calculations (e.g., if user picks Saturday)
+        effective_expiry = _next_friday(expiry_date)
+        if effective_expiry != expiry_date:
+            st.caption(f"Using next Friday: {effective_expiry.isoformat()}")
+        date = effective_expiry.isoformat()
 
         spot_source = st.selectbox("Spot Price Source", options=["CNBC", "Manual"])
         refresh_spot_btn = st_btn("🔄 Refresh Spot")

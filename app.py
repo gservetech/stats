@@ -190,6 +190,7 @@ def main():
         # Always enable the button; show status instead of disabling.
         if not api_ok:
             st.warning("Backend health check failed. Fetch may fail or be slow.")
+        st.caption(f"Backend: {API_BASE_URL}")
         fetch_btn = st_btn("🔄 Fetch Data")
 
     # --------- reset session_state when symbol changes (prevents stale mixing) ---------
@@ -206,10 +207,27 @@ def main():
     # Data Fetching Logic
     if fetch_btn:
         with st.spinner("Analyzing market structure..."):
+            st.session_state["last_fetch_errors"] = []
             st.session_state["options_result"] = fetch_options(symbol, date)
             st.session_state["weekly_result"] = fetch_weekly_summary(symbol, date, spot)
             st.session_state["hist_df"] = fetch_price_history(symbol).copy()
             st.session_state["spot_at_fetch"] = spot
+
+            options_result = st.session_state.get("options_result") or {}
+            if not options_result.get("success"):
+                st.session_state["last_fetch_errors"].append(
+                    f"Options fetch failed: {options_result.get('error', 'No response')}"
+                )
+
+            weekly_result = st.session_state.get("weekly_result") or {}
+            if not weekly_result.get("success"):
+                st.session_state["last_fetch_errors"].append(
+                    f"Weekly summary failed: {weekly_result.get('error', 'No response')}"
+                )
+
+    if st.session_state.get("last_fetch_errors"):
+        for msg in st.session_state["last_fetch_errors"]:
+            st.error(msg)
 
     options_result = st.session_state.get("options_result")
     weekly_result = st.session_state.get("weekly_result")

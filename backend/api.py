@@ -480,9 +480,23 @@ def build_chrome_options() -> ChromiumOptions:
     """
     opts = ChromiumOptions()
 
-    # ---- pick Chrome binary ----
+    # ---- pick Chrome/Chromium binary ----
     if sys.platform.startswith("linux"):
-        opts.binary_location = os.getenv("CHROME_BINARY", "/usr/bin/google-chrome")
+        env_bin = os.getenv("CHROME_BINARY")
+        if env_bin and os.path.exists(env_bin):
+            opts.binary_location = env_bin
+        else:
+            # Prefer stable google-chrome, then fall back to chromium variants.
+            candidates = [
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+            ]
+            for c in candidates:
+                if c and os.path.exists(c):
+                    opts.binary_location = c
+                    break
 
     elif sys.platform.startswith("win"):
         env_bin = os.getenv("CHROME_BINARY")

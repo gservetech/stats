@@ -3,12 +3,9 @@ import os
 import streamlit as st
 
 def safe_cache_data(*dargs, **dkwargs):
-    """A defensive wrapper around st.cache_data."""
+    """No-op cache wrapper: always returns the original function."""
     def _decorator(func):
-        try:
-            return st.cache_data(*dargs, **dkwargs)(func)
-        except Exception:
-            return func
+        return func
     return _decorator
 
 def get_api_base_url() -> str:

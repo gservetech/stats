@@ -204,7 +204,7 @@ def main():
         st.session_state["last_symbol"] = symbol
 
     # Data Fetching Logic
-    if fetch_btn and api_ok:
+    if fetch_btn:
         with st.spinner("Analyzing market structure..."):
             st.session_state["options_result"] = fetch_options(symbol, date)
             st.session_state["weekly_result"] = fetch_weekly_summary(symbol, date, spot)

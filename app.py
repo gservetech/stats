@@ -13,6 +13,7 @@ import time
 import plotly.graph_objects as go
 import numpy as np
 import requests
+
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -93,6 +94,7 @@ def main():
     with st.sidebar:
         st.markdown("## 🔍 Options Query")
         symbol = st.text_input("Symbol", value="MU").upper().strip()
+
         def _next_friday(d: dt.date) -> dt.date:
             days_ahead = (4 - d.weekday()) % 7
             return d + dt.timedelta(days=days_ahead)
@@ -128,9 +130,9 @@ def main():
             st.session_state[spot_err_key] = None
 
         should_refresh = (
-            refresh_spot_btn
-            or (st.session_state[spot_key] is None)
-            or (auto_refresh and (time.time() - st.session_state[spot_ts_key] >= refresh_interval))
+                refresh_spot_btn
+                or (st.session_state[spot_key] is None)
+                or (auto_refresh and (time.time() - st.session_state[spot_ts_key] >= refresh_interval))
         )
 
         if should_refresh and spot_source != "Manual" and symbol:
@@ -200,18 +202,67 @@ def main():
         st.session_state["spot_at_fetch"] = None
         st.session_state["last_symbol"] = symbol
 
-    # Data Fetching Logic
+    # -------------------------------------------------------------------------
+    # IMPROVED FETCHING LOGIC WITH RETRIES
+    # -------------------------------------------------------------------------
     if fetch_btn and api_ok:
-        with st.spinner("Analyzing market structure..."):
-            st.session_state["options_result"] = fetch_options(symbol, date)
-            st.session_state["weekly_result"] = fetch_weekly_summary(symbol, date, spot)
-            st.session_state["hist_df"] = fetch_price_history(symbol).copy()
+
+        # Helper function to retry API calls
+        def fetch_with_retry(fetch_func, func_name, max_retries=3, *args):
+            placeholder = st.empty()
+            for attempt in range(max_retries):
+                try:
+                    res = fetch_func(*args)
+                    # Check for valid dict with success=True or valid DataFrame
+                    if isinstance(res, dict) and res.get("success"):
+                        placeholder.empty()
+                        return res
+                    if isinstance(res, pd.DataFrame) and not res.empty:
+                        placeholder.empty()
+                        return res
+
+                    # If we got a result but it says error, log it
+                    err = res.get("error") if isinstance(res, dict) else "Unknown Error"
+                    if attempt < max_retries - 1:
+                        placeholder.warning(
+                            f"⚠️ {func_name} (Attempt {attempt + 1}/{max_retries}) failed: {err}. Retrying...")
+                        time.sleep(2)
+                    else:
+                        placeholder.error(f"❌ {func_name} failed: {err}")
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        placeholder.warning(
+                            f"⚠️ {func_name} (Attempt {attempt + 1}/{max_retries}) crashed: {e}. Retrying...")
+                        time.sleep(2)
+                    else:
+                        placeholder.error(f"❌ {func_name} crashed: {e}")
+            return None
+
+        with st.spinner(f"Analyzing market structure for {symbol}..."):
+            # 1. Fetch Options (Critical)
+            st.session_state["options_result"] = fetch_with_retry(
+                fetch_options, "Options Chain", 3, symbol, date
+            )
+
+            # 2. Fetch Weekly Summary (Critical)
+            st.session_state["weekly_result"] = fetch_with_retry(
+                fetch_weekly_summary, "Weekly Summary", 3, symbol, date, spot
+            )
+
+            # 3. Fetch History (Usually reliable, but good to be safe)
+            try:
+                st.session_state["hist_df"] = fetch_price_history(symbol).copy()
+            except Exception as e:
+                st.warning(f"Could not load price history: {e}")
+                st.session_state["hist_df"] = pd.DataFrame()
+
             st.session_state["spot_at_fetch"] = spot
 
     options_result = st.session_state.get("options_result")
     weekly_result = st.session_state.get("weekly_result")
     hist_df = st.session_state.get("hist_df")
 
+    # Only proceed if we actually have successful data
     if options_result and weekly_result and options_result.get("success"):
         df = pd.DataFrame(options_result["data"].get("data", []))
         w = weekly_result["data"]
@@ -252,7 +303,7 @@ def main():
                 "🔮 Friday Predictor",
                 "🧠 Friday Predictor+",
                 "🌊 Vanna/Charm",
-                "📊 Orderflow/Delta",   # ✅ added (was missing)
+                "📊 Orderflow/Delta",
                 "🧠 Interpretation",
             ]
         )
@@ -287,7 +338,11 @@ def main():
             render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
 
     else:
-        st.info("Query a symbol and click 'Fetch Data' to begin.")
+        if fetch_btn and api_ok:
+            # If we clicked fetch but ended up here, it means the retry failed.
+            st.error("Data fetch failed after multiple retries. Please check the backend connection.")
+        else:
+            st.info("Query a symbol and click 'Fetch Data' to begin.")
 
 
 if __name__ == "__main__":

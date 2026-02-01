@@ -189,7 +189,9 @@ def main():
         )
         spot = float(live_spot) if live_spot else float(spot_input)
 
-        fetch_btn = st_btn("🔄 Fetch Data", disabled=not api_ok)
+        if not api_ok:
+            st.warning("Backend health check failed. Fetch may fail or be slow.")
+        fetch_btn = st_btn("🔄 Fetch Data")
 
     # --------- reset session_state when symbol changes (prevents stale mixing) ---------
     if "last_symbol" not in st.session_state:
@@ -205,7 +207,7 @@ def main():
     # -------------------------------------------------------------------------
     # IMPROVED FETCHING LOGIC WITH RETRIES
     # -------------------------------------------------------------------------
-    if fetch_btn and api_ok:
+    if fetch_btn:
 
         # Helper function to retry API calls
         def fetch_with_retry(fetch_func, func_name, max_retries=3, *args):

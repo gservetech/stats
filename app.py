@@ -26,6 +26,7 @@ from stats_app.helpers.api_client import (
     fetch_spot_quote,
     fetch_options,
     fetch_weekly_summary,
+    fetch_weekly_gex,
     API_BASE_URL,
 )
 from stats_app.helpers.data_fetching import get_spot_from_finnhub, get_finnhub_api_key, fetch_price_history
@@ -200,6 +201,7 @@ def main():
     if st.session_state["last_symbol"] != symbol:
         st.session_state["options_result"] = None
         st.session_state["weekly_result"] = None
+        st.session_state["gex_result"] = None
         st.session_state["hist_df"] = pd.DataFrame()
         st.session_state["spot_at_fetch"] = None
         st.session_state["last_symbol"] = symbol
@@ -251,6 +253,11 @@ def main():
                 fetch_weekly_summary, "Weekly Summary", 3, symbol, date, spot
             )
 
+            # 2b. Fetch Weekly GEX (per-strike table)
+            st.session_state["gex_result"] = fetch_with_retry(
+                fetch_weekly_gex, "Weekly GEX", 3, symbol, date, spot
+            )
+
             # 3. Fetch History (Usually reliable, but good to be safe)
             try:
                 st.session_state["hist_df"] = fetch_price_history(symbol).copy()
@@ -262,6 +269,7 @@ def main():
 
     options_result = st.session_state.get("options_result")
     weekly_result = st.session_state.get("weekly_result")
+    gex_result = st.session_state.get("gex_result")
     hist_df = st.session_state.get("hist_df")
 
     # Only proceed if we actually have successful data
@@ -274,6 +282,7 @@ def main():
         top_put = pd.DataFrame(top.get("put_gex", []))
         top_net = pd.DataFrame(top.get("net_gex_abs", []))
         top_combined = pd.DataFrame(top.get("combined", []))
+        gex_df = pd.DataFrame(gex_result["data"].get("data", [])) if gex_result and gex_result.get("success") else pd.DataFrame()
 
         # Price History Expander
         with st.expander("📈 Price + Moving Averages", expanded=True):
@@ -316,7 +325,7 @@ def main():
         with t2:
             render_tab_oi_charts(df)
         with t3:
-            render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net, top_combined)
+            render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net, top_combined, gex_df)
         with t4:
             render_tab_gamma_map_filters(symbol, date, spot)
         with t5:

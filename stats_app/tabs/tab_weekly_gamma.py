@@ -1,7 +1,7 @@
 import streamlit as st
 from ..helpers.ui_components import st_df, st_plot, create_top_strikes_chart
 
-def render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net, top_combined):
+def render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net, top_combined, gex_df):
     st.subheader("📌 Weekly Gamma / GEX (Dealer Positioning)")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -57,5 +57,15 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net, to
             st_plot(create_top_strikes_chart(combined, "strike", "net_gex", "Combined Net GEX (Top Call/Put Strikes)"))
     else:
         st.info("No combined top strikes data returned.")
+
+    st.markdown("### 📚 Full Per-Strike GEX Table (all strikes)")
+    if gex_df is not None and not gex_df.empty:
+        show_df = gex_df.copy()
+        if "strike" in show_df.columns:
+            show_df = show_df.sort_values("strike")
+        with st.expander("Show full table", expanded=False):
+            st_df(show_df)
+    else:
+        st.info("No per-strike GEX data returned.")
 
     st.caption("Note: GEX is an approximation from IV + OI using Black-Scholes gamma; educational only.")

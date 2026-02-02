@@ -273,6 +273,7 @@ def main():
         top_call = pd.DataFrame(top.get("call_gex", []))
         top_put = pd.DataFrame(top.get("put_gex", []))
         top_net = pd.DataFrame(top.get("net_gex_abs", []))
+        top_combined = pd.DataFrame(top.get("combined", []))
 
         # Price History Expander
         with st.expander("📈 Price + Moving Averages", expanded=True):
@@ -315,7 +316,7 @@ def main():
         with t2:
             render_tab_oi_charts(df)
         with t3:
-            render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net)
+            render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net, top_combined)
         with t4:
             render_tab_gamma_map_filters(symbol, date, spot)
         with t5:

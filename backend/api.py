@@ -1016,6 +1016,16 @@ async def weekly_summary(
     top_net["net_gex_abs"] = net_abs.loc[top_net_idx].values
     top_net = top_net[["strike", "net_gex_abs", "net_gex"]]
 
+    # Combined view: union of top call + top put strikes with both call/put metrics.
+    combined_strikes = pd.Index(top_call["strike"]).union(top_put["strike"])
+    top_combined = gex_df[gex_df["strike"].isin(combined_strikes)].copy()
+    if not top_combined.empty:
+        top_combined["net_gex_abs"] = top_combined["net_gex"].abs()
+        top_combined = top_combined.sort_values("net_gex_abs", ascending=False)
+        top_combined = top_combined[
+            ["strike", "call_gex", "put_gex", "net_gex", "net_gex_abs", "call_oi", "put_oi", "call_vol", "put_vol"]
+        ]
+
     payload = {
         "success": True,
         "symbol": symbol,
@@ -1026,7 +1036,8 @@ async def weekly_summary(
         "top_strikes": {
             "call_gex": top_call.to_dict(orient="records"),
             "put_gex": top_put.to_dict(orient="records"),
-            "net_gex_abs": top_net.to_dict(orient="records")
+            "net_gex_abs": top_net.to_dict(orient="records"),
+            "combined": top_combined.to_dict(orient="records"),
         }
     }
     return sanitize_json(payload)

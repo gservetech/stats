@@ -994,14 +994,18 @@ async def weekly_summary(
     pcr_oi = (total_put_oi / total_call_oi) if total_call_oi > 0 else None
     pcr_vol = (total_put_vol / total_call_vol) if total_call_vol > 0 else None
 
+    total_call_gex = float(gex_df["call_gex"].sum())
+    total_put_gex = float(gex_df["put_gex"].sum())
+
     totals = {
         "call_oi": total_call_oi,
         "put_oi": total_put_oi,
         "call_volume": total_call_vol,
         "put_volume": total_put_vol,
-        "call_gex": float(gex_df["call_gex"].sum()),
-        "put_gex": float(gex_df["put_gex"].sum()),
-        "net_gex": float(gex_df["net_gex"].sum()),
+        "call_gex": total_call_gex,
+        "put_gex": total_put_gex,
+        # Keep net in the same units and explicitly compute from totals.
+        "net_gex": total_call_gex - total_put_gex,
     }
 
     top_call = gex_df.sort_values("call_gex", ascending=False).head(5)[["strike", "call_gex", "call_oi", "call_vol"]]

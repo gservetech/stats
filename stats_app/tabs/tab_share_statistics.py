@@ -38,14 +38,15 @@ def render_tab_share_statistics(
     if not stats or not stats.get("success"):
         err = stats.get("error") if isinstance(stats, dict) else None
         url = stats.get("url") if isinstance(stats, dict) else None
-        msg = err or "Share statistics unavailable."
+        st.error("Share statistics unavailable.")
+        if err:
+            st.caption(f"Error: {err}")
         if url:
-            msg = f"{msg} ({url})"
-        st.warning(msg)
-        return
-
-    if stats.get("html_error"):
-        st.info(f"Yahoo HTML parse failed, using JSON fallback. Reason: {stats['html_error']}")
+            st.caption(f"URL: {url}")
+        if st.button("Retry Share Stats", key=f"retry_share_stats_{symbol}"):
+            stats = fetch_yahoo_share_statistics(symbol)
+        if not stats or not stats.get("success"):
+            return
 
     short_shares = stats.get("short_shares")
     float_shares = stats.get("float_shares")

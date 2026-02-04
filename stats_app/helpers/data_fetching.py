@@ -592,8 +592,7 @@ def fetch_yahoo_share_statistics(symbol: str) -> dict:
         return {"success": False, "error": str(e), "url": url}
 
     if resp.status_code != 200:
-        # Fallback to Yahoo quoteSummary JSON (still Yahoo data, but not HTML)
-        return _fetch_yahoo_share_statistics_json(symbol, f"HTTP {resp.status_code}")
+        return {"success": False, "error": f"HTTP {resp.status_code}", "url": url}
 
     soup = BeautifulSoup(resp.text, "html.parser")
     section = None
@@ -604,11 +603,11 @@ def fetch_yahoo_share_statistics(symbol: str) -> dict:
                 break
 
     if not section:
-        return _fetch_yahoo_share_statistics_json(symbol, "Share Statistics section not found")
+        return {"success": False, "error": "Share Statistics section not found", "url": url}
 
     table = section.find("table")
     if not table:
-        return _fetch_yahoo_share_statistics_json(symbol, "Share Statistics table not found")
+        return {"success": False, "error": "Share Statistics table not found", "url": url}
 
     data = {}
     for row in table.find_all("tr"):

@@ -22,7 +22,12 @@ def _fmt_large(num: float | None):
         return f"{n/1e3:.2f}K"
     return f"{n:,.0f}"
 
-def render_tab_share_statistics(symbol: str, gex_df: pd.DataFrame | None = None, spot: float | None = None):
+def render_tab_share_statistics(
+    symbol: str,
+    gex_df: pd.DataFrame | None = None,
+    spot: float | None = None,
+    **_
+):
     st.markdown("### 🧾 Short Interest Context (Float / Short / Cover)")
 
     if not symbol:
@@ -87,6 +92,9 @@ def render_tab_share_statistics(symbol: str, gex_df: pd.DataFrame | None = None,
     st.markdown("---")
     st.markdown("### 🧲 Gamma Walls (GEX)")
 
+    if gex_df is not None and not isinstance(gex_df, pd.DataFrame):
+        gex_df = pd.DataFrame(gex_df)
+
     if gex_df is None or gex_df.empty:
         st.info("No per-strike GEX data available for gamma walls.")
     else:
@@ -95,10 +103,17 @@ def render_tab_share_statistics(symbol: str, gex_df: pd.DataFrame | None = None,
             if c in gex_df.columns:
                 gex_df[c] = pd.to_numeric(gex_df[c], errors="coerce").fillna(0.0)
 
-        if spot is None:
+        spot_val = None
+        if spot is not None:
+            try:
+                spot_val = float(spot)
+            except Exception:
+                spot_val = None
+
+        if spot_val is None:
             st.info("Spot price missing; showing top walls only.")
         else:
-            levels = build_gamma_levels(gex_df, spot=spot, top_n=5)
+            levels = build_gamma_levels(gex_df, spot=spot_val, top_n=5)
             if levels:
                 cA, cB, cC, cD = st.columns(4)
                 mag = float(levels['magnets'].iloc[0]['strike']) if not levels["magnets"].empty else None

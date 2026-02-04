@@ -1,8 +1,8 @@
 import streamlit as st
 import pandas as pd
 from ..helpers.data_fetching import fetch_yahoo_share_statistics
-from ..helpers.calculations import short_interest_bias
-from ..helpers.ui_components import st_df
+from ..helpers.calculations import short_interest_bias, build_gamma_levels
+from ..helpers.ui_components import st_df, st_plot, create_top_strikes_chart
 
 def _fmt_large(num: float | None):
     if num is None:
@@ -22,7 +22,7 @@ def _fmt_large(num: float | None):
         return f"{n/1e3:.2f}K"
     return f"{n:,.0f}"
 
-def render_tab_share_statistics(symbol: str):
+def render_tab_share_statistics(symbol: str, gex_df: pd.DataFrame | None = None, spot: float | None = None):
     st.markdown("### 🧾 Short Interest Context (Float / Short / Cover)")
 
     if not symbol:
@@ -83,5 +83,50 @@ def render_tab_share_statistics(symbol: str):
             st_df(df, height=320)
         else:
             st.info("No raw share statistics found.")
+
+    st.markdown("---")
+    st.markdown("### 🧲 Gamma Walls (GEX)")
+
+    if gex_df is None or gex_df.empty:
+        st.info("No per-strike GEX data available for gamma walls.")
+    else:
+        gex_df = gex_df.copy()
+        for c in ["strike", "call_gex", "put_gex", "net_gex", "gamma"]:
+            if c in gex_df.columns:
+                gex_df[c] = pd.to_numeric(gex_df[c], errors="coerce").fillna(0.0)
+
+        if spot is None:
+            st.info("Spot price missing; showing top walls only.")
+        else:
+            levels = build_gamma_levels(gex_df, spot=spot, top_n=5)
+            if levels:
+                cA, cB, cC, cD = st.columns(4)
+                mag = float(levels['magnets'].iloc[0]['strike']) if not levels["magnets"].empty else None
+                lower = levels["gamma_box"]["lower"]
+                upper = levels["gamma_box"]["upper"]
+                zg = levels.get("zero_gamma")
+
+                cA.metric("Main Magnet", f"{mag:g}" if mag is not None else "N/A")
+                cB.metric("Put Wall (Lower)", f"{lower:g}" if lower is not None else "N/A")
+                cC.metric("Call Wall (Upper)", f"{upper:g}" if upper is not None else "N/A")
+                cD.metric("Zero Gamma", f"{zg:g}" if zg is not None else "N/A")
+
+        w1, w2 = st.columns(2)
+        with w1:
+            st.markdown("**Top Call GEX**")
+            if {"strike", "call_gex"}.issubset(gex_df.columns):
+                top_call = gex_df.sort_values("call_gex", ascending=False).head(10)[["strike", "call_gex"]]
+                st_df(top_call)
+                st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"))
+            else:
+                st.info("Call GEX data not available.")
+        with w2:
+            st.markdown("**Top Put GEX**")
+            if {"strike", "put_gex"}.issubset(gex_df.columns):
+                top_put = gex_df.sort_values("put_gex", ascending=False).head(10)[["strike", "put_gex"]]
+                st_df(top_put)
+                st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"))
+            else:
+                st.info("Put GEX data not available.")
 
     st.caption("Note: Short interest is positioning context, not a standalone up/down predictor.")

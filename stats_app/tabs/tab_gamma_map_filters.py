@@ -2,9 +2,97 @@ import streamlit as st
 import pandas as pd
 from ..helpers.api_client import fetch_weekly_gex
 from ..helpers.calculations import build_gamma_levels
-from ..helpers.ui_components import st_plot
+from ..helpers.ui_components import st_plot, st_df, create_top_strikes_chart
 from ..helpers.filters import plot_filters, kalman_message
 from ..helpers.data_fetching import fetch_price_history
+
+def short_interest_bias(
+    short_shares: float,
+    float_shares: float,
+    avg_vol_10d: float | None = None,
+    short_shares_prior: float | None = None,
+    short_ratio: float | None = None
+):
+    """
+    Returns a lightweight bias signal based on short interest.
+    This is NOT a price prediction - it's positioning context.
+    """
+
+    # Guardrails
+    if not float_shares or float_shares <= 0:
+        return {"label": "N/A", "direction": "Unknown", "score": 0, "notes": ["Float missing/invalid."]}
+
+    short_pct_float = (short_shares / float_shares) * 100.0
+
+    # Core scoring: higher short% can mean bearish positioning OR squeeze potential,
+    # but "direction" depends on trend/flow elsewhere. We'll label it as "crowding".
+    score = 0
+    notes = []
+
+    # Short % of float tiers (crowding)
+    if short_pct_float < 3:
+        score += 1
+        notes.append(f"Low short interest ({short_pct_float:.2f}% of float) -> not a strong bearish signal.")
+    elif short_pct_float < 8:
+        score += 0
+        notes.append(f"Moderate short interest ({short_pct_float:.2f}% of float) -> mixed/neutral.")
+    elif short_pct_float < 15:
+        score -= 1
+        notes.append(f"High short interest ({short_pct_float:.2f}% of float) -> bearish positioning / squeeze watch.")
+    else:
+        score -= 2
+        notes.append(f"Very high short interest ({short_pct_float:.2f}% of float) -> crowded short / squeeze conditions possible.")
+
+    # Days to cover / short ratio (covering pressure)
+    if short_ratio is not None:
+        if short_ratio < 2:
+            score += 1
+            notes.append(f"Low days-to-cover ({short_ratio:.2f}) -> shorts can exit easily (less squeeze fuel).")
+        elif short_ratio < 5:
+            notes.append(f"Medium days-to-cover ({short_ratio:.2f}) -> some cover pressure possible.")
+        else:
+            score -= 1
+            notes.append(f"High days-to-cover ({short_ratio:.2f}) -> potential cover pressure (squeeze risk if trend flips up).")
+
+    # Change in short shares
+    if short_shares_prior is not None and short_shares_prior > 0:
+        delta = short_shares - short_shares_prior
+        delta_pct = (delta / short_shares_prior) * 100.0
+        if delta_pct > 5:
+            score -= 1
+            notes.append(f"Shorts increased meaningfully (+{delta_pct:.2f}%).")
+        elif delta_pct < -5:
+            score += 1
+            notes.append(f"Shorts decreased meaningfully ({delta_pct:.2f}%).")
+        else:
+            notes.append(f"Shorts changed modestly ({delta_pct:+.2f}%).")
+
+    # Optional: short shares vs 10d volume proxy
+    if avg_vol_10d:
+        cover_days_proxy = short_shares / avg_vol_10d
+        notes.append(f"Cover proxy (Short/AvgVol10d): {cover_days_proxy:.2f} days")
+
+    # Translate score to label (contextual bias, not a trade signal)
+    if score >= 2:
+        direction = "Neutral -> Slightly Bullish"
+        label = "LOW SHORT PRESSURE"
+    elif score == 1:
+        direction = "Neutral"
+        label = "LIGHT SHORTING"
+    elif score == 0:
+        direction = "Neutral"
+        label = "MIXED"
+    else:
+        direction = "Neutral -> Slightly Bearish"
+        label = "RISING/HEAVIER SHORTING"
+
+    return {
+        "label": label,
+        "direction": direction,
+        "score": score,
+        "short_pct_float": short_pct_float,
+        "notes": notes
+    }
 
 def render_tab_gamma_map_filters(symbol, date, spot):
     st.subheader("⌛ Gamma Map (Magnets / Walls / Box)")
@@ -49,6 +137,11 @@ def render_tab_gamma_map_filters(symbol, date, spot):
         if gex_df.empty:
             st.warning("No per-strike GEX returned from backend.")
         else:
+            gex_df = gex_df.copy()
+            for c in ["strike", "call_gex", "put_gex", "net_gex", "gamma"]:
+                if c in gex_df.columns:
+                    gex_df[c] = pd.to_numeric(gex_df[c], errors="coerce").fillna(0.0)
+
             levels = build_gamma_levels(gex_df, spot=spot, top_n=5)
             if not levels:
                 st.warning("Could not compute gamma levels.")
@@ -65,6 +158,25 @@ def render_tab_gamma_map_filters(symbol, date, spot):
                 cD.metric("Zero Gamma", f"{zg:g}" if zg is not None else "N/A")
 
                 st_plot(plot_net_gex_map(gex_df, spot=spot, levels=levels))
+
+                st.markdown("### 🧲 Gamma Walls (Top Call/Put GEX)")
+                w1, w2 = st.columns(2)
+                with w1:
+                    st.markdown("**Top Call GEX**")
+                    if {"strike", "call_gex"}.issubset(gex_df.columns):
+                        top_call = gex_df.sort_values("call_gex", ascending=False).head(10)[["strike", "call_gex"]]
+                        st_df(top_call)
+                        st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"))
+                    else:
+                        st.info("Call GEX data not available.")
+                with w2:
+                    st.markdown("**Top Put GEX**")
+                    if {"strike", "put_gex"}.issubset(gex_df.columns):
+                        top_put = gex_df.sort_values("put_gex", ascending=False).head(10)[["strike", "put_gex"]]
+                        st_df(top_put)
+                        st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"))
+                    else:
+                        st.info("Put GEX data not available.")
 
     st.markdown("---")
     st.subheader("📈 Noise Filters (McGinley / KAMA / Kalman)")

@@ -351,7 +351,7 @@ def main():
         with t14:
             render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
         with t15:
-            render_tab_share_statistics(symbol)
+            render_tab_share_statistics(symbol, gex_df=gex_df, spot=spot)
 
     else:
         if fetch_btn and api_ok:

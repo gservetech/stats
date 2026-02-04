@@ -46,6 +46,7 @@ from stats_app.tabs.tab_friday_predictor_plus import render_tab_friday_predictor
 from stats_app.tabs.tab_vanna_charm import render_tab_vanna_charm
 from stats_app.tabs.tab_interpretation_engine import render_tab_interpretation_engine
 from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
+from stats_app.tabs.tab_share_statistics import render_tab_share_statistics
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -300,8 +301,8 @@ def main():
 
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}**")
 
-        # Tabs (14 labels for 14 tab variables)
-        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14 = st.tabs(
+        # Tabs (15 labels for 15 tab variables)
+        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15 = st.tabs(
             [
                 "📋 Chain",
                 "📊 OI",
@@ -317,6 +318,7 @@ def main():
                 "🌊 Vanna/Charm",
                 "📊 Orderflow/Delta",
                 "🧠 Interpretation",
+                "🧾 Share Stats",
             ]
         )
 
@@ -348,6 +350,8 @@ def main():
             render_tab_orderflow_delta(symbol, hist_df, spot)
         with t14:
             render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
+        with t15:
+            render_tab_share_statistics(symbol)
 
     else:
         if fetch_btn and api_ok:

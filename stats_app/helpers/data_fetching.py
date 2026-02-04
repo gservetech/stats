@@ -1,10 +1,13 @@
 import os
 import time
 import datetime as dt
+import re
+from urllib.parse import quote
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .api_client import safe_cache_data
@@ -93,6 +96,35 @@ def _parse_float(val, default=None):
         return float(s)
     except Exception:
         return default
+
+def _parse_yahoo_number(val):
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s in ("N/A", "-", "—"):
+        return None
+    s = s.replace(",", "").replace("%", "")
+    m = re.match(r"^([+-]?\d+(?:\.\d+)?)([KMBT])?$", s, flags=re.IGNORECASE)
+    if not m:
+        return None
+    num = float(m.group(1))
+    suffix = (m.group(2) or "").upper()
+    mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(suffix, 1.0)
+    return num * mult
+
+def _normalize_share_stat_label(text: str) -> str:
+    if not text:
+        return ""
+    t = re.sub(r"\s+", " ", str(text)).strip()
+    # Remove trailing footnote markers like " 3" or " 4"
+    t = re.sub(r"\s*\d+$", "", t).strip()
+    return t
+
+def _extract_paren_text(label: str) -> str | None:
+    if not label:
+        return None
+    m = re.search(r"\(([^)]*)\)", label)
+    return m.group(1).strip() if m else None
 
 def _first_present(d: dict, keys: list[str]):
     for key in keys:
@@ -538,6 +570,162 @@ def get_social_sentiment_from_finnhub(symbol: str) -> dict | None:
         if data: return data
     except Exception: pass
     return None
+
+@safe_cache_data(ttl=900, show_spinner=False)
+def fetch_yahoo_share_statistics(symbol: str) -> dict:
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return {"success": False, "error": "missing_symbol"}
+
+    safe_symbol = quote(symbol)
+    url = f"https://finance.yahoo.com/quote/{safe_symbol}/key-statistics"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://finance.yahoo.com/",
+    }
+
+    try:
+        resp = _spot_session().get(url, headers=headers, timeout=20)
+    except Exception as e:
+        return {"success": False, "error": str(e), "url": url}
+
+    if resp.status_code != 200:
+        # Fallback to Yahoo quoteSummary JSON (still Yahoo data, but not HTML)
+        return _fetch_yahoo_share_statistics_json(symbol, f"HTTP {resp.status_code}")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    section = None
+    for header in soup.find_all(["h2", "h3"]):
+        if "Share Statistics" in header.get_text(strip=True):
+            section = header.find_parent("section") or header.find_parent("div")
+            if section:
+                break
+
+    if not section:
+        return _fetch_yahoo_share_statistics_json(symbol, "Share Statistics section not found")
+
+    table = section.find("table")
+    if not table:
+        return _fetch_yahoo_share_statistics_json(symbol, "Share Statistics table not found")
+
+    data = {}
+    for row in table.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 2:
+            continue
+        label = _normalize_share_stat_label(cells[0].get_text(" ", strip=True))
+        value = cells[1].get_text(" ", strip=True)
+        if label:
+            data[label] = value
+
+    data_lower = {k.lower(): v for k, v in data.items()}
+    avg_vol_10d = _parse_yahoo_number(data_lower.get("avg vol (10 day)"))
+    float_shares = _parse_yahoo_number(data_lower.get("float"))
+
+    short_shares = None
+    short_shares_prior = None
+    short_ratio = None
+    short_shares_label = None
+    short_shares_prior_label = None
+    short_ratio_label = None
+
+    for label, value in data.items():
+        l = label.lower()
+        if l.startswith("shares short") and "prior month" in l:
+            short_shares_prior = _parse_yahoo_number(value)
+            short_shares_prior_label = label
+        elif l.startswith("shares short"):
+            short_shares = _parse_yahoo_number(value)
+            short_shares_label = label
+        elif l.startswith("short ratio"):
+            short_ratio = _parse_yahoo_number(value)
+            short_ratio_label = label
+
+    return {
+        "success": True,
+        "symbol": symbol,
+        "url": url,
+        "raw": data,
+        "avg_vol_10d": avg_vol_10d,
+        "float_shares": float_shares,
+        "short_shares": short_shares,
+        "short_shares_prior": short_shares_prior,
+        "short_ratio": short_ratio,
+        "short_shares_label": short_shares_label,
+        "short_shares_prior_label": short_shares_prior_label,
+        "short_ratio_label": short_ratio_label,
+        "short_shares_asof": _extract_paren_text(short_shares_label),
+        "short_shares_prior_asof": _extract_paren_text(short_shares_prior_label),
+        "short_ratio_asof": _extract_paren_text(short_ratio_label),
+    }
+
+def _get_yf_raw(obj, key: str):
+    if not isinstance(obj, dict):
+        return None
+    val = obj.get(key)
+    if isinstance(val, dict):
+        if "raw" in val and val["raw"] is not None:
+            return val["raw"]
+        if "fmt" in val:
+            return _parse_yahoo_number(val["fmt"])
+    return _parse_yahoo_number(val)
+
+def _fetch_yahoo_share_statistics_json(symbol: str, html_error: str | None = None) -> dict:
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return {"success": False, "error": "missing_symbol"}
+    safe_symbol = quote(symbol)
+    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{safe_symbol}?modules=defaultKeyStatistics,summaryDetail,price"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://finance.yahoo.com/",
+    }
+    try:
+        resp = _spot_session().get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return {"success": False, "error": f"HTTP {resp.status_code}", "url": url, "html_error": html_error}
+        js = resp.json()
+    except Exception as e:
+        return {"success": False, "error": str(e), "url": url, "html_error": html_error}
+
+    try:
+        result = (js.get("quoteSummary") or {}).get("result") or []
+        if not result:
+            return {"success": False, "error": "quoteSummary missing result", "url": url, "html_error": html_error}
+        block = result[0]
+        dks = block.get("defaultKeyStatistics") or {}
+        sdet = block.get("summaryDetail") or {}
+
+        avg_vol_10d = _get_yf_raw(sdet, "averageDailyVolume10Day")
+        float_shares = _get_yf_raw(dks, "floatShares")
+        short_shares = _get_yf_raw(dks, "sharesShort")
+        short_shares_prior = _get_yf_raw(dks, "sharesShortPriorMonth")
+        short_ratio = _get_yf_raw(dks, "shortRatio")
+
+        return {
+            "success": True,
+            "symbol": symbol,
+            "url": url,
+            "raw": {},
+            "avg_vol_10d": avg_vol_10d,
+            "float_shares": float_shares,
+            "short_shares": short_shares,
+            "short_shares_prior": short_shares_prior,
+            "short_ratio": short_ratio,
+            "short_shares_label": None,
+            "short_shares_prior_label": None,
+            "short_ratio_label": None,
+            "short_shares_asof": None,
+            "short_shares_prior_asof": None,
+            "short_ratio_asof": None,
+            "html_error": html_error,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "url": url, "html_error": html_error}
 
 def get_quote_peers_from_finnhub(peers: list) -> dict:
     if not peers: return {}

@@ -364,6 +364,95 @@ def build_trade_bias(trend_label: str, gex_regime: str, iv_rank_proxy: float | N
         elif iv_rank_proxy <= 30: bias.append("IV is **low** (proxy) → directional option buying can be more reasonable (still manage risk).")
     return "\n".join(bias)
 
+def short_interest_bias(
+    short_shares: float,
+    float_shares: float,
+    avg_vol_10d: float | None = None,
+    short_shares_prior: float | None = None,
+    short_ratio: float | None = None
+) -> dict:
+    def _to_float(x):
+        try:
+            if x is None:
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    short_shares = _to_float(short_shares)
+    float_shares = _to_float(float_shares)
+    avg_vol_10d = _to_float(avg_vol_10d)
+    short_shares_prior = _to_float(short_shares_prior)
+    short_ratio = _to_float(short_ratio)
+
+    notes = []
+    short_pct_float = None
+    if short_shares is not None and float_shares and float_shares > 0:
+        short_pct_float = (short_shares / float_shares) * 100.0
+        notes.append(f"Short % of float: {short_pct_float:.2f}%")
+
+    days_to_cover = short_ratio
+    if days_to_cover is None and short_shares is not None and avg_vol_10d and avg_vol_10d > 0:
+        days_to_cover = short_shares / avg_vol_10d
+        notes.append("Short ratio estimated from short shares / avg 10d volume.")
+    if days_to_cover is not None:
+        notes.append(f"Short ratio (days to cover): {days_to_cover:.2f}")
+
+    change_pct = None
+    if short_shares is not None and short_shares_prior and short_shares_prior > 0:
+        change_pct = (short_shares - short_shares_prior) / short_shares_prior * 100.0
+        notes.append(f"Short shares change vs prior: {change_pct:+.1f}%")
+
+    score = 0
+    if short_pct_float is not None:
+        if short_pct_float >= 10:
+            score += 2
+            notes.append("Short % of float is high (>=10%).")
+        elif short_pct_float >= 5:
+            score += 1
+            notes.append("Short % of float is moderate (5–10%).")
+        else:
+            score -= 1
+            notes.append("Short % of float is low (<5%).")
+
+    if days_to_cover is not None:
+        if days_to_cover >= 5:
+            score += 2
+            notes.append("Days to cover is high (>=5).")
+        elif days_to_cover >= 3:
+            score += 1
+            notes.append("Days to cover is moderate (3–5).")
+        elif days_to_cover < 2:
+            score -= 1
+            notes.append("Days to cover is low (<2).")
+
+    if change_pct is not None:
+        if change_pct >= 10:
+            score += 1
+            notes.append("Short interest increased materially vs prior.")
+        elif change_pct <= -10:
+            score -= 1
+            notes.append("Short interest decreased materially vs prior.")
+
+    if score >= 3:
+        direction, label = "Bearish positioning / squeeze risk", "High short interest"
+    elif score == 2:
+        direction, label = "Bearish tilt", "Elevated short interest"
+    elif score == 1:
+        direction, label = "Mildly bearish", "Moderate short interest"
+    elif score <= -2:
+        direction, label = "Light short interest", "Low short interest"
+    else:
+        direction, label = "Neutral", "Balanced short interest"
+
+    return {
+        "short_pct_float": short_pct_float,
+        "direction": direction,
+        "label": label,
+        "notes": notes,
+        "score": score,
+    }
+
 def confidence_score(trend_strength: int, structure_ok: bool, vol_ok: bool, gex_ok: bool, or_ok: bool) -> int:
     score = int(trend_strength * 0.4) + (15 if structure_ok else 0) + (15 if vol_ok else 0) + (20 if gex_ok else 0) + (10 if or_ok else 0)
     return int(min(100, score))

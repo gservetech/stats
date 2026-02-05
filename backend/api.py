@@ -25,6 +25,8 @@ import re
 import os
 import sys
 import math
+import threading
+import subprocess
 from io import StringIO
 from time import time
 from datetime import datetime
@@ -47,6 +49,19 @@ import numpy as np
 import requests
 from pydoll.browser import Chrome
 from pydoll.browser.options import ChromiumOptions
+from bs4 import BeautifulSoup
+
+# Ensure Playwright installs browsers to a writable path in hosted envs
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+
+# Crawl4AI imports for Yahoo share statistics
+try:
+    from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig, CacheMode
+    CRAWL4AI_AVAILABLE = True
+except ImportError:
+    CRAWL4AI_AVAILABLE = False
+
+_PLAYWRIGHT_INSTALL_ATTEMPTED = False
 
 app = FastAPI(
     title="Barchart Options API",
@@ -86,6 +101,14 @@ _SPOT_CACHE = {}  # symbol -> {"ts": float, "data": dict}
 SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
 SPOT_STALE_SECONDS = int(os.getenv("SPOT_STALE_SECONDS", "60"))
 CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
+
+# Yahoo share statistics cache (1 hour TTL - data doesn't change frequently)
+_SHARE_STATS_CACHE = {}  # symbol -> {"ts": float, "data": dict}
+SHARE_STATS_TTL_SECONDS = int(os.getenv("SHARE_STATS_TTL_SECONDS", "3600"))
+
+# Crawl4AI concurrency (thread semaphore for sync runner)
+_CRAWL4AI_CONCURRENCY = int(os.getenv("CRAWL4AI_CONCURRENCY", "1"))
+_CRAWL4AI_THREAD_SEMAPHORE = threading.BoundedSemaphore(_CRAWL4AI_CONCURRENCY)
 _BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "2")) # Increased to 2 for production
 _BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
 _BROWSER_ACQUIRE_TIMEOUT = 100 # Max wait for a browser slot before erroring
@@ -98,6 +121,13 @@ if ZoneInfo:
         _EXPIRY_TZ = ZoneInfo(os.getenv("EXPIRY_TZ", "America/New_York"))
     except ZoneInfoNotFoundError:
         _EXPIRY_TZ = None
+
+# Playwright requires Proactor loop for subprocess on Windows
+if os.name == "nt":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 
 # Request deduplication: prevent multiple identical scrapes
 _PENDING_OPTIONS = {}  # (symbol,date) -> asyncio.Event (signals when scrape completes)
@@ -303,6 +333,122 @@ def _to_float(val, default=None):
         return default
 
 
+def _parse_yahoo_number(val):
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s in ("N/A", "-", "—"):
+        return None
+    s = s.replace(",", "").replace("%", "")
+    m = re.match(r"^([+-]?\d+(?:\.\d+)?)([KMBT])?$", s, flags=re.IGNORECASE)
+    if not m:
+        return None
+    num = float(m.group(1))
+    suffix = (m.group(2) or "").upper()
+    mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(suffix, 1.0)
+    return num * mult
+
+
+def _normalize_share_stat_label(text: str) -> str:
+    if not text:
+        return ""
+    t = re.sub(r"\s+", " ", str(text)).strip()
+    # Remove trailing footnote markers like " 3" or " 4"
+    t = re.sub(r"\s*\d+$", "", t).strip()
+    return t
+
+
+def _extract_paren_text(label: str) -> str | None:
+    if not label:
+        return None
+    m = re.search(r"\(([^)]*)\)", label)
+    return m.group(1).strip() if m else None
+
+
+def _parse_yahoo_share_statistics_html(html: str, symbol: str, url: str, source: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+    data = {}
+
+    # Yahoo layouts vary; parse all tables to find share-stat labels reliably.
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        if len(cells) < 2:
+            continue
+        label = _normalize_share_stat_label(cells[0].get_text(" ", strip=True))
+        value = cells[1].get_text(" ", strip=True)
+        if label and label not in data:
+            data[label] = value
+
+    if not data:
+        return {"success": False, "error": "No statistics tables found", "url": url}
+
+    data_lower = {k.lower(): v for k, v in data.items()}
+    avg_vol_10d = _parse_yahoo_number(data_lower.get("avg vol (10 day)"))
+    float_shares = _parse_yahoo_number(data_lower.get("float"))
+
+    short_shares = None
+    short_shares_prior = None
+    short_ratio = None
+    short_shares_label = None
+    short_shares_prior_label = None
+    short_ratio_label = None
+
+    for label, value in data.items():
+        l = label.lower()
+        if l.startswith("shares short") and "prior month" in l:
+            short_shares_prior = _parse_yahoo_number(value)
+            short_shares_prior_label = label
+        elif l.startswith("shares short"):
+            short_shares = _parse_yahoo_number(value)
+            short_shares_label = label
+        elif l.startswith("short ratio"):
+            short_ratio = _parse_yahoo_number(value)
+            short_ratio_label = label
+
+    if all(v is None for v in [avg_vol_10d, float_shares, short_shares, short_shares_prior, short_ratio]):
+        return {"success": False, "error": "Share Statistics labels not found", "url": url}
+
+    return {
+        "success": True,
+        "symbol": symbol,
+        "url": url,
+        "raw": data,
+        "avg_vol_10d": avg_vol_10d,
+        "float_shares": float_shares,
+        "short_shares": short_shares,
+        "short_shares_prior": short_shares_prior,
+        "short_ratio": short_ratio,
+        "short_shares_label": short_shares_label,
+        "short_shares_prior_label": short_shares_prior_label,
+        "short_ratio_label": short_ratio_label,
+        "short_shares_asof": _extract_paren_text(short_shares_label),
+        "short_shares_prior_asof": _extract_paren_text(short_shares_prior_label),
+        "short_ratio_asof": _extract_paren_text(short_ratio_label),
+        "source": source,
+    }
+
+
+def _should_auto_install_playwright() -> bool:
+    return os.getenv("AUTO_INSTALL_PLAYWRIGHT", "1") == "1"
+
+
+def _install_playwright_chromium() -> bool:
+    global _PLAYWRIGHT_INSTALL_ATTEMPTED
+    if _PLAYWRIGHT_INSTALL_ATTEMPTED:
+        return False
+    _PLAYWRIGHT_INSTALL_ATTEMPTED = True
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def _first_present(d: dict, keys: list[str]):
     for key in keys:
         if key in d and d[key] not in (None, ""):
@@ -416,6 +562,137 @@ def _pick(option_obj):
         "Last Trade": str(option_obj.get("tradeTime") or ""),
         "raw_trade_time": raw.get("tradeTime", 0),
     }
+
+
+# ---------------- Yahoo Share Statistics (Crawl4AI) ----------------
+# Persistent crawler instance for faster subsequent requests
+_PERSISTENT_CRAWLER = None
+_PERSISTENT_CRAWLER_LOCK = threading.Lock()
+
+
+async def _get_or_create_crawler():
+    """Get or create a persistent AsyncWebCrawler instance."""
+    global _PERSISTENT_CRAWLER
+    if _PERSISTENT_CRAWLER is not None:
+        return _PERSISTENT_CRAWLER
+    
+    browser_config = BrowserConfig(
+        headless=True,
+        verbose=False,
+        extra_args=[
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--blink-settings=imagesEnabled=false",  # Don't load images for speed
+        ],
+    )
+    
+    crawler = AsyncWebCrawler(config=browser_config)
+    await crawler.__aenter__()
+    _PERSISTENT_CRAWLER = crawler
+    return crawler
+
+
+async def _shutdown_persistent_crawler():
+    """Shutdown the persistent crawler (call on app shutdown)."""
+    global _PERSISTENT_CRAWLER
+    if _PERSISTENT_CRAWLER is not None:
+        try:
+            await _PERSISTENT_CRAWLER.__aexit__(None, None, None)
+        except Exception:
+            pass
+        _PERSISTENT_CRAWLER = None
+
+
+async def _fetch_yahoo_share_statistics_crawl4ai(symbol: str) -> dict:
+    safe_symbol = quote(symbol)
+    url = f"https://finance.yahoo.com/quote/{safe_symbol}/key-statistics"
+
+    if not CRAWL4AI_AVAILABLE:
+        return {
+            "success": False,
+            "error": "crawl4ai_not_available",
+            "detail": "crawl4ai is not installed or could not be imported",
+            "url": url,
+        }
+
+    try:
+        # Use or create persistent crawler
+        crawler = await _get_or_create_crawler()
+
+        wait_condition = """() => {
+            const text = document.body ? document.body.innerText : '';
+            return text.includes('Share Statistics') && (
+                text.includes('Avg Vol (10 day)') ||
+                text.includes('Shares Short') ||
+                text.includes('Short Ratio')
+            );
+        }"""
+
+        crawler_config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            wait_for=f"js:{wait_condition}",
+            page_timeout=30000,  # Reduced timeout since browser is already running
+        )
+
+        result = await crawler.arun(url=url, config=crawler_config)
+
+        if not result.success:
+            return {"success": False, "error": "crawl4ai_failed", "detail": "Failed to fetch page", "url": url}
+
+        html = getattr(result, "cleaned_html", None) or getattr(result, "html", None) or ""
+        if not html:
+            return {"success": False, "error": "crawl4ai_empty_html", "detail": "Empty HTML", "url": url}
+
+        return _parse_yahoo_share_statistics_html(html, symbol, url, "crawl4ai")
+    except Exception as e:
+        msg = str(e)
+        # If crawler died, reset it so next request creates a fresh one
+        global _PERSISTENT_CRAWLER
+        if "Target closed" in msg or "Browser closed" in msg or "Connection closed" in msg:
+            _PERSISTENT_CRAWLER = None
+        if "Executable doesn't exist" in msg and "playwright install" in msg:
+            return {
+                "success": False,
+                "error": "playwright_browsers_missing",
+                "detail": "Install Playwright browsers during build: `playwright install chromium`.",
+                "url": url,
+                "missing_browsers": True,
+            }
+        return {"success": False, "error": "crawl4ai_failed", "detail": msg, "url": url}
+
+
+def _crawl4ai_sync_runner(symbol: str) -> dict:
+    with _CRAWL4AI_THREAD_SEMAPHORE:
+        if os.name == "nt":
+            try:
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            except Exception:
+                pass
+        
+        # Create or reuse event loop
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(_fetch_yahoo_share_statistics_crawl4ai(symbol))
+        finally:
+            # Don't close the loop - keep crawler alive
+            pass
+        
+        if (
+            not result.get("success")
+            and result.get("missing_browsers")
+            and _should_auto_install_playwright()
+        ):
+            if _install_playwright_chromium():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    result = loop.run_until_complete(_fetch_yahoo_share_statistics_crawl4ai(symbol))
+                finally:
+                    pass
+        return result
 
 
 def process_options_data(opt_json):
@@ -887,6 +1164,7 @@ async def root():
             "/weekly/summary": "GET - PCR + GEX summary (params: symbol, date, spot)",
             "/weekly/gex": "GET - per-strike GEX (params: symbol, date, spot)",
             "/spot": "GET - spot quote (params: symbol, date optional)",
+            "/yahoo/share-statistics": "GET - Yahoo share statistics (params: symbol)",
             "/health": "GET - Health check"
         },
         "example": "/options?symbol=AAPL&date=2026-01-16"
@@ -935,6 +1213,30 @@ async def get_spot(
         "fetched_at": datetime.now().isoformat(),
     }
     return sanitize_json(payload)
+
+
+@app.get("/yahoo/share-statistics")
+async def yahoo_share_statistics(
+    symbol: str = Query(..., description="Stock symbol (e.g., AAPL, TSLA, MU)"),
+):
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        return {"success": False, "error": "missing_symbol"}
+
+    now = time()
+    hit = _SHARE_STATS_CACHE.get(symbol)
+    if hit and (now - hit["ts"]) < SHARE_STATS_TTL_SECONDS:
+        return sanitize_json(hit["data"])
+
+    try:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _crawl4ai_sync_runner, symbol)
+    except RuntimeError:
+        # If no running loop (unlikely here), run directly
+        result = _crawl4ai_sync_runner(symbol)
+    if result.get("success"):
+        _SHARE_STATS_CACHE[symbol] = {"ts": time(), "data": result}
+    return sanitize_json(result)
 
 
 @app.get("/options")

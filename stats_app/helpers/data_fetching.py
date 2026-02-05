@@ -2,26 +2,14 @@ import os
 import time
 import datetime as dt
 import re
-import asyncio
 from urllib.parse import quote
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
-from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from .api_client import safe_cache_data
-
-# Ensure Playwright installs browsers to a writable path in hosted envs
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
-
-# Crawl4AI imports for reliable scraping
-try:
-    from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig, CacheMode
-    CRAWL4AI_AVAILABLE = True
-except ImportError:
-    CRAWL4AI_AVAILABLE = False
+from .api_client import safe_cache_data, fetch_share_statistics
 
 _SPOT_SESSION = None
 
@@ -107,35 +95,6 @@ def _parse_float(val, default=None):
         return float(s)
     except Exception:
         return default
-
-def _parse_yahoo_number(val):
-    if val is None:
-        return None
-    s = str(val).strip()
-    if not s or s in ("N/A", "-", "—"):
-        return None
-    s = s.replace(",", "").replace("%", "")
-    m = re.match(r"^([+-]?\d+(?:\.\d+)?)([KMBT])?$", s, flags=re.IGNORECASE)
-    if not m:
-        return None
-    num = float(m.group(1))
-    suffix = (m.group(2) or "").upper()
-    mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(suffix, 1.0)
-    return num * mult
-
-def _normalize_share_stat_label(text: str) -> str:
-    if not text:
-        return ""
-    t = re.sub(r"\s+", " ", str(text)).strip()
-    # Remove trailing footnote markers like " 3" or " 4"
-    t = re.sub(r"\s*\d+$", "", t).strip()
-    return t
-
-def _extract_paren_text(label: str) -> str | None:
-    if not label:
-        return None
-    m = re.search(r"\(([^)]*)\)", label)
-    return m.group(1).strip() if m else None
 
 def _first_present(d: dict, keys: list[str]):
     for key in keys:
@@ -582,177 +541,19 @@ def get_social_sentiment_from_finnhub(symbol: str) -> dict | None:
     except Exception: pass
     return None
 
-def _parse_yahoo_share_statistics_html(html: str, symbol: str, url: str, source: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
-    data = {}
-
-    # Yahoo layouts vary; parse all tables to find share-stat labels reliably.
-    for row in soup.find_all("tr"):
-        cells = row.find_all(["td", "th"])
-        if len(cells) < 2:
-            continue
-        label = _normalize_share_stat_label(cells[0].get_text(" ", strip=True))
-        value = cells[1].get_text(" ", strip=True)
-        if label and label not in data:
-            data[label] = value
-
-    if not data:
-        return {"success": False, "error": "No statistics tables found", "url": url}
-
-    data_lower = {k.lower(): v for k, v in data.items()}
-    avg_vol_10d = _parse_yahoo_number(data_lower.get("avg vol (10 day)"))
-    float_shares = _parse_yahoo_number(data_lower.get("float"))
-
-    short_shares = None
-    short_shares_prior = None
-    short_ratio = None
-    short_shares_label = None
-    short_shares_prior_label = None
-    short_ratio_label = None
-
-    for label, value in data.items():
-        l = label.lower()
-        if l.startswith("shares short") and "prior month" in l:
-            short_shares_prior = _parse_yahoo_number(value)
-            short_shares_prior_label = label
-        elif l.startswith("shares short"):
-            short_shares = _parse_yahoo_number(value)
-            short_shares_label = label
-        elif l.startswith("short ratio"):
-            short_ratio = _parse_yahoo_number(value)
-            short_ratio_label = label
-
-    if all(v is None for v in [avg_vol_10d, float_shares, short_shares, short_shares_prior, short_ratio]):
-        return {"success": False, "error": "Share Statistics labels not found", "url": url}
-
-    return {
-        "success": True,
-        "symbol": symbol,
-        "url": url,
-        "raw": data,
-        "avg_vol_10d": avg_vol_10d,
-        "float_shares": float_shares,
-        "short_shares": short_shares,
-        "short_shares_prior": short_shares_prior,
-        "short_ratio": short_ratio,
-        "short_shares_label": short_shares_label,
-        "short_shares_prior_label": short_shares_prior_label,
-        "short_ratio_label": short_ratio_label,
-        "short_shares_asof": _extract_paren_text(short_shares_label),
-        "short_shares_prior_asof": _extract_paren_text(short_shares_prior_label),
-        "short_ratio_asof": _extract_paren_text(short_ratio_label),
-        "source": source,
-    }
-
-
-async def _fetch_yahoo_share_statistics_crawl4ai(symbol: str) -> dict:
-    """
-    Async function to fetch Yahoo Finance key-statistics using crawl4ai.
-    Uses a headless browser for more reliable scraping of dynamic content.
-    """
-    safe_symbol = quote(symbol)
-    url = f"https://finance.yahoo.com/quote/{safe_symbol}/key-statistics"
-
-    try:
-        # Configure browser for stealth mode
-        browser_config = BrowserConfig(
-            headless=True,
-            verbose=False,
-            extra_args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
-        )
-
-        # Wait for the Share Statistics content to render
-        wait_condition = """() => {
-            const text = document.body ? document.body.innerText : '';
-            return text.includes('Share Statistics') && (
-                text.includes('Avg Vol (10 day)') ||
-                text.includes('Shares Short') ||
-                text.includes('Short Ratio')
-            );
-        }"""
-
-        crawler_config = CrawlerRunConfig(
-            cache_mode=CacheMode.BYPASS,
-            wait_for=f"js:{wait_condition}",
-            page_timeout=45000,  # 45 seconds timeout
-        )
-
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await crawler.arun(url=url, config=crawler_config)
-
-            if not result.success:
-                return {"success": False, "error": "Crawl4AI failed to fetch page", "url": url}
-
-            html = getattr(result, "cleaned_html", None) or getattr(result, "html", None) or ""
-            if not html:
-                return {"success": False, "error": "Crawl4AI returned empty HTML", "url": url}
-
-            return _parse_yahoo_share_statistics_html(html, symbol, url, "crawl4ai")
-
-    except Exception as e:
-        msg = str(e)
-        if "Executable doesn't exist" in msg and "playwright install" in msg:
-            return {
-                "success": False,
-                "error": "playwright_browsers_missing",
-                "detail": "Install Playwright browsers during build: `playwright install chromium`.",
-                "url": url,
-            }
-        return {"success": False, "error": msg, "url": url}
-
 
 @safe_cache_data(ttl=900, show_spinner=False)
 def fetch_yahoo_share_statistics(symbol: str) -> dict:
     """
-    Fetch Yahoo Finance key-statistics using crawl4ai for reliable scraping.
-    No fallbacks: if crawl4ai is unavailable or fails, return the error.
+    Fetch Yahoo Finance key-statistics via backend API (Crawl4AI).
     """
     symbol = (symbol or "").strip().upper()
     if not symbol:
         return {"success": False, "error": "missing_symbol"}
-
-    if not CRAWL4AI_AVAILABLE:
-        return {
-            "success": False,
-            "error": "crawl4ai_not_available",
-            "detail": "crawl4ai is not installed or could not be imported",
-        }
-
-    # Playwright requires a Proactor event loop on Windows for subprocess support
-    if os.name == "nt":
-        try:
-            policy = asyncio.get_event_loop_policy()
-            if not isinstance(policy, asyncio.WindowsProactorEventLoopPolicy):
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        except Exception:
-            pass
-
-    try:
-        # Run the async function in a new event loop
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an async context, create a new loop in a thread
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, _fetch_yahoo_share_statistics_crawl4ai(symbol))
-                    result = future.result(timeout=60)
-            else:
-                result = loop.run_until_complete(_fetch_yahoo_share_statistics_crawl4ai(symbol))
-        except RuntimeError:
-            # No event loop exists, create one
-            result = asyncio.run(_fetch_yahoo_share_statistics_crawl4ai(symbol))
-
-        return result
-    except Exception as e:
-        detail = str(e)
-        if isinstance(e, NotImplementedError):
-            return {
-                "success": False,
-                "error": "playwright_subprocess_not_supported",
-                "detail": "Playwright needs a Proactor event loop on Windows (subprocess support).",
-            }
-        return {"success": False, "error": "crawl4ai_failed", "detail": detail}
+    result = fetch_share_statistics(symbol)
+    if not isinstance(result, dict):
+        return {"success": False, "error": "invalid_backend_response"}
+    return result
 
 def get_quote_peers_from_finnhub(peers: list) -> dict:
     if not peers: return {}

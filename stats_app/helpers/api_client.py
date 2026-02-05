@@ -116,3 +116,26 @@ def fetch_weekly_gex(symbol: str, date: str, spot: float, r: float = 0.05, q: fl
         return {"success": False, "error": "Cannot connect to backend.", "status_code": 503}
     except Exception as e:
         return {"success": False, "error": str(e), "status_code": 500}
+
+
+@safe_cache_data(ttl=300, show_spinner=False)
+def fetch_share_statistics(symbol: str):
+    try:
+        r = requests.get(
+            f"{API_BASE_URL}/yahoo/share-statistics",
+            params={"symbol": symbol},
+            timeout=60,
+        )
+        if r.status_code == 200:
+            return r.json()
+        try:
+            detail = r.json().get("detail", f"HTTP {r.status_code}")
+        except Exception:
+            detail = f"HTTP {r.status_code}"
+        return {"success": False, "error": detail, "status_code": r.status_code}
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": "Timeout calling backend share statistics endpoint.", "status_code": 408}
+    except requests.exceptions.ConnectionError:
+        return {"success": False, "error": "Cannot connect to backend.", "status_code": 503}
+    except Exception as e:
+        return {"success": False, "error": str(e), "status_code": 500}

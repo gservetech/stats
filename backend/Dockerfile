@@ -4,6 +4,7 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PLAYWRIGHT_BROWSERS_PATH=0
 
 # Install Chrome and dependencies using modern GPG key method
 RUN apt-get update && apt-get install -y \
@@ -43,6 +44,7 @@ WORKDIR /app
 # Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m playwright install chromium
 
 # Copy application code
 COPY api.py .

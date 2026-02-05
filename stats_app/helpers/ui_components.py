@@ -32,11 +32,11 @@ def st_df(df: pd.DataFrame, height=None, hide_index: bool = True):
         else:
             st.dataframe(df, use_container_width=True, height=int(height), hide_index=hide_index)
 
-def st_plot(fig):
+def st_plot(fig, key: str | None = None):
     try:
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", key=key)
     except TypeError:
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=key)
 
 def st_btn(label: str, disabled: bool = False, key: str | None = None):
     try:

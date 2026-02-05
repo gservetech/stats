@@ -136,7 +136,7 @@ def render_tab_share_statistics(
             if {"strike", "call_gex"}.issubset(gex_df.columns):
                 top_call = gex_df.sort_values("call_gex", ascending=False).head(10)[["strike", "call_gex"]]
                 st_df(top_call)
-                st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"))
+                st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"), key="share_stats_top_call_gex")
             else:
                 st.info("Call GEX data not available.")
         with w2:
@@ -144,7 +144,7 @@ def render_tab_share_statistics(
             if {"strike", "put_gex"}.issubset(gex_df.columns):
                 top_put = gex_df.sort_values("put_gex", ascending=False).head(10)[["strike", "put_gex"]]
                 st_df(top_put)
-                st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"))
+                st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"), key="share_stats_top_put_gex")
             else:
                 st.info("Put GEX data not available.")
 

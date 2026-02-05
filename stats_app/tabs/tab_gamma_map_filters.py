@@ -149,7 +149,7 @@ def render_tab_gamma_map_filters(symbol, date, spot):
                 cC.metric("Call Wall (Upper)", f"{art['call_wall']:g}" if art["call_wall"] is not None else "N/A")
                 cD.metric("Spot Used", f"{art['spot_used']:.2f}" if art["spot_used"] is not None else "N/A")
 
-                st_plot(plot_net_gex_map(gex_df, spot=spot, art=art))
+                st_plot(plot_net_gex_map(gex_df, spot=spot, art=art), key="gamma_map_net_gex")
 
                 st.markdown("### 🧲 Gamma Walls (Top Call/Put GEX)")
                 w1, w2 = st.columns(2)
@@ -162,7 +162,7 @@ def render_tab_gamma_map_filters(symbol, date, spot):
                     if not top_call.empty:
                         st_df(top_call)
                         if {"strike", "call_gex"}.issubset(top_call.columns):
-                            st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"))
+                            st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"), key="gamma_map_top_call_gex")
                     else:
                         st.info("Call GEX data not available.")
                 with w2:
@@ -170,7 +170,7 @@ def render_tab_gamma_map_filters(symbol, date, spot):
                     if not top_put.empty:
                         st_df(top_put)
                         if {"strike", "put_gex"}.issubset(top_put.columns):
-                            st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"))
+                            st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"), key="gamma_map_top_put_gex")
                     else:
                         st.info("Put GEX data not available.")
 

@@ -54,7 +54,7 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, gex_df, art=None):
         if not top_call.empty:
             st_df(top_call)
             if {"strike", "call_gex"}.issubset(top_call.columns):
-                st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"))
+                st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"), key="weekly_gamma_top_call_gex")
         else:
             st.info("No top call GEX data returned.")
 
@@ -63,7 +63,7 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, gex_df, art=None):
         if not top_put.empty:
             st_df(top_put)
             if {"strike", "put_gex"}.issubset(top_put.columns):
-                st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"))
+                st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"), key="weekly_gamma_top_put_gex")
         else:
             st.info("No top put GEX data returned.")
 
@@ -79,7 +79,7 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, gex_df, art=None):
             y_col = "net_gex"
             title = "Top Net GEX (Directional)"
             if {"strike", y_col}.issubset(top_net.columns):
-                st_plot(create_top_strikes_chart(top_net, "strike", y_col, title))
+                st_plot(create_top_strikes_chart(top_net, "strike", y_col, title), key="weekly_gamma_top_net_gex")
         else:
             st.info("No top net GEX data returned.")
 
@@ -99,7 +99,7 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, gex_df, art=None):
             top_combined = top_combined.sort_values("net_gex_abs", ascending=False)
             st_df(top_combined)
             if {"strike", "net_gex"}.issubset(top_combined.columns):
-                st_plot(create_top_strikes_chart(top_combined, "strike", "net_gex", "Combined Net GEX (Top Call/Put Strikes)"))
+                st_plot(create_top_strikes_chart(top_combined, "strike", "net_gex", "Combined Net GEX (Top Call/Put Strikes)"), key="weekly_gamma_combined_net_gex")
         else:
             st.info("No overlapping strikes found between top call and put GEX.")
     else:

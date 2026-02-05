@@ -37,10 +37,13 @@ def render_tab_share_statistics(
     stats = fetch_yahoo_share_statistics(symbol)
     if not stats or not stats.get("success"):
         err = stats.get("error") if isinstance(stats, dict) else None
+        detail = stats.get("detail") if isinstance(stats, dict) else None
         url = stats.get("url") if isinstance(stats, dict) else None
         st.error("Share statistics unavailable.")
         if err:
             st.caption(f"Error: {err}")
+        if detail:
+            st.caption(f"Detail: {detail}")
         if url:
             st.caption(f"URL: {url}")
         if st.button("Retry Share Stats", key=f"retry_share_stats_{symbol}"):

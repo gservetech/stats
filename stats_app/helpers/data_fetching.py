@@ -2,6 +2,7 @@ import os
 import time
 import datetime as dt
 import re
+import asyncio
 from urllib.parse import quote
 import pandas as pd
 import requests
@@ -11,6 +12,13 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .api_client import safe_cache_data
+
+# Crawl4AI imports for reliable scraping
+try:
+    from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig, CacheMode
+    CRAWL4AI_AVAILABLE = True
+except ImportError:
+    CRAWL4AI_AVAILABLE = False
 
 _SPOT_SESSION = None
 
@@ -571,53 +579,22 @@ def get_social_sentiment_from_finnhub(symbol: str) -> dict | None:
     except Exception: pass
     return None
 
-@safe_cache_data(ttl=900, show_spinner=False)
-def fetch_yahoo_share_statistics(symbol: str) -> dict:
-    symbol = (symbol or "").strip().upper()
-    if not symbol:
-        return {"success": False, "error": "missing_symbol"}
-
-    safe_symbol = quote(symbol)
-    url = f"https://finance.yahoo.com/quote/{safe_symbol}/key-statistics"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://finance.yahoo.com/",
-    }
-
-    try:
-        resp = _spot_session().get(url, headers=headers, timeout=20)
-    except Exception as e:
-        return {"success": False, "error": str(e), "url": url}
-
-    if resp.status_code != 200:
-        return {"success": False, "error": f"HTTP {resp.status_code}", "url": url}
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    section = None
-    for header in soup.find_all(["h2", "h3"]):
-        if "Share Statistics" in header.get_text(strip=True):
-            section = header.find_parent("section") or header.find_parent("div")
-            if section:
-                break
-
-    if not section:
-        return {"success": False, "error": "Share Statistics section not found", "url": url}
-
-    table = section.find("table")
-    if not table:
-        return {"success": False, "error": "Share Statistics table not found", "url": url}
-
+def _parse_yahoo_share_statistics_html(html: str, symbol: str, url: str, source: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
     data = {}
-    for row in table.find_all("tr"):
-        cells = row.find_all("td")
+
+    # Yahoo layouts vary; parse all tables to find share-stat labels reliably.
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["td", "th"])
         if len(cells) < 2:
             continue
         label = _normalize_share_stat_label(cells[0].get_text(" ", strip=True))
         value = cells[1].get_text(" ", strip=True)
-        if label:
+        if label and label not in data:
             data[label] = value
+
+    if not data:
+        return {"success": False, "error": "No statistics tables found", "url": url}
 
     data_lower = {k.lower(): v for k, v in data.items()}
     avg_vol_10d = _parse_yahoo_number(data_lower.get("avg vol (10 day)"))
@@ -642,6 +619,9 @@ def fetch_yahoo_share_statistics(symbol: str) -> dict:
             short_ratio = _parse_yahoo_number(value)
             short_ratio_label = label
 
+    if all(v is None for v in [avg_vol_10d, float_shares, short_shares, short_shares_prior, short_ratio]):
+        return {"success": False, "error": "Share Statistics labels not found", "url": url}
+
     return {
         "success": True,
         "symbol": symbol,
@@ -658,73 +638,110 @@ def fetch_yahoo_share_statistics(symbol: str) -> dict:
         "short_shares_asof": _extract_paren_text(short_shares_label),
         "short_shares_prior_asof": _extract_paren_text(short_shares_prior_label),
         "short_ratio_asof": _extract_paren_text(short_ratio_label),
+        "source": source,
     }
 
-def _get_yf_raw(obj, key: str):
-    if not isinstance(obj, dict):
-        return None
-    val = obj.get(key)
-    if isinstance(val, dict):
-        if "raw" in val and val["raw"] is not None:
-            return val["raw"]
-        if "fmt" in val:
-            return _parse_yahoo_number(val["fmt"])
-    return _parse_yahoo_number(val)
 
-def _fetch_yahoo_share_statistics_json(symbol: str, html_error: str | None = None) -> dict:
+async def _fetch_yahoo_share_statistics_crawl4ai(symbol: str) -> dict:
+    """
+    Async function to fetch Yahoo Finance key-statistics using crawl4ai.
+    Uses a headless browser for more reliable scraping of dynamic content.
+    """
+    safe_symbol = quote(symbol)
+    url = f"https://finance.yahoo.com/quote/{safe_symbol}/key-statistics"
+
+    try:
+        # Configure browser for stealth mode
+        browser_config = BrowserConfig(
+            headless=True,
+            verbose=False,
+            extra_args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
+
+        # Wait for the Share Statistics content to render
+        wait_condition = """() => {
+            const text = document.body ? document.body.innerText : '';
+            return text.includes('Share Statistics') && (
+                text.includes('Avg Vol (10 day)') ||
+                text.includes('Shares Short') ||
+                text.includes('Short Ratio')
+            );
+        }"""
+
+        crawler_config = CrawlerRunConfig(
+            cache_mode=CacheMode.BYPASS,
+            wait_for=f"js:{wait_condition}",
+            page_timeout=45000,  # 45 seconds timeout
+        )
+
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            result = await crawler.arun(url=url, config=crawler_config)
+
+            if not result.success:
+                return {"success": False, "error": "Crawl4AI failed to fetch page", "url": url}
+
+            html = getattr(result, "cleaned_html", None) or getattr(result, "html", None) or ""
+            if not html:
+                return {"success": False, "error": "Crawl4AI returned empty HTML", "url": url}
+
+            return _parse_yahoo_share_statistics_html(html, symbol, url, "crawl4ai")
+
+    except Exception as e:
+        return {"success": False, "error": str(e), "url": url}
+
+
+@safe_cache_data(ttl=900, show_spinner=False)
+def fetch_yahoo_share_statistics(symbol: str) -> dict:
+    """
+    Fetch Yahoo Finance key-statistics using crawl4ai for reliable scraping.
+    No fallbacks: if crawl4ai is unavailable or fails, return the error.
+    """
     symbol = (symbol or "").strip().upper()
     if not symbol:
         return {"success": False, "error": "missing_symbol"}
-    safe_symbol = quote(symbol)
-    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{safe_symbol}?modules=defaultKeyStatistics,summaryDetail,price"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": "https://finance.yahoo.com/",
-    }
-    try:
-        resp = _spot_session().get(url, headers=headers, timeout=20)
-        if resp.status_code != 200:
-            return {"success": False, "error": f"HTTP {resp.status_code}", "url": url, "html_error": html_error}
-        js = resp.json()
-    except Exception as e:
-        return {"success": False, "error": str(e), "url": url, "html_error": html_error}
 
-    try:
-        result = (js.get("quoteSummary") or {}).get("result") or []
-        if not result:
-            return {"success": False, "error": "quoteSummary missing result", "url": url, "html_error": html_error}
-        block = result[0]
-        dks = block.get("defaultKeyStatistics") or {}
-        sdet = block.get("summaryDetail") or {}
-
-        avg_vol_10d = _get_yf_raw(sdet, "averageDailyVolume10Day")
-        float_shares = _get_yf_raw(dks, "floatShares")
-        short_shares = _get_yf_raw(dks, "sharesShort")
-        short_shares_prior = _get_yf_raw(dks, "sharesShortPriorMonth")
-        short_ratio = _get_yf_raw(dks, "shortRatio")
-
+    if not CRAWL4AI_AVAILABLE:
         return {
-            "success": True,
-            "symbol": symbol,
-            "url": url,
-            "raw": {},
-            "avg_vol_10d": avg_vol_10d,
-            "float_shares": float_shares,
-            "short_shares": short_shares,
-            "short_shares_prior": short_shares_prior,
-            "short_ratio": short_ratio,
-            "short_shares_label": None,
-            "short_shares_prior_label": None,
-            "short_ratio_label": None,
-            "short_shares_asof": None,
-            "short_shares_prior_asof": None,
-            "short_ratio_asof": None,
-            "html_error": html_error,
+            "success": False,
+            "error": "crawl4ai_not_available",
+            "detail": "crawl4ai is not installed or could not be imported",
         }
+
+    # Playwright requires a Proactor event loop on Windows for subprocess support
+    if os.name == "nt":
+        try:
+            policy = asyncio.get_event_loop_policy()
+            if not isinstance(policy, asyncio.WindowsProactorEventLoopPolicy):
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except Exception:
+            pass
+
+    try:
+        # Run the async function in a new event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If we're already in an async context, create a new loop in a thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, _fetch_yahoo_share_statistics_crawl4ai(symbol))
+                    result = future.result(timeout=60)
+            else:
+                result = loop.run_until_complete(_fetch_yahoo_share_statistics_crawl4ai(symbol))
+        except RuntimeError:
+            # No event loop exists, create one
+            result = asyncio.run(_fetch_yahoo_share_statistics_crawl4ai(symbol))
+
+        return result
     except Exception as e:
-        return {"success": False, "error": str(e), "url": url, "html_error": html_error}
+        detail = str(e)
+        if isinstance(e, NotImplementedError):
+            return {
+                "success": False,
+                "error": "playwright_subprocess_not_supported",
+                "detail": "Playwright needs a Proactor event loop on Windows (subprocess support).",
+            }
+        return {"success": False, "error": "crawl4ai_failed", "detail": detail}
 
 def get_quote_peers_from_finnhub(peers: list) -> dict:
     if not peers: return {}

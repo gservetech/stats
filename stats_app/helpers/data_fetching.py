@@ -13,6 +13,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .api_client import safe_cache_data
 
+# Ensure Playwright installs browsers to a writable path in hosted envs
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+
 # Crawl4AI imports for reliable scraping
 try:
     from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig, CacheMode
@@ -687,7 +690,15 @@ async def _fetch_yahoo_share_statistics_crawl4ai(symbol: str) -> dict:
             return _parse_yahoo_share_statistics_html(html, symbol, url, "crawl4ai")
 
     except Exception as e:
-        return {"success": False, "error": str(e), "url": url}
+        msg = str(e)
+        if "Executable doesn't exist" in msg and "playwright install" in msg:
+            return {
+                "success": False,
+                "error": "playwright_browsers_missing",
+                "detail": "Install Playwright browsers during build: `playwright install chromium`.",
+                "url": url,
+            }
+        return {"success": False, "error": msg, "url": url}
 
 
 @safe_cache_data(ttl=900, show_spinner=False)

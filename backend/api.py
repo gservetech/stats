@@ -26,7 +26,6 @@ import os
 import sys
 import math
 import threading
-import subprocess
 from io import StringIO
 from time import time
 from datetime import datetime
@@ -51,17 +50,16 @@ from pydoll.browser import Chrome
 from pydoll.browser.options import ChromiumOptions
 from bs4 import BeautifulSoup
 
+# Load environment variables from project .env if present (dev/local)
+try:
+    from dotenv import load_dotenv
+    _ROOT_DIR = Path(__file__).resolve().parents[1]
+    load_dotenv(_ROOT_DIR / ".env", override=False)
+except Exception:
+    pass
+
 # Ensure Playwright installs browsers to a writable path in hosted envs
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
-
-# Crawl4AI imports for Yahoo share statistics
-try:
-    from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig, CacheMode
-    CRAWL4AI_AVAILABLE = True
-except ImportError:
-    CRAWL4AI_AVAILABLE = False
-
-_PLAYWRIGHT_INSTALL_ATTEMPTED = False
 
 app = FastAPI(
     title="Barchart Options API",
@@ -106,9 +104,12 @@ CNBC_QUOTE_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolT
 _SHARE_STATS_CACHE = {}  # symbol -> {"ts": float, "data": dict}
 SHARE_STATS_TTL_SECONDS = int(os.getenv("SHARE_STATS_TTL_SECONDS", "3600"))
 
-# Crawl4AI concurrency (thread semaphore for sync runner)
-_CRAWL4AI_CONCURRENCY = int(os.getenv("CRAWL4AI_CONCURRENCY", "1"))
-_CRAWL4AI_THREAD_SEMAPHORE = threading.BoundedSemaphore(_CRAWL4AI_CONCURRENCY)
+# Firecrawl settings for Yahoo share statistics
+FIRECRAWL_API_URL = os.getenv("FIRECRAWL_API_URL", "https://api.firecrawl.dev/v2/scrape")
+FIRECRAWL_MAX_AGE_MS = int(os.getenv("FIRECRAWL_MAX_AGE_MS", "172800000"))
+FIRECRAWL_TIMEOUT_SECONDS = int(os.getenv("FIRECRAWL_TIMEOUT_SECONDS", "60"))
+_FIRECRAWL_CONCURRENCY = int(os.getenv("FIRECRAWL_CONCURRENCY", "2"))
+_FIRECRAWL_THREAD_SEMAPHORE = threading.BoundedSemaphore(_FIRECRAWL_CONCURRENCY)
 _BROWSER_CONCURRENCY = int(os.getenv("BROWSER_CONCURRENCY", "2")) # Increased to 2 for production
 _BROWSER_SEMAPHORE = asyncio.Semaphore(_BROWSER_CONCURRENCY)
 _BROWSER_ACQUIRE_TIMEOUT = 100 # Max wait for a browser slot before erroring
@@ -428,27 +429,6 @@ def _parse_yahoo_share_statistics_html(html: str, symbol: str, url: str, source:
     }
 
 
-def _should_auto_install_playwright() -> bool:
-    return os.getenv("AUTO_INSTALL_PLAYWRIGHT", "1") == "1"
-
-
-def _install_playwright_chromium() -> bool:
-    global _PLAYWRIGHT_INSTALL_ATTEMPTED
-    if _PLAYWRIGHT_INSTALL_ATTEMPTED:
-        return False
-    _PLAYWRIGHT_INSTALL_ATTEMPTED = True
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        return proc.returncode == 0
-    except Exception:
-        return False
-
-
 def _first_present(d: dict, keys: list[str]):
     for key in keys:
         if key in d and d[key] not in (None, ""):
@@ -564,135 +544,113 @@ def _pick(option_obj):
     }
 
 
-# ---------------- Yahoo Share Statistics (Crawl4AI) ----------------
-# Persistent crawler instance for faster subsequent requests
-_PERSISTENT_CRAWLER = None
-_PERSISTENT_CRAWLER_LOCK = threading.Lock()
+# ---------------- Yahoo Share Statistics (Firecrawl) ----------------
+def _extract_firecrawl_html(payload: dict) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    def _pick_html(obj):
+        if not isinstance(obj, dict):
+            return None
+        for key in ("html", "raw_html", "content", "page_content", "pageContent"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        return None
+
+    html = _pick_html(payload)
+    if html:
+        return html
+
+    data = payload.get("data") or payload.get("result") or payload.get("results")
+    if isinstance(data, dict):
+        html = _pick_html(data)
+        if html:
+            return html
+    elif isinstance(data, list):
+        for item in data:
+            html = _pick_html(item)
+            if html:
+                return html
+    return None
 
 
-async def _get_or_create_crawler():
-    """Get or create a persistent AsyncWebCrawler instance."""
-    global _PERSISTENT_CRAWLER
-    if _PERSISTENT_CRAWLER is not None:
-        return _PERSISTENT_CRAWLER
-    
-    browser_config = BrowserConfig(
-        headless=True,
-        verbose=False,
-        extra_args=[
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-extensions",
-            "--blink-settings=imagesEnabled=false",  # Don't load images for speed
-        ],
-    )
-    
-    crawler = AsyncWebCrawler(config=browser_config)
-    await crawler.__aenter__()
-    _PERSISTENT_CRAWLER = crawler
-    return crawler
-
-
-async def _shutdown_persistent_crawler():
-    """Shutdown the persistent crawler (call on app shutdown)."""
-    global _PERSISTENT_CRAWLER
-    if _PERSISTENT_CRAWLER is not None:
-        try:
-            await _PERSISTENT_CRAWLER.__aexit__(None, None, None)
-        except Exception:
-            pass
-        _PERSISTENT_CRAWLER = None
-
-
-async def _fetch_yahoo_share_statistics_crawl4ai(symbol: str) -> dict:
+def _fetch_yahoo_share_statistics_firecrawl(symbol: str) -> dict:
     safe_symbol = quote(symbol)
     url = f"https://finance.yahoo.com/quote/{safe_symbol}/key-statistics"
 
-    if not CRAWL4AI_AVAILABLE:
+    api_key = os.getenv("FIRECRAWL_API_KEY")
+    if not api_key:
         return {
             "success": False,
-            "error": "crawl4ai_not_available",
-            "detail": "crawl4ai is not installed or could not be imported",
+            "error": "firecrawl_api_key_missing",
+            "detail": "Set FIRECRAWL_API_KEY in the environment.",
+            "url": url,
+        }
+
+    payload = {
+        "url": url,
+        "onlyMainContent": False,
+        "maxAge": FIRECRAWL_MAX_AGE_MS,
+        "parsers": ["pdf"],
+        "formats": ["html"],
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    try:
+        resp = requests.post(
+            FIRECRAWL_API_URL,
+            json=payload,
+            headers=headers,
+            timeout=FIRECRAWL_TIMEOUT_SECONDS,
+        )
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": "firecrawl_timeout", "detail": "Request timed out", "url": url}
+    except Exception as e:
+        return {"success": False, "error": "firecrawl_failed", "detail": str(e), "url": url}
+
+    if resp.status_code >= 400:
+        detail = None
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text[:500]
+        return {
+            "success": False,
+            "error": "firecrawl_http_error",
+            "status_code": resp.status_code,
+            "detail": detail,
             "url": url,
         }
 
     try:
-        # Use or create persistent crawler
-        crawler = await _get_or_create_crawler()
-
-        wait_condition = """() => {
-            const text = document.body ? document.body.innerText : '';
-            return text.includes('Share Statistics') && (
-                text.includes('Avg Vol (10 day)') ||
-                text.includes('Shares Short') ||
-                text.includes('Short Ratio')
-            );
-        }"""
-
-        crawler_config = CrawlerRunConfig(
-            cache_mode=CacheMode.BYPASS,
-            wait_for=f"js:{wait_condition}",
-            page_timeout=30000,  # Reduced timeout since browser is already running
-        )
-
-        result = await crawler.arun(url=url, config=crawler_config)
-
-        if not result.success:
-            return {"success": False, "error": "crawl4ai_failed", "detail": "Failed to fetch page", "url": url}
-
-        html = getattr(result, "cleaned_html", None) or getattr(result, "html", None) or ""
-        if not html:
-            return {"success": False, "error": "crawl4ai_empty_html", "detail": "Empty HTML", "url": url}
-
-        return _parse_yahoo_share_statistics_html(html, symbol, url, "crawl4ai")
+        body = resp.json()
     except Exception as e:
-        msg = str(e)
-        # If crawler died, reset it so next request creates a fresh one
-        global _PERSISTENT_CRAWLER
-        if "Target closed" in msg or "Browser closed" in msg or "Connection closed" in msg:
-            _PERSISTENT_CRAWLER = None
-        if "Executable doesn't exist" in msg and "playwright install" in msg:
-            return {
-                "success": False,
-                "error": "playwright_browsers_missing",
-                "detail": "Install Playwright browsers during build: `playwright install chromium`.",
-                "url": url,
-                "missing_browsers": True,
-            }
-        return {"success": False, "error": "crawl4ai_failed", "detail": msg, "url": url}
+        return {"success": False, "error": "firecrawl_invalid_json", "detail": str(e), "url": url}
+
+    if isinstance(body, dict) and body.get("success") is False:
+        return {
+            "success": False,
+            "error": "firecrawl_failed",
+            "detail": body.get("error") or body.get("message") or body,
+            "url": url,
+        }
+
+    html = _extract_firecrawl_html(body)
+    if not html:
+        return {
+            "success": False,
+            "error": "firecrawl_empty_html",
+            "detail": "No HTML found in Firecrawl response",
+            "url": url,
+        }
+
+    return _parse_yahoo_share_statistics_html(html, symbol, url, "firecrawl")
 
 
-def _crawl4ai_sync_runner(symbol: str) -> dict:
-    with _CRAWL4AI_THREAD_SEMAPHORE:
-        if os.name == "nt":
-            try:
-                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            except Exception:
-                pass
-        
-        # Create or reuse event loop
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(_fetch_yahoo_share_statistics_crawl4ai(symbol))
-        finally:
-            # Don't close the loop - keep crawler alive
-            pass
-        
-        if (
-            not result.get("success")
-            and result.get("missing_browsers")
-            and _should_auto_install_playwright()
-        ):
-            if _install_playwright_chromium():
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    result = loop.run_until_complete(_fetch_yahoo_share_statistics_crawl4ai(symbol))
-                finally:
-                    pass
-        return result
+def _firecrawl_sync_runner(symbol: str) -> dict:
+    with _FIRECRAWL_THREAD_SEMAPHORE:
+        return _fetch_yahoo_share_statistics_firecrawl(symbol)
 
 
 def process_options_data(opt_json):
@@ -1230,10 +1188,10 @@ async def yahoo_share_statistics(
 
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _crawl4ai_sync_runner, symbol)
+        result = await loop.run_in_executor(None, _firecrawl_sync_runner, symbol)
     except RuntimeError:
         # If no running loop (unlikely here), run directly
-        result = _crawl4ai_sync_runner(symbol)
+        result = _firecrawl_sync_runner(symbol)
     if result.get("success"):
         _SHARE_STATS_CACHE[symbol] = {"ts": time(), "data": result}
     return sanitize_json(result)

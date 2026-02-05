@@ -545,7 +545,7 @@ def get_social_sentiment_from_finnhub(symbol: str) -> dict | None:
 @safe_cache_data(ttl=900, show_spinner=False)
 def fetch_yahoo_share_statistics(symbol: str) -> dict:
     """
-    Fetch Yahoo Finance key-statistics via backend API (Crawl4AI).
+    Fetch Yahoo Finance key-statistics via backend API (Firecrawl).
     """
     symbol = (symbol or "").strip().upper()
     if not symbol:

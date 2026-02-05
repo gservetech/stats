@@ -25,6 +25,7 @@ venv/
 ENV/
 env/
 .venv/
+.env
 
 # IDE
 .vscode/
@@ -38,6 +39,11 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Env files
+.env
+.env.*
+!.env.example
 
 # Data files (if any large CSVs)
 *.csv

@@ -1145,8 +1145,18 @@ async def health():
 async def get_spot(
     symbol: str = Query(..., description="Stock symbol (e.g., AAPL, $SPX, TSLA)"),
     date: str | None = Query(None, description="Optional expiration date (YYYY-MM-DD)"),
+    force_refresh: bool = Query(False, description="Bypass cache and force fresh fetch"),
 ):
-    data = await get_spot_cached(symbol, date)
+    if force_refresh:
+        # Bypass cache entirely - fetch fresh data
+        key = (symbol or "").strip().upper()
+        data = await scrape_spot(symbol, date)
+        _SPOT_CACHE[key] = {"ts": time(), "data": data}
+        data = dict(data)
+        data["cached"] = False
+        data["stale"] = False
+    else:
+        data = await get_spot_cached(symbol, date)
     payload = {
         "success": True,
         "symbol": symbol,

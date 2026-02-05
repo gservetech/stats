@@ -30,11 +30,11 @@ def check_api() -> bool:
         return False
 
 @safe_cache_data(ttl=5, show_spinner=False)
-def fetch_spot_quote(symbol: str, date: str):
+def fetch_spot_quote(symbol: str, date: str, force_refresh: bool = False):
     try:
         r = requests.get(
             f"{API_BASE_URL}/spot",
-            params={"symbol": symbol, "date": date},
+            params={"symbol": symbol, "date": date, "force_refresh": force_refresh},
             timeout=30,
         )
         if r.status_code == 200:

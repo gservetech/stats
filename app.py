@@ -142,7 +142,8 @@ def main():
             spot_error = None
 
             # 1) Prefer backend /spot (cached + stable)
-            backend = fetch_spot_quote(symbol, date)
+            # When user explicitly clicks refresh, bypass cache
+            backend = fetch_spot_quote(symbol, date, force_refresh=refresh_spot_btn)
             if backend and backend.get("success"):
                 spot_data = backend.get("data")
                 if spot_data and not spot_data.get("source"):

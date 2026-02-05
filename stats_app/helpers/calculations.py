@@ -567,6 +567,79 @@ def build_gamma_levels(gex_df: pd.DataFrame, spot: float, top_n: int = 5):
     except Exception: pass
     return {"magnets": magnets, "major_call_wall": major_call_wall, "major_put_wall": major_put_wall, "nearest_lower": nearest_lower, "nearest_upper": nearest_upper, "zero_gamma": zero_gamma, "gamma_box": {"lower": nearest_lower, "upper": nearest_upper}}
 
+
+def compute_gamma_map_artifacts(gex_df: pd.DataFrame, spot: float, top_n: int = 10):
+    """
+    Single source of truth for:
+      - gamma levels (walls / magnet / zero gamma / box)
+      - top_call/top_put/top_net tables
+    All computed from the SAME gex_df and SAME spot.
+    """
+    df = gex_df.copy()
+
+    # Normalize numeric columns safely
+    for col in ["strike", "net_gex", "call_gex", "put_gex"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    df = df.sort_values("strike")
+
+    # ---- WALLS: define them consistently ----
+    # call wall = max call_gex strike, put wall = max put_gex strike
+    call_wall = None
+    put_wall = None
+
+    if "call_gex" in df.columns and not df.empty:
+        idx = df["call_gex"].idxmax()
+        call_wall = float(df.loc[idx, "strike"]) if pd.notna(idx) else None
+
+    if "put_gex" in df.columns and not df.empty:
+        idx = df["put_gex"].idxmax()
+        put_wall = float(df.loc[idx, "strike"]) if pd.notna(idx) else None
+
+    # ---- TOP TABLES (same df) ----
+    top_call = pd.DataFrame()
+    top_put = pd.DataFrame()
+    top_net = pd.DataFrame()
+
+    if "call_gex" in df.columns:
+        top_call = df[["strike", "call_gex"]].sort_values("call_gex", ascending=False).head(top_n)
+
+    if "put_gex" in df.columns:
+        top_put = df[["strike", "put_gex"]].sort_values("put_gex", ascending=False).head(top_n)
+
+    if "net_gex" in df.columns:
+        temp = df[["strike", "net_gex"]].copy()
+        temp["net_gex_abs"] = temp["net_gex"].abs()
+        top_net = temp.sort_values("net_gex_abs", ascending=False).head(top_n)
+
+    # ---- MAGNET (max abs(net_gex) strike) ----
+    magnet = None
+    if "net_gex" in df.columns and not df.empty:
+        idx = df["net_gex"].abs().idxmax()
+        magnet = float(df.loc[idx, "strike"]) if pd.notna(idx) else None
+
+    # ---- Zero Gamma (closest to zero net_gex near spot) ----
+    zero_gamma = None
+    try:
+        df_range = df[df["strike"].between(spot * 0.8, spot * 1.2)].copy()
+        if not df_range.empty:
+            zero_gamma = float(df_range.loc[df_range["net_gex"].abs().idxmin()]["strike"])
+    except Exception:
+        pass
+
+    return {
+        "spot_used": float(spot) if spot is not None else None,
+        "call_wall": call_wall,
+        "put_wall": put_wall,
+        "magnet": magnet,
+        "zero_gamma": zero_gamma,
+        "top_call": top_call,
+        "top_put": top_put,
+        "top_net": top_net,
+        "df": df,
+    }
+
 def rsi(close: pd.Series, length: int = 14) -> pd.Series:
     delta = close.diff()
     gain, loss = delta.clip(lower=0), -delta.clip(upper=0)

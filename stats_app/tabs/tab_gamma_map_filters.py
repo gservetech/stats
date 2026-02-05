@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from ..helpers.api_client import fetch_weekly_gex
-from ..helpers.calculations import build_gamma_levels
+from ..helpers.calculations import compute_gamma_map_artifacts
 from ..helpers.ui_components import st_plot, st_df, create_top_strikes_chart
 from ..helpers.filters import plot_filters, kalman_message
 from ..helpers.data_fetching import fetch_price_history
@@ -100,7 +100,7 @@ def render_tab_gamma_map_filters(symbol, date, spot):
     # Imports for plotting inside tab
     import plotly.graph_objects as go
     
-    def plot_net_gex_map(df, spot, levels):
+    def plot_net_gex_map(df, spot, art):
         df = df.copy()
         df["net_gex"] = pd.to_numeric(df["net_gex"], errors="coerce").fillna(0.0)
         df["strike"] = pd.to_numeric(df["strike"], errors="coerce").fillna(0.0)
@@ -112,13 +112,13 @@ def render_tab_gamma_map_filters(symbol, date, spot):
         if spot:
             fig.add_vline(x=spot, line_dash="dash", line_color="white", annotation_text=f"Spot: {spot:g}")
             
-        if levels:
-            if levels.get("major_call_wall"):
-                fig.add_vline(x=levels["major_call_wall"], line_color="#00d775", line_width=2, annotation_text="Call Wall")
-            if levels.get("major_put_wall"):
-                fig.add_vline(x=levels["major_put_wall"], line_color="#ff4757", line_width=2, annotation_text="Put Wall")
-            if levels.get("zero_gamma"):
-                fig.add_vline(x=levels["zero_gamma"], line_dash="dot", line_color="orange", annotation_text="Zero Gamma")
+        if art:
+            if art.get("call_wall"):
+                fig.add_vline(x=art["call_wall"], line_color="#00d775", line_width=2, annotation_text="Call Wall")
+            if art.get("put_wall"):
+                fig.add_vline(x=art["put_wall"], line_color="#ff4757", line_width=2, annotation_text="Put Wall")
+            if art.get("zero_gamma"):
+                fig.add_vline(x=art["zero_gamma"], line_dash="dot", line_color="orange", annotation_text="Zero Gamma")
 
         fig.update_layout(template="plotly_dark", height=500, title="Net GEX by Strike (Gamma Map)", xaxis_title="Strike", yaxis_title="Net GEX ($)")
         return fig
@@ -137,44 +137,40 @@ def render_tab_gamma_map_filters(symbol, date, spot):
         if gex_df.empty:
             st.warning("No per-strike GEX returned from backend.")
         else:
-            gex_df = gex_df.copy()
-            for c in ["strike", "call_gex", "put_gex", "net_gex", "gamma"]:
-                if c in gex_df.columns:
-                    gex_df[c] = pd.to_numeric(gex_df[c], errors="coerce").fillna(0.0)
-
-            levels = build_gamma_levels(gex_df, spot=spot, top_n=5)
-            if not levels:
+            # Use the single source of truth function
+            art = compute_gamma_map_artifacts(gex_df, spot=spot, top_n=10)
+            
+            if not art:
                 st.warning("Could not compute gamma levels.")
             else:
                 cA, cB, cC, cD = st.columns(4)
-                mag = float(levels['magnets'].iloc[0]['strike']) if not levels["magnets"].empty else None
-                lower = levels["gamma_box"]["lower"]
-                upper = levels["gamma_box"]["upper"]
-                zg = levels.get("zero_gamma")
+                cA.metric("Main Magnet", f"{art['magnet']:g}" if art["magnet"] is not None else "N/A")
+                cB.metric("Put Wall (Lower)", f"{art['put_wall']:g}" if art["put_wall"] is not None else "N/A")
+                cC.metric("Call Wall (Upper)", f"{art['call_wall']:g}" if art["call_wall"] is not None else "N/A")
+                cD.metric("Spot Used", f"{art['spot_used']:.2f}" if art["spot_used"] is not None else "N/A")
 
-                cA.metric("Main Magnet", f"{mag:g}" if mag is not None else "N/A")
-                cB.metric("Put Wall (Lower)", f"{lower:g}" if lower is not None else "N/A")
-                cC.metric("Call Wall (Upper)", f"{upper:g}" if upper is not None else "N/A")
-                cD.metric("Zero Gamma", f"{zg:g}" if zg is not None else "N/A")
-
-                st_plot(plot_net_gex_map(gex_df, spot=spot, levels=levels))
+                st_plot(plot_net_gex_map(gex_df, spot=spot, art=art))
 
                 st.markdown("### 🧲 Gamma Walls (Top Call/Put GEX)")
                 w1, w2 = st.columns(2)
+                
+                top_call = art["top_call"]
+                top_put = art["top_put"]
+                
                 with w1:
                     st.markdown("**Top Call GEX**")
-                    if {"strike", "call_gex"}.issubset(gex_df.columns):
-                        top_call = gex_df.sort_values("call_gex", ascending=False).head(10)[["strike", "call_gex"]]
+                    if not top_call.empty:
                         st_df(top_call)
-                        st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"))
+                        if {"strike", "call_gex"}.issubset(top_call.columns):
+                            st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"))
                     else:
                         st.info("Call GEX data not available.")
                 with w2:
                     st.markdown("**Top Put GEX**")
-                    if {"strike", "put_gex"}.issubset(gex_df.columns):
-                        top_put = gex_df.sort_values("put_gex", ascending=False).head(10)[["strike", "put_gex"]]
+                    if not top_put.empty:
                         st_df(top_put)
-                        st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"))
+                        if {"strike", "put_gex"}.issubset(top_put.columns):
+                            st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"))
                     else:
                         st.info("Put GEX data not available.")
 

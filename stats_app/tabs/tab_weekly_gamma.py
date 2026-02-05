@@ -1,14 +1,50 @@
 import streamlit as st
 from ..helpers.ui_components import st_df, st_plot, create_top_strikes_chart
+from ..helpers.calculations import compute_gamma_map_artifacts
 
-def render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net, top_combined, gex_df):
+
+def render_tab_weekly_gamma(pcr, totals, w, spot, gex_df, art=None):
+    """
+    Render the Weekly Gamma / GEX tab.
+    
+    Args:
+        pcr: Put/Call ratio data
+        totals: Total GEX values
+        w: Weekly data dict (for spot fallback)
+        spot: Current spot price
+        gex_df: Full per-strike GEX DataFrame
+        art: Optional pre-computed gamma artifacts from compute_gamma_map_artifacts.
+             If None, will compute from gex_df.
+    """
     st.subheader("📌 Weekly Gamma / GEX (Dealer Positioning)")
+    
+    # Compute artifacts if not provided (single source of truth)
+    if art is None and gex_df is not None and not gex_df.empty:
+        art = compute_gamma_map_artifacts(gex_df, spot=spot, top_n=10)
+    
+    spot_used = art.get("spot_used") if art else (w.get("spot") or spot)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Put/Call Ratio (OI)", f"{(pcr.get('oi') or 0):.3f}" if pcr.get("oi") is not None else "N/A")
     c2.metric("Put/Call Ratio (Volume)", f"{(pcr.get('volume') or 0):.3f}" if pcr.get("volume") is not None else "N/A")
     c3.metric("Total Net GEX", f"{(totals.get('net_gex') or 0):,.0f}")
-    c4.metric("Spot Used", f"{float(w.get('spot') or spot):,.2f}")
+    c4.metric("Spot Used", f"{float(spot_used):,.2f}" if spot_used is not None else "N/A")
+
+    # Get tables from artifacts (same df, same spot)
+    top_call = art.get("top_call") if art else None
+    top_put = art.get("top_put") if art else None
+    top_net = art.get("top_net") if art else None
+    
+    # Handle legacy calls that pass these separately
+    if top_call is None:
+        import pandas as pd
+        top_call = pd.DataFrame()
+    if top_put is None:
+        import pandas as pd
+        top_put = pd.DataFrame()
+    if top_net is None:
+        import pandas as pd
+        top_net = pd.DataFrame()
 
     st.markdown("### 🧲 Top Strikes (Gamma Walls / Magnets)")
     colA, colB, colC = st.columns(3)
@@ -47,14 +83,25 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, top_call, top_put, top_net, to
         else:
             st.info("No top net GEX data returned.")
 
+    # Combined top strikes from intersecting call/put
     st.markdown("### 🧩 Combined Top Call/Put (same strikes)")
-    if top_combined is not None and not top_combined.empty:
-        combined = top_combined.copy()
-        if "net_gex_abs" in combined.columns:
-            combined = combined.sort_values("net_gex_abs", ascending=False)
-        st_df(combined)
-        if {"strike", "net_gex"}.issubset(combined.columns):
-            st_plot(create_top_strikes_chart(combined, "strike", "net_gex", "Combined Net GEX (Top Call/Put Strikes)"))
+    if not top_call.empty and not top_put.empty:
+        import pandas as pd
+        top_combined = pd.merge(
+            top_call[["strike", "call_gex"]],
+            top_put[["strike", "put_gex"]],
+            on="strike",
+            how="inner"
+        )
+        if not top_combined.empty and "call_gex" in top_combined.columns and "put_gex" in top_combined.columns:
+            top_combined["net_gex"] = top_combined["call_gex"] + top_combined["put_gex"]
+            top_combined["net_gex_abs"] = top_combined["net_gex"].abs()
+            top_combined = top_combined.sort_values("net_gex_abs", ascending=False)
+            st_df(top_combined)
+            if {"strike", "net_gex"}.issubset(top_combined.columns):
+                st_plot(create_top_strikes_chart(top_combined, "strike", "net_gex", "Combined Net GEX (Top Call/Put Strikes)"))
+        else:
+            st.info("No overlapping strikes found between top call and put GEX.")
     else:
         st.info("No combined top strikes data returned.")
 

@@ -5,27 +5,21 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    # Load environment variables from the parent directory's .env file
+    env_file:
+      - ../.env
     environment:
       - TZ=UTC
       - PYTHONUNBUFFERED=1
       - SPOT_TTL_SECONDS=15
       - SPOT_STALE_SECONDS=60
-      - BROWSER_CONCURRENCY=1
-      - OPTIONS_PAGELOAD_TIMEOUT=60
-      - OPTIONS_WAIT_SECONDS=45
-      - OPTIONS_RETRY_COUNT=1
-    # Chrome needs extra shared memory
-    shm_size: "2gb"
-    # Security options for Chrome
-    security_opt:
-      - seccomp:unconfined
     # Resource limits (adjust based on your VPS)
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 2G
         reservations:
-          memory: 1G
+          memory: 512M
     logging:
       driver: "json-file"
       options:

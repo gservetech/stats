@@ -48,6 +48,10 @@ from stats_app.tabs.tab_interpretation_engine import render_tab_interpretation_e
 from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
 from stats_app.tabs.tab_share_statistics import render_tab_share_statistics
 
+# ✅ NEW: Friday Playbook (chain-driven)
+from stats_app.tabs.tab_friday_playbook_chain import render_tab_friday_playbook_from_chain
+
+
 # Configure Streamlit Page
 st.set_page_config(
     page_title="Stats Dashboard | Options & Gamma",
@@ -132,9 +136,9 @@ def main():
             st.session_state[spot_err_key] = None
 
         should_refresh = (
-                refresh_spot_btn
-                or (st.session_state[spot_key] is None)
-                or (auto_refresh and (time.time() - st.session_state[spot_ts_key] >= refresh_interval))
+            refresh_spot_btn
+            or (st.session_state[spot_key] is None)
+            or (auto_refresh and (time.time() - st.session_state[spot_ts_key] >= refresh_interval))
         )
 
         if should_refresh and spot_source != "Manual" and symbol:
@@ -231,14 +235,16 @@ def main():
                     err = res.get("error") if isinstance(res, dict) else "Unknown Error"
                     if attempt < max_retries - 1:
                         placeholder.warning(
-                            f"⚠️ {func_name} (Attempt {attempt + 1}/{max_retries}) failed: {err}. Retrying...")
+                            f"⚠️ {func_name} (Attempt {attempt + 1}/{max_retries}) failed: {err}. Retrying..."
+                        )
                         time.sleep(2)
                     else:
                         placeholder.error(f"❌ {func_name} failed: {err}")
                 except Exception as e:
                     if attempt < max_retries - 1:
                         placeholder.warning(
-                            f"⚠️ {func_name} (Attempt {attempt + 1}/{max_retries}) crashed: {e}. Retrying...")
+                            f"⚠️ {func_name} (Attempt {attempt + 1}/{max_retries}) crashed: {e}. Retrying..."
+                        )
                         time.sleep(2)
                     else:
                         placeholder.error(f"❌ {func_name} crashed: {e}")
@@ -284,7 +290,11 @@ def main():
         top_put = pd.DataFrame(top.get("put_gex", []))
         top_net = pd.DataFrame(top.get("net_gex_abs", []))
         top_combined = pd.DataFrame(top.get("combined", []))
-        gex_df = pd.DataFrame(gex_result["data"].get("data", [])) if gex_result and gex_result.get("success") else pd.DataFrame()
+        gex_df = (
+            pd.DataFrame(gex_result["data"].get("data", []))
+            if gex_result and gex_result.get("success")
+            else pd.DataFrame()
+        )
 
         # Price History Expander
         with st.expander("📈 Price + Moving Averages", expanded=True):
@@ -302,8 +312,8 @@ def main():
 
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}**")
 
-        # Tabs (15 labels for 15 tab variables)
-        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15 = st.tabs(
+        # ✅ Tabs (NOW 16)
+        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16 = st.tabs(
             [
                 "📋 Chain",
                 "📊 OI",
@@ -316,6 +326,7 @@ def main():
                 "🎯 Vol Cone",
                 "🔮 Friday Predictor",
                 "🧠 Friday Predictor+",
+                "🧭 Friday Playbook",   # ✅ NEW TAB
                 "🌊 Vanna/Charm",
                 "📊 Orderflow/Delta",
                 "🧠 Interpretation",
@@ -341,17 +352,25 @@ def main():
             render_tab_vwap_obv(symbol)
         with t9:
             render_tab_vol_cone(symbol)
+
         with t10:
             render_tab_friday_predictor(symbol, date, hist_df, spot)
         with t11:
             render_tab_friday_predictor_plus(symbol, w, hist_df, spot)
+
+        # ✅ NEW: Friday Playbook (chain-driven)
+        # Uses your options chain df (`df`) as the "chain_df" input.
         with t12:
-            render_tab_vanna_charm(symbol, date, spot, hist_df)
+            render_tab_friday_playbook_from_chain(symbol=symbol, spot=spot, chain_df=df)
+
+        # shifted down by one
         with t13:
-            render_tab_orderflow_delta(symbol, hist_df, spot)
+            render_tab_vanna_charm(symbol, date, spot, hist_df)
         with t14:
-            render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
+            render_tab_orderflow_delta(symbol, hist_df, spot)
         with t15:
+            render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
+        with t16:
             render_tab_share_statistics(symbol, gex_df=gex_df, spot=spot)
 
     else:

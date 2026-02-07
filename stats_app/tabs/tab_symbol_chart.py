@@ -9,11 +9,12 @@ def render_symbol_chart(symbol: str):
     # Timeframe selection matching the user's list
     timeframes = ["1D", "5D", "1M", "3M", "6M", "YTD", "1Y", "5Y", "ALL"]
     
-    # Initialize session state for timeframe if not present
-    if "selected_chart_tf" not in st.session_state:
-        st.session_state["selected_chart_tf"] = "1D"
-        
-    current_tf = st.session_state["selected_chart_tf"]
+    # Keep timeframe state scoped per symbol to avoid cross-tab/symbol bleed.
+    tf_state_key = f"selected_chart_tf_{symbol}"
+    if tf_state_key not in st.session_state:
+        st.session_state[tf_state_key] = "1D"
+
+    current_tf = st.session_state[tf_state_key]
 
     # Header with Timeframe selector
     st.markdown("""
@@ -49,10 +50,11 @@ def render_symbol_chart(symbol: str):
     # Timeframe selector row
     cols = st.columns(len(timeframes) + 2)
     for i, tf in enumerate(timeframes):
-        if cols[i].button(tf, key=f"tf_btn_{tf}", width="stretch", 
+        if cols[i].button(tf, key=f"tf_btn_{symbol}_{tf}", width="stretch", 
                           type="primary" if current_tf == tf else "secondary"):
-            st.session_state["selected_chart_tf"] = tf
-            # No st.rerun() needed - fragment auto-reruns on widget interaction
+            st.session_state[tf_state_key] = tf
+            # Apply immediately in this run so fetch uses the clicked timeframe.
+            current_tf = tf
 
     # Add a spacer and a full-screen icon lookalike (placeholder)
     cols[-1].markdown("""
@@ -139,7 +141,37 @@ def render_symbol_chart(symbol: str):
             vol_series = df["close"].diff().abs().fillna(0)
         vol_label = "Activity (price-range proxy)"
 
-    vol_display = vol_series.astype(float)
+    vol_display_raw = vol_series.astype(float)
+    vol_display = vol_display_raw.copy()
+    vol_scale_note = ""
+
+    # Readability fix (stronger):
+    # - Clamp display to a robust cap when distribution is highly skewed
+    # - Lift tiny non-zero bars to a minimum visible height
+    # Hover still uses true raw volume values.
+    nonzero = vol_display_raw[vol_display_raw > 0]
+    if len(nonzero) >= 20:
+        q90 = float(np.nanquantile(nonzero, 0.90))
+        q98 = float(np.nanquantile(nonzero, 0.98))
+        skew_ratio = (q98 / q90) if q90 > 0 else np.inf
+
+        if q98 > 0:
+            if skew_ratio >= 4.0:
+                display_cap = max(q90 * 2.5, q98 * 0.6)
+            else:
+                display_cap = q98 * 1.05
+
+            vol_display = np.minimum(vol_display_raw, display_cap)
+
+            min_visible = display_cap * 0.012
+            vol_display = np.where(
+                (vol_display_raw > 0) & (vol_display < min_visible),
+                min_visible,
+                vol_display,
+            )
+
+            if np.any(vol_display_raw > display_cap):
+                vol_scale_note = " (scaled for readability; hover shows raw)"
 
     # Price axis bounds (avoid 0 baseline flattening)
     if "low" in df.columns and df["low"].notna().any():
@@ -216,8 +248,8 @@ def render_symbol_chart(symbol: str):
             x=df["date"],
             y=vol_display,
             marker_color=vol_colors,
-            name=vol_label,
-            customdata=vol_series,
+            name=f"{vol_label}{vol_scale_note}",
+            customdata=vol_display_raw,
             hovertemplate=f"{vol_label}: %{{customdata:,.0f}}",
             opacity=0.95,
             marker_line_width=0,
@@ -226,7 +258,7 @@ def render_symbol_chart(symbol: str):
     )
     volume_fig.update_layout(
         template="plotly_dark",
-        height=360,
+        height=440,
         margin=dict(l=0, r=0, t=10, b=0),
         bargap=0.0,
         bargroupgap=0.0,
@@ -253,7 +285,7 @@ def render_symbol_chart(symbol: str):
         zeroline=False,
         tickfont=dict(color="#888"),
         tickformat="~s",
-        title=dict(text=vol_label, font=dict(color="#888", size=12)),
+        title=dict(text=f"{vol_label}{vol_scale_note}", font=dict(color="#888", size=12)),
     )
 
     # Range indicator (vertical lines for day break if 5D)

@@ -422,7 +422,7 @@ def main():
         else:
             _show_core_fetch_hint()
     with t12:
-        render_tab_friday_playbook()
+        render_tab_friday_playbook(symbol, spot, df if has_core_data else pd.DataFrame())
     with t13:
         if has_core_data:
             render_tab_vanna_charm(symbol, date, spot, hist_df)

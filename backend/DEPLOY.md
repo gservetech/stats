@@ -1,5 +1,7 @@
 # Barchart Options API - VPS Deployment Guide
 
+Streamlit frontend deployment is documented separately in `DEPLOY_STREAMLIT.md` at the repository root.
+
 ## Domain: api.kdsinsured.com
 
 ## Quick Deployment Steps

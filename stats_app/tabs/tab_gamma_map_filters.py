@@ -94,7 +94,7 @@ def short_interest_bias(
         "notes": notes
     }
 
-def render_tab_gamma_map_filters(symbol, date, spot):
+def render_tab_gamma_map_filters(symbol, date, spot, gex_df_input: pd.DataFrame | None = None):
     st.subheader("⌛ Gamma Map (Magnets / Walls / Box)")
     
     # Imports for plotting inside tab
@@ -123,56 +123,62 @@ def render_tab_gamma_map_filters(symbol, date, spot):
         fig.update_layout(template="plotly_dark", height=500, title="Net GEX by Strike (Gamma Map)", xaxis_title="Strike", yaxis_title="Net GEX ($)")
         return fig
 
-    with st.spinner("Loading per-strike GEX (weekly/gex) ..."):
-        r_val = st.session_state.get("r_in", 0.041)
-        q_val = st.session_state.get("q_in", 0.004)
-        gex_result = fetch_weekly_gex(symbol, date, spot, r=r_val, q=q_val)
-
-    if not gex_result.get("success"):
-        st.warning(f"Could not load /weekly/gex: {gex_result.get('error')}")
+    gex_df = pd.DataFrame()
+    if gex_df_input is not None and not gex_df_input.empty:
+        gex_df = gex_df_input.copy()
+        st.caption("Using cached weekly GEX from main fetch (same dataset as other tabs).")
     else:
-        gex_payload = gex_result["data"]
-        gex_df = pd.DataFrame(gex_payload.get("data", []) or [])
+        with st.spinner("Loading per-strike GEX (weekly/gex) ..."):
+            r_val = st.session_state.get("r_in", 0.041)
+            q_val = st.session_state.get("q_in", 0.004)
+            gex_result = fetch_weekly_gex(symbol, date, spot, r=r_val, q=q_val)
 
-        if gex_df.empty:
-            st.warning("No per-strike GEX returned from backend.")
+        if not gex_result.get("success"):
+            st.warning(f"Could not load /weekly/gex: {gex_result.get('error')}")
         else:
-            # Use the single source of truth function
-            art = compute_gamma_map_artifacts(gex_df, spot=spot, top_n=10)
+            gex_payload = gex_result["data"]
+            gex_df = pd.DataFrame(gex_payload.get("data", []) or [])
+
+    if not gex_df.empty:
+
+        # Use the single source of truth function
+        art = compute_gamma_map_artifacts(gex_df, spot=spot, top_n=10)
+        
+        if not art:
+            st.warning("Could not compute gamma levels.")
+        else:
+            cA, cB, cC, cD = st.columns(4)
+            cA.metric("Main Magnet", f"{art['magnet']:g}" if art["magnet"] is not None else "N/A")
+            cB.metric("Put Wall (Lower)", f"{art['put_wall']:g}" if art["put_wall"] is not None else "N/A")
+            cC.metric("Call Wall (Upper)", f"{art['call_wall']:g}" if art["call_wall"] is not None else "N/A")
+            cD.metric("Spot Used", f"{art['spot_used']:.2f}" if art["spot_used"] is not None else "N/A")
+
+            st_plot(plot_net_gex_map(gex_df, spot=spot, art=art), key="gamma_map_net_gex")
+
+            st.markdown("### 🧲 Gamma Walls (Top Call/Put GEX)")
+            w1, w2 = st.columns(2)
             
-            if not art:
-                st.warning("Could not compute gamma levels.")
-            else:
-                cA, cB, cC, cD = st.columns(4)
-                cA.metric("Main Magnet", f"{art['magnet']:g}" if art["magnet"] is not None else "N/A")
-                cB.metric("Put Wall (Lower)", f"{art['put_wall']:g}" if art["put_wall"] is not None else "N/A")
-                cC.metric("Call Wall (Upper)", f"{art['call_wall']:g}" if art["call_wall"] is not None else "N/A")
-                cD.metric("Spot Used", f"{art['spot_used']:.2f}" if art["spot_used"] is not None else "N/A")
-
-                st_plot(plot_net_gex_map(gex_df, spot=spot, art=art), key="gamma_map_net_gex")
-
-                st.markdown("### 🧲 Gamma Walls (Top Call/Put GEX)")
-                w1, w2 = st.columns(2)
-                
-                top_call = art["top_call"]
-                top_put = art["top_put"]
-                
-                with w1:
-                    st.markdown("**Top Call GEX**")
-                    if not top_call.empty:
-                        st_df(top_call)
-                        if {"strike", "call_gex"}.issubset(top_call.columns):
-                            st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"), key="gamma_map_top_call_gex")
-                    else:
-                        st.info("Call GEX data not available.")
-                with w2:
-                    st.markdown("**Top Put GEX**")
-                    if not top_put.empty:
-                        st_df(top_put)
-                        if {"strike", "put_gex"}.issubset(top_put.columns):
-                            st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"), key="gamma_map_top_put_gex")
-                    else:
-                        st.info("Put GEX data not available.")
+            top_call = art["top_call"]
+            top_put = art["top_put"]
+            
+            with w1:
+                st.markdown("**Top Call GEX**")
+                if not top_call.empty:
+                    st_df(top_call)
+                    if {"strike", "call_gex"}.issubset(top_call.columns):
+                        st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"), key="gamma_map_top_call_gex")
+                else:
+                    st.info("Call GEX data not available.")
+            with w2:
+                st.markdown("**Top Put GEX**")
+                if not top_put.empty:
+                    st_df(top_put)
+                    if {"strike", "put_gex"}.issubset(top_put.columns):
+                        st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"), key="gamma_map_top_put_gex")
+                else:
+                    st.info("Put GEX data not available.")
+    else:
+        st.warning("No per-strike GEX returned from backend.")
 
     st.markdown("---")
     st.subheader("📈 Noise Filters (McGinley / KAMA / Kalman)")

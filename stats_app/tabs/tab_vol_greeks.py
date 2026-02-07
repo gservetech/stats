@@ -92,7 +92,7 @@ def render_tab_vol_greeks(df, spot, symbol, date):
         st.markdown("### 📊 Spot Move Matrix (Delta + Gamma)")
         if "Gamma" in atm:
             df_matrix = _build_spot_move_matrix(float(spot_for_greeks), float(atm.get("Call Delta", 0)), float(atm.get("Put Delta", 0)), float(atm.get("Gamma", 0)))
-            st.dataframe(df_matrix, use_container_width=True, height=300)
+            st.dataframe(df_matrix, width="stretch", height=300)
 
     st.markdown("---")
     st.subheader("🧲 Skew Analysis (25-Delta)")

@@ -27,22 +27,22 @@ def st_df(df: pd.DataFrame, height=None, hide_index: bool = True):
     try:
         st.dataframe(df, **kwargs)
     except TypeError:
-        if height is None:
-            st.dataframe(df, use_container_width=True, hide_index=hide_index)
-        else:
-            st.dataframe(df, use_container_width=True, height=int(height), hide_index=hide_index)
+        fallback_kwargs = {"hide_index": hide_index}
+        if height is not None:
+            fallback_kwargs["height"] = int(height)
+        st.dataframe(df, **fallback_kwargs)
 
 def st_plot(fig, key: str | None = None):
     try:
         st.plotly_chart(fig, width="stretch", key=key)
     except TypeError:
-        st.plotly_chart(fig, use_container_width=True, key=key)
+        st.plotly_chart(fig, key=key)
 
 def st_btn(label: str, disabled: bool = False, key: str | None = None):
     try:
         return st.button(label, width="stretch", disabled=disabled, key=key)
     except TypeError:
-        return st.button(label, use_container_width=True, disabled=disabled, key=key)
+        return st.button(label, disabled=disabled, key=key)
 
 def _parse_num(val):
     if pd.isna(val) or val == "":

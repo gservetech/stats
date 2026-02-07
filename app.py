@@ -47,6 +47,8 @@ from stats_app.tabs.tab_vanna_charm import render_tab_vanna_charm
 from stats_app.tabs.tab_interpretation_engine import render_tab_interpretation_engine
 from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
 from stats_app.tabs.tab_share_statistics import render_tab_share_statistics
+from stats_app.tabs.tab_yahoo_data import render_tab_yahoo_data
+from stats_app.tabs.tab_friday_playbook import render_tab_friday_playbook
 
 # ✅ NEW: Friday Playbook (chain-driven)
 from stats_app.tabs.tab_friday_playbook_chain import render_tab_friday_playbook_from_chain
@@ -63,6 +65,37 @@ st.set_page_config(
 
 def main():
     apply_custom_styles()
+
+    def _backend_health_state() -> tuple[bool, int]:
+        """
+        Debounced backend health check.
+        - Check less often on success.
+        - Re-check faster when failing.
+        - Track consecutive failure streak to suppress one-off warning noise.
+        """
+        now_ts = time.time()
+        last_check_ts = float(st.session_state.get("backend_health_last_check_ts", 0.0))
+        last_status = st.session_state.get("backend_health_status")
+        fail_streak = int(st.session_state.get("backend_health_fail_streak", 0))
+
+        success_interval = 30.0
+        failure_interval = 8.0
+        check_interval = failure_interval if last_status is False else success_interval
+
+        should_check = (last_status is None) or ((now_ts - last_check_ts) >= check_interval)
+        if should_check:
+            is_ok = check_api()
+            st.session_state["backend_health_last_check_ts"] = now_ts
+            st.session_state["backend_health_status"] = is_ok
+            if is_ok:
+                fail_streak = 0
+                st.session_state["backend_health_last_ok_ts"] = now_ts
+            else:
+                fail_streak += 1
+            st.session_state["backend_health_fail_streak"] = fail_streak
+            last_status = is_ok
+
+        return bool(last_status), fail_streak
 
     # Header
     st.markdown(
@@ -94,7 +127,7 @@ def main():
         unsafe_allow_html=True,
     )
 
-    api_ok = check_api()
+    api_ok, api_fail_streak = _backend_health_state()
 
     # Sidebar
     with st.sidebar:
@@ -123,6 +156,20 @@ def main():
             st_autorefresh(interval=refresh_interval * 1000, key=f"spot_refresh_{symbol}")
         elif auto_refresh and not st_autorefresh:
             st.info("Auto-refresh unavailable (missing streamlit-autorefresh).")
+
+        st.markdown("## ⏱️ Friday Stock Confirmation")
+        friday_twelve_interval = st.selectbox(
+            "TwelveData Interval",
+            options=["1min", "5min", "15min"],
+            index=1,
+        )
+        friday_twelve_outputsize = st.slider(
+            "TwelveData Candles",
+            min_value=30,
+            max_value=200,
+            value=100,
+            step=10,
+        )
 
         # --------- per-symbol spot cache (prevents symbol cross-talk) ---------
         spot_key = f"spot_data_{symbol}"
@@ -197,7 +244,10 @@ def main():
         spot = float(live_spot) if live_spot else float(spot_input)
 
         if not api_ok:
-            st.warning("Backend health check failed. Fetch may fail or be slow.")
+            if api_fail_streak >= 3:
+                st.warning("Backend health check failed repeatedly. Fetch may fail or be slow.")
+            else:
+                st.caption("Backend health check is unstable (transient). Retrying automatically.")
         fetch_btn = st_btn("🔄 Fetch Data")
 
     # --------- reset session_state when symbol changes (prevents stale mixing) ---------
@@ -280,10 +330,25 @@ def main():
     gex_result = st.session_state.get("gex_result")
     hist_df = st.session_state.get("hist_df")
 
-    # Only proceed if we actually have successful data
-    if options_result and weekly_result and options_result.get("success"):
+    # Friday Playbook only needs options-chain data, so keep this independent
+    # from weekly-summary success.
+    has_chain_data = bool(options_result and options_result.get("success"))
+    chain_df_for_playbook = (
+        pd.DataFrame(options_result["data"].get("data", []))
+        if has_chain_data
+        else pd.DataFrame()
+    )
+
+    has_core_data = bool(options_result and weekly_result and options_result.get("success"))
+    df = pd.DataFrame()
+    w = {}
+    totals, pcr = {}, {}
+    gex_df = pd.DataFrame()
+
+    if has_core_data:
         df = pd.DataFrame(options_result["data"].get("data", []))
         w = weekly_result["data"]
+<<<<<<< HEAD
         totals, pcr, top = w.get("totals", {}), w.get("pcr", {}), w.get("top_strikes", {})
 
         top_call = pd.DataFrame(top.get("call_gex", []))
@@ -295,8 +360,12 @@ def main():
             if gex_result and gex_result.get("success")
             else pd.DataFrame()
         )
+=======
+        totals = w.get("totals", {})
+        pcr = w.get("pcr", {})
+        gex_df = pd.DataFrame(gex_result["data"].get("data", [])) if gex_result and gex_result.get("success") else pd.DataFrame()
+>>>>>>> d07f80b8ca929e21ab0c57a5260403cfeb28443e
 
-        # Price History Expander
         with st.expander("📈 Price + Moving Averages", expanded=True):
             if hist_df is not None and not hist_df.empty:
                 px_df = hist_df.copy()
@@ -311,7 +380,10 @@ def main():
                 st_plot(fig_px)
 
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}**")
+    elif fetch_btn and api_ok:
+        st.error("Data fetch failed after multiple retries. Please check the backend connection.")
 
+<<<<<<< HEAD
         # ✅ Tabs (NOW 16)
         t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16 = st.tabs(
             [
@@ -333,9 +405,38 @@ def main():
                 "🧾 Share Stats",
             ]
         )
+=======
+    # Keep tabs visible even before core fetch so Yahoo tab loads instantly.
+    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17 = st.tabs(
+        [
+            "📋 Chain",
+            "📊 OI",
+            "📌 Weekly GEX",
+            "🧲 Map",
+            "🧮 Greeks",
+            "🏆 Pro Edge",
+            "🔳 Folding",
+            "📈 VWAP",
+            "🎯 Vol Cone",
+            "🔮 Friday Predictor",
+            "🧠 Friday Predictor+",
+            "📜 Friday Playbook",
+            "🌊 Vanna/Charm",
+            "📊 Orderflow/Delta",
+            "🧠 Interpretation",
+            "🧾 Share Stats",
+            "📈 Yahoo Data",
+        ]
+    )
+>>>>>>> d07f80b8ca929e21ab0c57a5260403cfeb28443e
 
-        with t1:
+    def _show_core_fetch_hint():
+        st.info("Click `🔄 Fetch Data` in the sidebar to load this tab.")
+
+    with t1:
+        if has_core_data:
             render_tab_options_chain(df)
+<<<<<<< HEAD
         with t2:
             render_tab_oi_charts(df)
         with t3:
@@ -377,8 +478,96 @@ def main():
         if fetch_btn and api_ok:
             # If we clicked fetch but ended up here, it means the retry failed.
             st.error("Data fetch failed after multiple retries. Please check the backend connection.")
+=======
+>>>>>>> d07f80b8ca929e21ab0c57a5260403cfeb28443e
         else:
-            st.info("Query a symbol and click 'Fetch Data' to begin.")
+            _show_core_fetch_hint()
+    with t2:
+        if has_core_data:
+            render_tab_oi_charts(df)
+        else:
+            _show_core_fetch_hint()
+    with t3:
+        if has_core_data:
+            render_tab_weekly_gamma(pcr, totals, w, spot, gex_df)
+        else:
+            _show_core_fetch_hint()
+    with t4:
+        if has_core_data:
+            render_tab_gamma_map_filters(
+                symbol,
+                date,
+                spot,
+                gex_df if not gex_df.empty else pd.DataFrame(),
+            )
+        else:
+            _show_core_fetch_hint()
+    with t5:
+        if has_core_data:
+            render_tab_vol_greeks(df, spot, symbol, date)
+        else:
+            _show_core_fetch_hint()
+    with t6:
+        if has_core_data:
+            render_tab_pro_edge(symbol, date, spot, hist_df, totals, df)
+        else:
+            _show_core_fetch_hint()
+    with t7:
+        if has_core_data:
+            render_tab_market_folding(symbol)
+        else:
+            _show_core_fetch_hint()
+    with t8:
+        if has_core_data:
+            render_tab_vwap_obv(symbol)
+        else:
+            _show_core_fetch_hint()
+    with t9:
+        if has_core_data:
+            render_tab_vol_cone(symbol)
+        else:
+            _show_core_fetch_hint()
+    with t10:
+        if has_core_data:
+            render_tab_friday_predictor(symbol, date, hist_df, spot)
+        else:
+            _show_core_fetch_hint()
+    with t11:
+        if has_core_data:
+            render_tab_friday_predictor_plus(symbol, w, hist_df, spot)
+        else:
+            _show_core_fetch_hint()
+    with t12:
+        render_tab_friday_playbook(
+            symbol,
+            spot,
+            chain_df_for_playbook,
+            gex_df if has_core_data and not gex_df.empty else pd.DataFrame(),
+            twelve_interval=friday_twelve_interval,
+            twelve_outputsize=friday_twelve_outputsize,
+        )
+    with t13:
+        if has_core_data:
+            render_tab_vanna_charm(symbol, date, spot, hist_df)
+        else:
+            _show_core_fetch_hint()
+    with t14:
+        if has_core_data:
+            render_tab_orderflow_delta(symbol, hist_df, spot)
+        else:
+            _show_core_fetch_hint()
+    with t15:
+        if has_core_data:
+            render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
+        else:
+            _show_core_fetch_hint()
+    with t16:
+        if has_core_data:
+            render_tab_share_statistics(symbol, gex_df=gex_df, spot=spot)
+        else:
+            _show_core_fetch_hint()
+    with t17:
+        render_tab_yahoo_data(symbol)
 
 
 if __name__ == "__main__":

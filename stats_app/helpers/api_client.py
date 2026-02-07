@@ -1,5 +1,6 @@
 import requests
 import os
+import time
 import streamlit as st
 
 def safe_cache_data(*dargs, **dkwargs):
@@ -23,11 +24,18 @@ API_BASE_URL = get_api_base_url()
 
 @safe_cache_data(ttl=15, show_spinner=False)
 def check_api() -> bool:
-    try:
-        r = requests.get(f"{API_BASE_URL}/health", timeout=5)
-        return r.status_code == 200
-    except Exception:
-        return False
+    # Retry quickly to avoid false negatives from transient local/network hiccups.
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            r = requests.get(f"{API_BASE_URL}/health", timeout=2.5)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        if attempt < max_attempts - 1:
+            time.sleep(0.25 * (attempt + 1))
+    return False
 
 @safe_cache_data(ttl=5, show_spinner=False)
 def fetch_spot_quote(symbol: str, date: str, force_refresh: bool = False):

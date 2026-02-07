@@ -60,6 +60,37 @@ st.set_page_config(
 def main():
     apply_custom_styles()
 
+    def _backend_health_state() -> tuple[bool, int]:
+        """
+        Debounced backend health check.
+        - Check less often on success.
+        - Re-check faster when failing.
+        - Track consecutive failure streak to suppress one-off warning noise.
+        """
+        now_ts = time.time()
+        last_check_ts = float(st.session_state.get("backend_health_last_check_ts", 0.0))
+        last_status = st.session_state.get("backend_health_status")
+        fail_streak = int(st.session_state.get("backend_health_fail_streak", 0))
+
+        success_interval = 30.0
+        failure_interval = 8.0
+        check_interval = failure_interval if last_status is False else success_interval
+
+        should_check = (last_status is None) or ((now_ts - last_check_ts) >= check_interval)
+        if should_check:
+            is_ok = check_api()
+            st.session_state["backend_health_last_check_ts"] = now_ts
+            st.session_state["backend_health_status"] = is_ok
+            if is_ok:
+                fail_streak = 0
+                st.session_state["backend_health_last_ok_ts"] = now_ts
+            else:
+                fail_streak += 1
+            st.session_state["backend_health_fail_streak"] = fail_streak
+            last_status = is_ok
+
+        return bool(last_status), fail_streak
+
     # Header
     st.markdown(
         """
@@ -90,7 +121,7 @@ def main():
         unsafe_allow_html=True,
     )
 
-    api_ok = check_api()
+    api_ok, api_fail_streak = _backend_health_state()
 
     # Sidebar
     with st.sidebar:
@@ -193,7 +224,10 @@ def main():
         spot = float(live_spot) if live_spot else float(spot_input)
 
         if not api_ok:
-            st.warning("Backend health check failed. Fetch may fail or be slow.")
+            if api_fail_streak >= 3:
+                st.warning("Backend health check failed repeatedly. Fetch may fail or be slow.")
+            else:
+                st.caption("Backend health check is unstable (transient). Retrying automatically.")
         fetch_btn = st_btn("🔄 Fetch Data")
 
     # --------- reset session_state when symbol changes (prevents stale mixing) ---------

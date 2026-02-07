@@ -48,6 +48,7 @@ from stats_app.tabs.tab_interpretation_engine import render_tab_interpretation_e
 from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
 from stats_app.tabs.tab_share_statistics import render_tab_share_statistics
 from stats_app.tabs.tab_yahoo_data import render_tab_yahoo_data
+from stats_app.tabs.tab_friday_playbook import render_tab_friday_playbook
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -340,7 +341,7 @@ def main():
         st.error("Data fetch failed after multiple retries. Please check the backend connection.")
 
     # Keep tabs visible even before core fetch so Yahoo tab loads instantly.
-    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16 = st.tabs(
+    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17 = st.tabs(
         [
             "📋 Chain",
             "📊 OI",
@@ -353,6 +354,7 @@ def main():
             "🎯 Vol Cone",
             "🔮 Friday Predictor",
             "🧠 Friday Predictor+",
+            "📜 Friday Playbook",
             "🌊 Vanna/Charm",
             "📊 Orderflow/Delta",
             "🧠 Interpretation",
@@ -420,26 +422,28 @@ def main():
         else:
             _show_core_fetch_hint()
     with t12:
+        render_tab_friday_playbook()
+    with t13:
         if has_core_data:
             render_tab_vanna_charm(symbol, date, spot, hist_df)
         else:
             _show_core_fetch_hint()
-    with t13:
+    with t14:
         if has_core_data:
             render_tab_orderflow_delta(symbol, hist_df, spot)
         else:
             _show_core_fetch_hint()
-    with t14:
+    with t15:
         if has_core_data:
             render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
         else:
             _show_core_fetch_hint()
-    with t15:
+    with t16:
         if has_core_data:
             render_tab_share_statistics(symbol, gex_df=gex_df, spot=spot)
         else:
             _show_core_fetch_hint()
-    with t16:
+    with t17:
         render_tab_yahoo_data(symbol)
 
 

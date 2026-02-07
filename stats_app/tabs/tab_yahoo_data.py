@@ -169,7 +169,7 @@ def _build_main_chart(df: pd.DataFrame, symbol: str, interval: str) -> go.Figure
         rows=2,
         cols=1,
         shared_xaxes=True,
-        row_heights=[0.86, 0.14],
+        row_heights=[0.78, 0.22],
         vertical_spacing=0.02,
     )
 
@@ -183,11 +183,42 @@ def _build_main_chart(df: pd.DataFrame, symbol: str, interval: str) -> go.Figure
     vol_colors = np.where(move_up, "#00c076", "#f24b5e")
 
     volume_raw = df["volume"].fillna(0).astype(float)
-    if len(volume_raw) > 0:
-        cap = float(volume_raw.quantile(0.995))
-        volume_plot = volume_raw.clip(upper=cap) if cap > 0 else volume_raw
-    else:
-        volume_plot = volume_raw
+    volume_plot = volume_raw.copy()
+    vol_scale_note = ""
+
+    # Stronger readability scaling for highly skewed volume distributions.
+    # Keep raw values for hover; only display heights are transformed.
+    nonzero = volume_raw[volume_raw > 0]
+    if len(nonzero) >= 20:
+        q90 = float(np.nanquantile(nonzero, 0.90))
+        q98 = float(np.nanquantile(nonzero, 0.98))
+        skew_ratio = (q98 / q90) if q90 > 0 else np.inf
+
+        if q98 > 0:
+            if skew_ratio >= 4.0:
+                display_cap = max(q90 * 2.5, q98 * 0.6)
+            else:
+                display_cap = q98 * 1.05
+
+            volume_plot = np.minimum(volume_raw, display_cap)
+
+            min_visible = display_cap * 0.012
+            volume_plot = np.where(
+                (volume_raw > 0) & (volume_plot < min_visible),
+                min_visible,
+                volume_plot,
+            )
+
+            if np.any(volume_raw > display_cap):
+                vol_scale_note = " (scaled)"
+
+    # Thicker bars for sparse intervals.
+    bar_kwargs = {}
+    if len(df) > 1:
+        gaps = df["datetime"].astype("int64").diff().dropna()
+        if len(gaps) > 0:
+            gap_ms = float(gaps.median()) / 1_000_000.0
+            bar_kwargs["width"] = max(int(gap_ms * 0.9), 1)
 
     fig.add_trace(
         go.Scatter(
@@ -211,9 +242,11 @@ def _build_main_chart(df: pd.DataFrame, symbol: str, interval: str) -> go.Figure
             y=volume_plot,
             marker=dict(color=vol_colors),
             customdata=volume_raw,
+            name=f"Volume{vol_scale_note}",
             opacity=0.95,
             hovertemplate="%{x}<br>Volume: %{customdata:,.0f}<extra></extra>",
             showlegend=False,
+            **bar_kwargs,
         ),
         row=2,
         col=1,
@@ -243,7 +276,7 @@ def _build_main_chart(df: pd.DataFrame, symbol: str, interval: str) -> go.Figure
     )
 
     fig.update_layout(
-        height=760,
+        height=840,
         margin=dict(l=8, r=10, t=6, b=8),
         paper_bgcolor="#0a1220",
         plot_bgcolor="#0a1220",

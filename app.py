@@ -153,6 +153,20 @@ def main():
         elif auto_refresh and not st_autorefresh:
             st.info("Auto-refresh unavailable (missing streamlit-autorefresh).")
 
+        st.markdown("## ⏱️ Friday Stock Confirmation")
+        friday_twelve_interval = st.selectbox(
+            "TwelveData Interval",
+            options=["1min", "5min", "15min"],
+            index=1,
+        )
+        friday_twelve_outputsize = st.slider(
+            "TwelveData Candles",
+            min_value=30,
+            max_value=200,
+            value=100,
+            step=10,
+        )
+
         # --------- per-symbol spot cache (prevents symbol cross-talk) ---------
         spot_key = f"spot_data_{symbol}"
         spot_ts_key = f"spot_ts_{symbol}"
@@ -392,7 +406,12 @@ def main():
             _show_core_fetch_hint()
     with t4:
         if has_core_data:
-            render_tab_gamma_map_filters(symbol, date, spot)
+            render_tab_gamma_map_filters(
+                symbol,
+                date,
+                spot,
+                gex_df if not gex_df.empty else pd.DataFrame(),
+            )
         else:
             _show_core_fetch_hint()
     with t5:
@@ -436,6 +455,8 @@ def main():
             spot,
             chain_df_for_playbook,
             gex_df if has_core_data and not gex_df.empty else pd.DataFrame(),
+            twelve_interval=friday_twelve_interval,
+            twelve_outputsize=friday_twelve_outputsize,
         )
     with t13:
         if has_core_data:

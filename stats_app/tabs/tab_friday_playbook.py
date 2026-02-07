@@ -1,28 +1,27 @@
 import os
-import time
-from datetime import datetime
 from typing import Optional, Dict, Any
 
 import pandas as pd
 import streamlit as st
 
+from ..helpers.calculations import compute_gamma_map_artifacts
 from ..helpers.ui_components import st_df
 
 try:
-    import finnhub  # optional; only used if FINNHUB_API_KEY is set
+    from twelvedata import TDClient  # optional; only used if TWELVE_API_KEY is set
 except Exception:
-    finnhub = None
+    TDClient = None
 
 
 # -----------------------------------------------------------------------------
-# Friday Playbook (Options Chain + Finnhub Stock Confirmation) — FULL FILE
+# Friday Playbook (Options Chain + TwelveData Stock Confirmation) — FULL FILE
 # -----------------------------------------------------------------------------
 # Options side (PRIMARY):
 #   - uses chain_df: call/put volume + OI + IV per strike
 #   - derives walls, magnet, flow proxy (Volume / OI)
 #
 # Stock side (CONFIRMATION):
-#   - uses Finnhub 5-min candles (Close/Volume)
+#   - uses TwelveData 5-min candles (Close/Volume)
 #   - confirms if breakout has real participation or is likely fake
 #
 # Rule:
@@ -47,9 +46,27 @@ def _fmt(x, nd=2):
         return "N/A"
 
 
+def _ensure_col(df: pd.DataFrame, canonical: str, aliases: list[str]):
+    if canonical in df.columns:
+        return
+    for a in aliases:
+        if a in df.columns:
+            df[canonical] = df[a]
+            return
+
+
 def _prep_chain_df(chain_df: pd.DataFrame) -> pd.DataFrame:
     df = chain_df.copy()
     df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+
+    # Normalize common schema variants coming from backend/API sources.
+    _ensure_col(df, "strike", ["strike_price", "k"])
+    _ensure_col(df, "call_volume", ["call_vol", "calls_volume", "c_volume"])
+    _ensure_col(df, "put_volume", ["put_vol", "puts_volume", "p_volume"])
+    _ensure_col(df, "call_open_int", ["call_oi", "calls_oi", "call_open_interest"])
+    _ensure_col(df, "put_open_int", ["put_oi", "puts_oi", "put_open_interest"])
+    _ensure_col(df, "call_iv", ["calls_iv", "call_implied_volatility", "call_ivol"])
+    _ensure_col(df, "put_iv", ["puts_iv", "put_implied_volatility", "put_ivol"])
 
     required = ["strike", "call_volume", "call_open_int", "call_iv", "put_volume", "put_open_int", "put_iv"]
     missing = [c for c in required if c not in df.columns]
@@ -59,7 +76,7 @@ def _prep_chain_df(chain_df: pd.DataFrame) -> pd.DataFrame:
     # Coerce numerics
     num_cols = [
         c for c in df.columns
-        if any(k in c for k in ["bid", "ask", "change", "volume", "open_int", "iv", "strike"])
+        if any(k in c for k in ["bid", "ask", "change", "volume", "open_int", "oi", "iv", "strike"])
     ]
     for c in num_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -87,6 +104,20 @@ def _walls_and_magnet(df: pd.DataFrame):
     magnet = _num(magnet_row["strike"], None) if magnet_row is not None else None
 
     return call_wall, put_wall, magnet, call_wall_row, put_wall_row, magnet_row
+
+
+def _gex_levels(gex_df: pd.DataFrame, spot: float):
+    if gex_df is None or gex_df.empty:
+        return None
+    art = compute_gamma_map_artifacts(gex_df, spot=spot, top_n=10)
+    if not art:
+        return None
+    return {
+        "magnet": art.get("magnet"),
+        "put_wall": art.get("put_wall"),
+        "call_wall": art.get("call_wall"),
+        "spot_used": art.get("spot_used"),
+    }
 
 
 def _near(x, y, band_pct=0.006):
@@ -169,37 +200,70 @@ def _options_vs_stock_volume_markdown():
 """
 
 
+def _get_twelve_key() -> Optional[str]:
+    try:
+        key = st.secrets.get("TWELVE_API_KEY")
+        if key:
+            return str(key)
+    except Exception:
+        pass
+    key = os.getenv("TWELVE_API_KEY", "").strip()
+    return key or None
+
+
 @st.cache_resource
-def _get_finnhub_client(api_key: str):
-    if finnhub is None:
+def _get_twelve_client(api_key: str):
+    if TDClient is None or not api_key:
         return None
-    return finnhub.Client(api_key=api_key)
+    return TDClient(apikey=api_key)
 
 
 @st.cache_data(ttl=20)
-def fetch_finnhub_candles(symbol: str, api_key: str, resolution: str = "5", lookback_sec: int = 1800) -> pd.DataFrame:
+def fetch_twelve_candles(symbol: str, api_key: str, interval: str = "5min", outputsize: int = 100) -> pd.DataFrame:
     """
-    Fetch last lookback_sec worth of candles from Finnhub.
-    resolution: '1','5','15','30','60','D'
+    Fetch intraday candles from TwelveData and normalize columns to:
+    t, o, h, l, c, v
     """
-    client = _get_finnhub_client(api_key)
-    if client is None:
+    td = _get_twelve_client(api_key)
+    if td is None:
         return pd.DataFrame()
 
-    now = int(time.time())
-    past = now - int(lookback_sec)
-
-    res = client.stock_candles(symbol, resolution, past, now)
-    if not isinstance(res, dict) or res.get("s") == "no_data":
+    try:
+        ts = td.time_series(symbol=symbol, interval=interval, outputsize=outputsize)
+        df = ts.as_pandas()
+    except Exception:
         return pd.DataFrame()
 
-    df = pd.DataFrame(res)
-    # expected keys: c,h,l,o,s,t,v
-    if df.empty or "t" not in df.columns:
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    df["t"] = pd.to_datetime(df["t"], unit="s", utc=True).dt.tz_convert("America/Toronto")
-    return df
+    df = df.sort_index()
+    cols = {str(c).lower(): c for c in df.columns}
+    c_open = cols.get("open")
+    c_high = cols.get("high")
+    c_low = cols.get("low")
+    c_close = cols.get("close")
+    c_volume = cols.get("volume")
+    if c_close is None or c_volume is None:
+        return pd.DataFrame()
+
+    t_idx = pd.to_datetime(df.index, errors="coerce")
+    if isinstance(t_idx, pd.DatetimeIndex):
+        if t_idx.tz is None:
+            t_idx = t_idx.tz_localize("America/Toronto", nonexistent="shift_forward", ambiguous="NaT")
+        else:
+            t_idx = t_idx.tz_convert("America/Toronto")
+
+    out = pd.DataFrame({
+        "t": t_idx,
+        "o": pd.to_numeric(df[c_open], errors="coerce") if c_open is not None else pd.NA,
+        "h": pd.to_numeric(df[c_high], errors="coerce") if c_high is not None else pd.NA,
+        "l": pd.to_numeric(df[c_low], errors="coerce") if c_low is not None else pd.NA,
+        "c": pd.to_numeric(df[c_close], errors="coerce"),
+        "v": pd.to_numeric(df[c_volume], errors="coerce"),
+    }).dropna(subset=["t", "c", "v"])
+
+    return out
 
 
 def breakout_status_from_candles(candles: pd.DataFrame) -> Dict[str, Any]:
@@ -213,7 +277,7 @@ def breakout_status_from_candles(candles: pd.DataFrame) -> Dict[str, Any]:
       - label: SURGE / QUIET / STEADY / NO_DATA
     """
     if candles is None or candles.empty or "v" not in candles.columns or "c" not in candles.columns:
-        return {"label": "NO_DATA", "note": "No Finnhub candles (market closed or key missing)."}
+        return {"label": "NO_DATA", "note": "No stock candles (market closed or key missing)."}
 
     df = candles.copy().sort_values("t")
     latest = df.iloc[-1]
@@ -282,7 +346,7 @@ def _go_nogo(options_regime: str, opt_flow: Dict[str, Any], stock_break: Dict[st
     Combines:
       - options regime
       - options dominant near-spot flow
-      - Finnhub stock volume label (SURGE/QUIET/STEADY)
+      - stock volume label (SURGE/QUIET/STEADY)
     into an actionable message.
     """
     label = "NO-GO"
@@ -306,7 +370,7 @@ def _go_nogo(options_regime: str, opt_flow: Dict[str, Any], stock_break: Dict[st
         label = "NO-GO"
         reason = "Pin/chop risk + stock volume is quiet → high fake-out risk."
 
-    # No data from Finnhub => caution
+    # No stock candles => caution
     if stock_lbl == "NO_DATA":
         label = "CAUTION"
         reason = "No real-time stock volume feed available; rely on options flow only."
@@ -314,25 +378,16 @@ def _go_nogo(options_regime: str, opt_flow: Dict[str, Any], stock_break: Dict[st
     return {"label": label, "reason": reason}
 
 
-def _get_finnhub_key() -> Optional[str]:
-    try:
-        key = st.secrets.get("FINNHUB_API_KEY")
-        if key:
-            return str(key)
-    except Exception:
-        pass
-    return os.getenv("FINNHUB_API_KEY")
-
-
 def render_tab_friday_playbook_from_chain(
     symbol: str,
     spot: float,
     chain_df: pd.DataFrame,
-    finnhub_api_key: Optional[str] = None,
-    finnhub_resolution: str = "5",
-    finnhub_lookback_sec: int = 1800,
+    gex_df: Optional[pd.DataFrame] = None,
+    twelve_api_key: Optional[str] = None,
+    twelve_interval: str = "5min",
+    twelve_outputsize: int = 100,
 ):
-    st.subheader("📅 Friday Gamma Playbook (Chain-Driven + Finnhub Confirmation)")
+    st.subheader("📅 Friday Gamma Playbook (Chain-Driven + TwelveData Confirmation)")
 
     st.warning("📌 READ the rulebook below BEFORE placing any Friday trade.")
     st.markdown(_rulebook_markdown())
@@ -349,16 +404,30 @@ def render_tab_friday_playbook_from_chain(
         st.error(f"Chain data format issue: {e}")
         return
 
-    call_wall, put_wall, magnet, call_wall_row, put_wall_row, magnet_row = _walls_and_magnet(df)
-    regime, reason = _infer_regime_from_chain(df, spot, call_wall, put_wall, magnet)
+    oi_call_wall, oi_put_wall, oi_magnet, call_wall_row, put_wall_row, magnet_row = _walls_and_magnet(df)
+    gex_levels = _gex_levels(gex_df, spot)
+
+    if gex_levels:
+        call_wall = _num(gex_levels.get("call_wall"), oi_call_wall)
+        put_wall = _num(gex_levels.get("put_wall"), oi_put_wall)
+        magnet = _num(gex_levels.get("magnet"), oi_magnet)
+        spot_used = _num(gex_levels.get("spot_used"), spot)
+        source_note = "Using GEX-derived levels (same logic as Gamma Map tab)."
+    else:
+        call_wall, put_wall, magnet = oi_call_wall, oi_put_wall, oi_magnet
+        spot_used = spot
+        source_note = "Using OI-derived levels (fallback because GEX levels unavailable)."
+
+    regime, reason = _infer_regime_from_chain(df, spot_used, call_wall, put_wall, magnet)
 
     st.markdown("## 🧱 Today’s Structure (Walls & Magnet)")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Symbol", symbol)
-    c2.metric("Spot", _fmt(spot, 2))
-    c3.metric("Call Wall (max Call OI)", _fmt(call_wall, 2))
-    c4.metric("Put Wall (max Put OI)", _fmt(put_wall, 2))
-    c5.metric("Magnet (max Total OI)", _fmt(magnet, 2))
+    c2.metric("Spot Used", _fmt(spot_used, 2))
+    c3.metric("Call Wall", _fmt(call_wall, 2))
+    c4.metric("Put Wall", _fmt(put_wall, 2))
+    c5.metric("Magnet", _fmt(magnet, 2))
+    st.caption(source_note)
 
     c6, c7, c8 = st.columns(3)
     total_call_oi = float(df["call_open_int"].fillna(0).sum())
@@ -371,14 +440,14 @@ def render_tab_friday_playbook_from_chain(
     st.info(f"*Regime:* {regime} — {reason}")
 
     # Near-spot options flow snapshot
-    opt_flow = _options_flow_snapshot(df, spot)
+    opt_flow = _options_flow_snapshot(df, spot_used)
 
-    # ---------------- Stock: Finnhub candles confirmation ----------------
-    st.markdown("## 📈 Real-time Stock Volume Confirmation (Finnhub)")
+    # ---------------- Stock: TwelveData candles confirmation ----------------
+    st.markdown("## 📈 Real-time Stock Volume Confirmation (TwelveData)")
 
-    stock_break = {"label": "NO_DATA", "note": "Finnhub not configured."}
-    if finnhub_api_key and finnhub is not None:
-        candles = fetch_finnhub_candles(symbol, finnhub_api_key, finnhub_resolution, finnhub_lookback_sec)
+    stock_break = {"label": "NO_DATA", "note": "TwelveData not configured."}
+    if twelve_api_key and TDClient is not None:
+        candles = fetch_twelve_candles(symbol, twelve_api_key, twelve_interval, twelve_outputsize)
         stock_break = breakout_status_from_candles(candles)
 
         if stock_break.get("label") == "NO_DATA":
@@ -394,10 +463,10 @@ def render_tab_friday_playbook_from_chain(
             d4.metric("Vol vs Prev", f"{vr:.2f}x" if vr is not None else "N/A")
             st.caption(stock_break.get("note", ""))
 
-            with st.expander("Show Finnhub candles (debug)", expanded=False):
+            with st.expander("Show TwelveData candles (debug)", expanded=False):
                 st_df(candles[["t", "o", "h", "l", "c", "v"]].tail(20))
     else:
-        st.info("Set FINNHUB_API_KEY to enable real-time stock volume confirmation.")
+        st.info("Set TWELVE_API_KEY to enable real-time stock volume confirmation.")
 
     # ---------------- GO / NO-GO ----------------
     st.markdown("## ✅ Trade Readiness (GO / NO-GO)")
@@ -463,6 +532,8 @@ def render_tab_friday_playbook(
     spot: float,
     chain_df: pd.DataFrame,
     gex_df: Optional[pd.DataFrame] = None,
+    twelve_interval: str = "5min",
+    twelve_outputsize: int = 100,
 ):
     """
     Backward-compatible entrypoint used by app.py.
@@ -473,5 +544,8 @@ def render_tab_friday_playbook(
         symbol=symbol,
         spot=spot,
         chain_df=chain_df,
-        finnhub_api_key=_get_finnhub_key(),
+        gex_df=gex_df,
+        twelve_api_key=_get_twelve_key(),
+        twelve_interval=twelve_interval,
+        twelve_outputsize=twelve_outputsize,
     )

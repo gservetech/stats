@@ -927,4 +927,4 @@ Because support hedging is removed and selling can **cascade**.
 
     with st.expander("Debug / Normalized inputs used (Strike, OI, IV)", expanded=False):
         show = df[["strike", "call_oi", "put_oi", "call_iv", "put_iv", "vanna_proxy", "charm_proxy"]].copy()
-        st.dataframe(show, use_container_width=True)
+        st.dataframe(show, width="stretch")

@@ -93,7 +93,7 @@ def render_tab_orderflow_delta(symbol: str, hist_df: pd.DataFrame, spot: float):
         template="plotly_dark",
         height=300,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # -----------------------------
     # Education Table

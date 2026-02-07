@@ -47,6 +47,7 @@ from stats_app.tabs.tab_vanna_charm import render_tab_vanna_charm
 from stats_app.tabs.tab_interpretation_engine import render_tab_interpretation_engine
 from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
 from stats_app.tabs.tab_share_statistics import render_tab_share_statistics
+from stats_app.tabs.tab_yahoo_data import render_tab_yahoo_data
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -308,19 +309,19 @@ def main():
     gex_result = st.session_state.get("gex_result")
     hist_df = st.session_state.get("hist_df")
 
-    # Only proceed if we actually have successful data
-    if options_result and weekly_result and options_result.get("success"):
+    has_core_data = bool(options_result and weekly_result and options_result.get("success"))
+    df = pd.DataFrame()
+    w = {}
+    totals, pcr = {}, {}
+    gex_df = pd.DataFrame()
+
+    if has_core_data:
         df = pd.DataFrame(options_result["data"].get("data", []))
         w = weekly_result["data"]
-        totals, pcr, top = w.get("totals", {}), w.get("pcr", {}), w.get("top_strikes", {})
-
-        top_call = pd.DataFrame(top.get("call_gex", []))
-        top_put = pd.DataFrame(top.get("put_gex", []))
-        top_net = pd.DataFrame(top.get("net_gex_abs", []))
-        top_combined = pd.DataFrame(top.get("combined", []))
+        totals = w.get("totals", {})
+        pcr = w.get("pcr", {})
         gex_df = pd.DataFrame(gex_result["data"].get("data", [])) if gex_result and gex_result.get("success") else pd.DataFrame()
 
-        # Price History Expander
         with st.expander("📈 Price + Moving Averages", expanded=True):
             if hist_df is not None and not hist_df.empty:
                 px_df = hist_df.copy()
@@ -335,65 +336,111 @@ def main():
                 st_plot(fig_px)
 
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}**")
+    elif fetch_btn and api_ok:
+        st.error("Data fetch failed after multiple retries. Please check the backend connection.")
 
-        # Tabs (15 labels for 15 tab variables)
-        t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15 = st.tabs(
-            [
-                "📋 Chain",
-                "📊 OI",
-                "📌 Weekly GEX",
-                "🧲 Map",
-                "🧮 Greeks",
-                "🏆 Pro Edge",
-                "🔳 Folding",
-                "📈 VWAP",
-                "🎯 Vol Cone",
-                "🔮 Friday Predictor",
-                "🧠 Friday Predictor+",
-                "🌊 Vanna/Charm",
-                "📊 Orderflow/Delta",
-                "🧠 Interpretation",
-                "🧾 Share Stats",
-            ]
-        )
+    # Keep tabs visible even before core fetch so Yahoo tab loads instantly.
+    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16 = st.tabs(
+        [
+            "📋 Chain",
+            "📊 OI",
+            "📌 Weekly GEX",
+            "🧲 Map",
+            "🧮 Greeks",
+            "🏆 Pro Edge",
+            "🔳 Folding",
+            "📈 VWAP",
+            "🎯 Vol Cone",
+            "🔮 Friday Predictor",
+            "🧠 Friday Predictor+",
+            "🌊 Vanna/Charm",
+            "📊 Orderflow/Delta",
+            "🧠 Interpretation",
+            "🧾 Share Stats",
+            "📈 Yahoo Data",
+        ]
+    )
 
-        with t1:
+    def _show_core_fetch_hint():
+        st.info("Click `🔄 Fetch Data` in the sidebar to load this tab.")
+
+    with t1:
+        if has_core_data:
             render_tab_options_chain(df)
-        with t2:
-            render_tab_oi_charts(df)
-        with t3:
-            render_tab_weekly_gamma(pcr, totals, w, spot, gex_df)
-        with t4:
-            render_tab_gamma_map_filters(symbol, date, spot)
-        with t5:
-            render_tab_vol_greeks(df, spot, symbol, date)
-        with t6:
-            render_tab_pro_edge(symbol, date, spot, hist_df, totals, df)
-        with t7:
-            render_tab_market_folding(symbol)
-        with t8:
-            render_tab_vwap_obv(symbol)
-        with t9:
-            render_tab_vol_cone(symbol)
-        with t10:
-            render_tab_friday_predictor(symbol, date, hist_df, spot)
-        with t11:
-            render_tab_friday_predictor_plus(symbol, w, hist_df, spot)
-        with t12:
-            render_tab_vanna_charm(symbol, date, spot, hist_df)
-        with t13:
-            render_tab_orderflow_delta(symbol, hist_df, spot)
-        with t14:
-            render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
-        with t15:
-            render_tab_share_statistics(symbol, gex_df=gex_df, spot=spot)
-
-    else:
-        if fetch_btn and api_ok:
-            # If we clicked fetch but ended up here, it means the retry failed.
-            st.error("Data fetch failed after multiple retries. Please check the backend connection.")
         else:
-            st.info("Query a symbol and click 'Fetch Data' to begin.")
+            _show_core_fetch_hint()
+    with t2:
+        if has_core_data:
+            render_tab_oi_charts(df)
+        else:
+            _show_core_fetch_hint()
+    with t3:
+        if has_core_data:
+            render_tab_weekly_gamma(pcr, totals, w, spot, gex_df)
+        else:
+            _show_core_fetch_hint()
+    with t4:
+        if has_core_data:
+            render_tab_gamma_map_filters(symbol, date, spot)
+        else:
+            _show_core_fetch_hint()
+    with t5:
+        if has_core_data:
+            render_tab_vol_greeks(df, spot, symbol, date)
+        else:
+            _show_core_fetch_hint()
+    with t6:
+        if has_core_data:
+            render_tab_pro_edge(symbol, date, spot, hist_df, totals, df)
+        else:
+            _show_core_fetch_hint()
+    with t7:
+        if has_core_data:
+            render_tab_market_folding(symbol)
+        else:
+            _show_core_fetch_hint()
+    with t8:
+        if has_core_data:
+            render_tab_vwap_obv(symbol)
+        else:
+            _show_core_fetch_hint()
+    with t9:
+        if has_core_data:
+            render_tab_vol_cone(symbol)
+        else:
+            _show_core_fetch_hint()
+    with t10:
+        if has_core_data:
+            render_tab_friday_predictor(symbol, date, hist_df, spot)
+        else:
+            _show_core_fetch_hint()
+    with t11:
+        if has_core_data:
+            render_tab_friday_predictor_plus(symbol, w, hist_df, spot)
+        else:
+            _show_core_fetch_hint()
+    with t12:
+        if has_core_data:
+            render_tab_vanna_charm(symbol, date, spot, hist_df)
+        else:
+            _show_core_fetch_hint()
+    with t13:
+        if has_core_data:
+            render_tab_orderflow_delta(symbol, hist_df, spot)
+        else:
+            _show_core_fetch_hint()
+    with t14:
+        if has_core_data:
+            render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
+        else:
+            _show_core_fetch_hint()
+    with t15:
+        if has_core_data:
+            render_tab_share_statistics(symbol, gex_df=gex_df, spot=spot)
+        else:
+            _show_core_fetch_hint()
+    with t16:
+        render_tab_yahoo_data(symbol)
 
 
 if __name__ == "__main__":

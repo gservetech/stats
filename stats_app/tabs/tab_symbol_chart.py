@@ -49,7 +49,7 @@ def render_symbol_chart(symbol: str):
     # Timeframe selector row
     cols = st.columns(len(timeframes) + 2)
     for i, tf in enumerate(timeframes):
-        if cols[i].button(tf, key=f"tf_btn_{tf}", use_container_width=True, 
+        if cols[i].button(tf, key=f"tf_btn_{tf}", width="stretch", 
                           type="primary" if current_tf == tf else "secondary"):
             st.session_state["selected_chart_tf"] = tf
             # No st.rerun() needed - fragment auto-reruns on widget interaction
@@ -275,5 +275,5 @@ def render_symbol_chart(symbol: str):
                 line_color="rgba(255,255,255,0.1)",
             )
 
-    st.plotly_chart(price_fig, use_container_width=True, config={'displayModeBar': False})
-    st.plotly_chart(volume_fig, use_container_width=True, config={'displayModeBar': False})
+    st.plotly_chart(price_fig, width="stretch", config={'displayModeBar': False})
+    st.plotly_chart(volume_fig, width="stretch", config={'displayModeBar': False})

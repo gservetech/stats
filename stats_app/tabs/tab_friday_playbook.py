@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from ..helpers.ui_components import st_df
+from ..helpers.calculations import compute_gamma_map_artifacts
 
 
 def _num(s, default=0.0):
@@ -90,6 +91,20 @@ def _walls_and_magnet(df: pd.DataFrame):
     magnet = _num(magnet_row["strike"], None) if magnet_row is not None else None
 
     return call_wall, put_wall, magnet, call_wall_row, put_wall_row, magnet_row
+
+
+def _gex_levels(gex_df: pd.DataFrame, spot: float):
+    if gex_df is None or gex_df.empty:
+        return None
+    art = compute_gamma_map_artifacts(gex_df, spot=spot, top_n=10)
+    if not art:
+        return None
+    return {
+        "magnet": art.get("magnet"),
+        "put_wall": art.get("put_wall"),
+        "call_wall": art.get("call_wall"),
+        "spot_used": art.get("spot_used"),
+    }
 
 
 def _near(x, y, band_pct=0.006):
@@ -308,7 +323,7 @@ Spreads cap your convexity and remove gamma — you lose to:
 """
 
 
-def render_tab_friday_playbook(symbol: str, spot: float, chain_df: pd.DataFrame):
+def render_tab_friday_playbook(symbol: str, spot: float, chain_df: pd.DataFrame, gex_df: pd.DataFrame | None = None):
     st.subheader("📅 Friday Gamma Playbook (Chain-Driven: Walls • Magnet • Flow • Strategies)")
 
     st.warning("📌 READ the rulebook below BEFORE placing any Friday trade.")
@@ -324,16 +339,31 @@ def render_tab_friday_playbook(symbol: str, spot: float, chain_df: pd.DataFrame)
         st.error(f"Chain data format issue: {e}")
         return
 
-    call_wall, put_wall, magnet, call_wall_row, put_wall_row, magnet_row = _walls_and_magnet(df)
+    oi_call_wall, oi_put_wall, oi_magnet, call_wall_row, put_wall_row, magnet_row = _walls_and_magnet(df)
+    gex_levels = _gex_levels(gex_df, spot)
+
+    # Align with Gamma Map values when GEX is available.
+    if gex_levels:
+        call_wall = _num(gex_levels.get("call_wall"), oi_call_wall)
+        put_wall = _num(gex_levels.get("put_wall"), oi_put_wall)
+        magnet = _num(gex_levels.get("magnet"), oi_magnet)
+        spot_used = _num(gex_levels.get("spot_used"), spot)
+        source_note = "Using **GEX-derived levels** (same source as Gamma Map tab)."
+    else:
+        call_wall, put_wall, magnet = oi_call_wall, oi_put_wall, oi_magnet
+        spot_used = spot
+        source_note = "Using **OI-derived levels** (fallback because GEX levels unavailable)."
+
     regime, reason = _infer_regime_from_chain(df, spot, call_wall, put_wall, magnet)
 
     st.markdown("## 🧱 Today’s Structure (Walls & Magnet)")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Symbol", symbol)
-    c2.metric("Spot", _fmt(spot, 2))
-    c3.metric("Call Wall (max Call OI)", _fmt(call_wall, 2))
-    c4.metric("Put Wall (max Put OI)", _fmt(put_wall, 2))
-    c5.metric("Magnet (max Total OI)", _fmt(magnet, 2))
+    c2.metric("Spot Used", _fmt(spot_used, 2))
+    c3.metric("Call Wall (Upper)", _fmt(call_wall, 2))
+    c4.metric("Put Wall (Lower)", _fmt(put_wall, 2))
+    c5.metric("Main Magnet", _fmt(magnet, 2))
+    st.caption(source_note)
 
     c6, c7, c8 = st.columns(3)
     total_call_oi = float(df["call_open_int"].fillna(0).sum())

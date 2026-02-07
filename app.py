@@ -310,6 +310,15 @@ def main():
     gex_result = st.session_state.get("gex_result")
     hist_df = st.session_state.get("hist_df")
 
+    # Friday Playbook only needs options-chain data, so keep this independent
+    # from weekly-summary success.
+    has_chain_data = bool(options_result and options_result.get("success"))
+    chain_df_for_playbook = (
+        pd.DataFrame(options_result["data"].get("data", []))
+        if has_chain_data
+        else pd.DataFrame()
+    )
+
     has_core_data = bool(options_result and weekly_result and options_result.get("success"))
     df = pd.DataFrame()
     w = {}
@@ -422,7 +431,7 @@ def main():
         else:
             _show_core_fetch_hint()
     with t12:
-        render_tab_friday_playbook(symbol, spot, df if has_core_data else pd.DataFrame())
+        render_tab_friday_playbook(symbol, spot, chain_df_for_playbook)
     with t13:
         if has_core_data:
             render_tab_vanna_charm(symbol, date, spot, hist_df)

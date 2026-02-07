@@ -27,6 +27,11 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
 ## 2. Configure Streamlit Secrets
 
 Create `/opt/stats/.streamlit/secrets.toml`:

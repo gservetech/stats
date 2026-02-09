@@ -11,7 +11,7 @@ load_dotenv()
 
 # Optional: if you installed finnhub-python
 try:
-    import finnhub
+    import get_volume
     HAS_FINNHUB = True
 except Exception:
     HAS_FINNHUB = False

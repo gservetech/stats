@@ -137,12 +137,7 @@ def main():
         today = dt.date.today()
         default_friday = _next_friday(today)
         expiry_date = st.date_input("Expiration Date", value=default_friday)
-
-        # Always use the next Friday for calculations (e.g., if user picks Saturday)
-        effective_expiry = _next_friday(expiry_date)
-        if effective_expiry != expiry_date:
-            st.caption(f"Using next Friday: {effective_expiry.isoformat()}")
-        date = effective_expiry.isoformat()
+        date = expiry_date.isoformat()
 
         spot_source = st.selectbox("Spot Price Source", options=["CNBC", "Manual"])
         refresh_spot_btn = st_btn("🔄 Refresh Spot")

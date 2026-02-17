@@ -49,6 +49,7 @@ from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
 from stats_app.tabs.tab_share_statistics import render_tab_share_statistics
 from stats_app.tabs.tab_yahoo_data import render_tab_yahoo_data
 from stats_app.tabs.tab_friday_playbook import render_tab_friday_playbook
+from stats_app.tabs.tab_capital_flow import render_tab_capital_flow
 
 
 # Configure Streamlit Page
@@ -362,7 +363,7 @@ def main():
         st.error("Data fetch failed after multiple retries. Please check the backend connection.")
 
     # Keep tabs visible even before core fetch so Yahoo tab loads instantly.
-    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17 = st.tabs(
+    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18 = st.tabs(
         [
             "📋 Chain",
             "📊 OI",
@@ -381,6 +382,7 @@ def main():
             "🧠 Interpretation",
             "🧾 Share Stats",
             "📈 Yahoo Data",
+            "💸 Capital Flow",
         ]
     )
 
@@ -478,6 +480,11 @@ def main():
             _show_core_fetch_hint()
     with t17:
         render_tab_yahoo_data(symbol)
+    with t18:
+        if has_core_data:
+            render_tab_capital_flow(df, spot=spot, expiry_date=date, symbol=symbol)
+        else:
+            _show_core_fetch_hint()
 
 
 if __name__ == "__main__":

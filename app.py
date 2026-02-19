@@ -51,6 +51,14 @@ from stats_app.tabs.tab_yahoo_data import render_tab_yahoo_data
 from stats_app.tabs.tab_friday_playbook import render_tab_friday_playbook
 from stats_app.tabs.tab_capital_flow import render_tab_capital_flow
 
+# ✅ Existing Nobel tab (you already added)
+from stats_app.tabs.tab_nobel_pattern import render_tab_nobel_pattern
+
+# ✅ NEW TABS (this answer)
+from stats_app.tabs.tab_expected_move import render_tab_expected_move
+from stats_app.tabs.tab_gamma_flip_detector import render_tab_gamma_flip_detector
+from stats_app.tabs.tab_iv_term_structure import render_tab_iv_term_structure
+
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -65,12 +73,6 @@ def main():
     apply_custom_styles()
 
     def _backend_health_state() -> tuple[bool, int]:
-        """
-        Debounced backend health check.
-        - Check less often on success.
-        - Re-check faster when failing.
-        - Track consecutive failure streak to suppress one-off warning noise.
-        """
         now_ts = time.time()
         last_check_ts = float(st.session_state.get("backend_health_last_check_ts", 0.0))
         last_status = st.session_state.get("backend_health_status")
@@ -164,7 +166,7 @@ def main():
             step=10,
         )
 
-        # --------- per-symbol spot cache (prevents symbol cross-talk) ---------
+        # --------- per-symbol spot cache ---------
         spot_key = f"spot_data_{symbol}"
         spot_ts_key = f"spot_ts_{symbol}"
         spot_err_key = f"spot_err_{symbol}"
@@ -185,8 +187,6 @@ def main():
             spot_data = None
             spot_error = None
 
-            # 1) Prefer backend /spot (cached + stable)
-            # When user explicitly clicks refresh, bypass cache
             backend = fetch_spot_quote(symbol, date, force_refresh=refresh_spot_btn)
             if backend and backend.get("success"):
                 spot_data = backend.get("data")
@@ -195,7 +195,6 @@ def main():
             else:
                 spot_error = backend.get("error") if backend else "Backend spot fetch failed"
 
-            # 2) Fallback to direct CNBC/Finnhub
             if not spot_data:
                 spot_data = get_spot_from_finnhub(symbol)
                 if not spot_data and not get_finnhub_api_key():
@@ -243,7 +242,7 @@ def main():
                 st.caption("Backend health check is unstable (transient). Retrying automatically.")
         fetch_btn = st_btn("🔄 Fetch Data")
 
-    # --------- reset session_state when symbol changes (prevents stale mixing) ---------
+    # --------- reset session_state when symbol changes ---------
     if "last_symbol" not in st.session_state:
         st.session_state["last_symbol"] = symbol
 
@@ -256,17 +255,15 @@ def main():
         st.session_state["last_symbol"] = symbol
 
     # -------------------------------------------------------------------------
-    # IMPROVED FETCHING LOGIC WITH RETRIES
+    # FETCHING LOGIC WITH RETRIES
     # -------------------------------------------------------------------------
     if fetch_btn:
 
-        # Helper function to retry API calls
         def fetch_with_retry(fetch_func, func_name, max_retries=3, *args):
             placeholder = st.empty()
             for attempt in range(max_retries):
                 try:
                     res = fetch_func(*args)
-                    # Check for valid dict with success=True or valid DataFrame
                     if isinstance(res, dict) and res.get("success"):
                         placeholder.empty()
                         return res
@@ -274,7 +271,6 @@ def main():
                         placeholder.empty()
                         return res
 
-                    # If we got a result but it says error, log it
                     err = res.get("error") if isinstance(res, dict) else "Unknown Error"
                     if attempt < max_retries - 1:
                         placeholder.warning(
@@ -294,22 +290,18 @@ def main():
             return None
 
         with st.spinner(f"Analyzing market structure for {symbol}..."):
-            # 1. Fetch Options (Critical)
             st.session_state["options_result"] = fetch_with_retry(
                 fetch_options, "Options Chain", 3, symbol, date
             )
 
-            # 2. Fetch Weekly Summary (Critical)
             st.session_state["weekly_result"] = fetch_with_retry(
                 fetch_weekly_summary, "Weekly Summary", 3, symbol, date, spot
             )
 
-            # 2b. Fetch Weekly GEX (per-strike table)
             st.session_state["gex_result"] = fetch_with_retry(
                 fetch_weekly_gex, "Weekly GEX", 3, symbol, date, spot
             )
 
-            # 3. Fetch History (Usually reliable, but good to be safe)
             try:
                 st.session_state["hist_df"] = fetch_price_history(symbol).copy()
             except Exception as e:
@@ -323,8 +315,6 @@ def main():
     gex_result = st.session_state.get("gex_result")
     hist_df = st.session_state.get("hist_df")
 
-    # Friday Playbook only needs options-chain data, so keep this independent
-    # from weekly-summary success.
     has_chain_data = bool(options_result and options_result.get("success"))
     chain_df_for_playbook = (
         pd.DataFrame(options_result["data"].get("data", []))
@@ -362,8 +352,8 @@ def main():
     elif fetch_btn and api_ok:
         st.error("Data fetch failed after multiple retries. Please check the backend connection.")
 
-    # Keep tabs visible even before core fetch so Yahoo tab loads instantly.
-    t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18 = st.tabs(
+    # ---------------- Tabs (Capital Flow LAST) ----------------
+    t1, t2, t3, t4, t5, t6, t7, tNOBEL, tEM, tGF, tIVTS, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18 = st.tabs(
         [
             "📋 Chain",
             "📊 OI",
@@ -372,6 +362,10 @@ def main():
             "🧮 Greeks",
             "🏆 Pro Edge",
             "🔳 Folding",
+            "🧠 Nobel Pattern",
+            "📦 Expected Move",
+            "🧲 Gamma Flip",
+            "🧾 IV Term Structure",
             "📈 VWAP",
             "🎯 Vol Cone",
             "🔮 Friday Predictor",
@@ -382,7 +376,7 @@ def main():
             "🧠 Interpretation",
             "🧾 Share Stats",
             "📈 Yahoo Data",
-            "💸 Capital Flow",
+            "💸 Capital Flow",   # ✅ LAST
         ]
     )
 
@@ -394,61 +388,88 @@ def main():
             render_tab_options_chain(df)
         else:
             _show_core_fetch_hint()
+
     with t2:
         if has_core_data:
             render_tab_oi_charts(df)
         else:
             _show_core_fetch_hint()
+
     with t3:
         if has_core_data:
             render_tab_weekly_gamma(pcr, totals, w, spot, gex_df)
         else:
             _show_core_fetch_hint()
+
     with t4:
         if has_core_data:
-            render_tab_gamma_map_filters(
-                symbol,
-                date,
-                spot,
-                gex_df if not gex_df.empty else pd.DataFrame(),
-            )
+            render_tab_gamma_map_filters(symbol, date, spot, gex_df if not gex_df.empty else pd.DataFrame())
         else:
             _show_core_fetch_hint()
+
     with t5:
         if has_core_data:
             render_tab_vol_greeks(df, spot, symbol, date)
         else:
             _show_core_fetch_hint()
+
     with t6:
         if has_core_data:
             render_tab_pro_edge(symbol, date, spot, hist_df, totals, df)
         else:
             _show_core_fetch_hint()
+
     with t7:
         if has_core_data:
             render_tab_market_folding(symbol)
         else:
             _show_core_fetch_hint()
+
+    with tNOBEL:
+        render_tab_nobel_pattern(symbol=symbol, spot=spot, hist_df=hist_df)
+
+    with tEM:
+        if has_core_data:
+            render_tab_expected_move(df=df, spot=spot, expiry_date=date, symbol=symbol)
+        else:
+            _show_core_fetch_hint()
+
+    with tGF:
+        if has_core_data and not gex_df.empty:
+            render_tab_gamma_flip_detector(gex_df=gex_df, spot=spot, symbol=symbol)
+        else:
+            st.info("Run Fetch Data (needs Weekly GEX table).")
+
+    with tIVTS:
+        if has_core_data:
+            render_tab_iv_term_structure(df=df, spot=spot, expiry_date=date, symbol=symbol)
+        else:
+            _show_core_fetch_hint()
+
     with t8:
         if has_core_data:
             render_tab_vwap_obv(symbol)
         else:
             _show_core_fetch_hint()
+
     with t9:
         if has_core_data:
             render_tab_vol_cone(symbol)
         else:
             _show_core_fetch_hint()
+
     with t10:
         if has_core_data:
             render_tab_friday_predictor(symbol, date, hist_df, spot)
         else:
             _show_core_fetch_hint()
+
     with t11:
         if has_core_data:
             render_tab_friday_predictor_plus(symbol, w, hist_df, spot)
         else:
             _show_core_fetch_hint()
+
     with t12:
         render_tab_friday_playbook(
             symbol,
@@ -458,28 +479,34 @@ def main():
             twelve_interval=friday_twelve_interval,
             twelve_outputsize=friday_twelve_outputsize,
         )
+
     with t13:
         if has_core_data:
             render_tab_vanna_charm(symbol, date, spot, hist_df)
         else:
             _show_core_fetch_hint()
+
     with t14:
         if has_core_data:
             render_tab_orderflow_delta(symbol, hist_df, spot)
         else:
             _show_core_fetch_hint()
+
     with t15:
         if has_core_data:
             render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
         else:
             _show_core_fetch_hint()
+
     with t16:
         if has_core_data:
             render_tab_share_statistics(symbol, gex_df=gex_df, spot=spot)
         else:
             _show_core_fetch_hint()
+
     with t17:
         render_tab_yahoo_data(symbol)
+
     with t18:
         if has_core_data:
             render_tab_capital_flow(df, spot=spot, expiry_date=date, symbol=symbol)

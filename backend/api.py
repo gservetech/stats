@@ -836,6 +836,7 @@ async def scrape_options(symbol: str, date: str):
                         )
 
                     request_id, _api_url = captured_requests["options"]
+                    print(f"[INFO] Captured options API URL: {_api_url}")
 
                     try:
                         body_data = await tab.get_network_response_body(request_id)

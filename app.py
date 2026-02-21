@@ -43,6 +43,7 @@ from stats_app.tabs.tab_vwap_obv import render_tab_vwap_obv
 from stats_app.tabs.tab_vol_cone import render_tab_vol_cone
 from stats_app.tabs.tab_friday_predictor import render_tab_friday_predictor
 from stats_app.tabs.tab_friday_predictor_plus import render_tab_friday_predictor_plus
+from stats_app.tabs.tab_friday_calculation_6_weeks import render_tab_friday_calculation_6_weeks
 from stats_app.tabs.tab_vanna_charm import render_tab_vanna_charm
 from stats_app.tabs.tab_interpretation_engine import render_tab_interpretation_engine
 from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
@@ -353,7 +354,7 @@ def main():
         st.error("Data fetch failed after multiple retries. Please check the backend connection.")
 
     # ---------------- Tabs (Capital Flow LAST) ----------------
-    t1, t2, t3, t4, t5, t6, t7, tNOBEL, tEM, tGF, tIVTS, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18 = st.tabs(
+    t1, t2, t3, t4, t5, t6, t7, tNOBEL, tEM, tGF, tIVTS, t8, t9, t10, t11, tF6, t12, t13, t14, t15, t16, t17, t18 = st.tabs(
         [
             "📋 Chain",
             "📊 OI",
@@ -370,6 +371,7 @@ def main():
             "🎯 Vol Cone",
             "🔮 Friday Predictor",
             "🧠 Friday Predictor+",
+            "🗓️ Friday Calculation (6 Weeks)",
             "📜 Friday Playbook",
             "🌊 Vanna/Charm",
             "📊 Orderflow/Delta",
@@ -467,6 +469,12 @@ def main():
     with t11:
         if has_core_data:
             render_tab_friday_predictor_plus(symbol, w, hist_df, spot)
+        else:
+            _show_core_fetch_hint()
+
+    with tF6:
+        if has_core_data:
+            render_tab_friday_calculation_6_weeks(symbol=symbol, spot=spot)
         else:
             _show_core_fetch_hint()
 

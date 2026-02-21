@@ -75,25 +75,16 @@ def _run_6_week_calc(symbol: str, spot: float, start_friday: dt.date) -> tuple[p
     return pd.DataFrame(rows), errors
 
 
-def render_tab_friday_calculation_6_weeks(symbol: str, spot: float):
-    st.subheader("🗓️ Friday Calculation (6 Weeks)")
-
-    if not symbol:
-        st.warning("Symbol is required.")
-        return
-
-    spot_val = _to_num(spot)
-    if spot_val is None or spot_val <= 0:
-        st.warning("Valid spot price is required.")
-        return
-
-    start_friday = _next_friday(dt.date.today())
-    end_friday = start_friday + dt.timedelta(days=35)
-    st.caption(
-        f"Nearest upcoming Friday: **{start_friday.isoformat()}**  |  "
-        f"Range: **{start_friday.isoformat()} → {end_friday.isoformat()}**  |  "
-        f"Spot used for all weeks: **{spot_val:,.2f}**"
+def _render_6_week_calc_body(symbol: str, spot_val: float, start_friday: dt.date):
+    calculate_now = st.selectbox(
+        "Calculate 6-week data now?",
+        options=["No", "Yes"],
+        index=0,
+        key=f"friday_calc_6w_mode_{symbol}",
     )
+    if calculate_now != "Yes":
+        st.info("Set to 'Yes' to run the 6-week Friday calculation. Default is 'No' for performance.")
+        return
 
     cache_key = f"friday_calc_6w_{symbol}"
     refresh = st_btn("Run / Refresh 6-Week Calculation", key=f"friday_calc_6w_refresh_{symbol}")
@@ -161,3 +152,35 @@ def render_tab_friday_calculation_6_weeks(symbol: str, spot: float):
     if errors:
         with st.expander("Errors", expanded=False):
             st_df(pd.DataFrame(errors), height=200)
+
+
+if hasattr(st, "fragment"):
+    @st.fragment
+    def _render_6_week_calc_fragment(symbol: str, spot_val: float, start_friday: dt.date):
+        _render_6_week_calc_body(symbol=symbol, spot_val=spot_val, start_friday=start_friday)
+else:
+    def _render_6_week_calc_fragment(symbol: str, spot_val: float, start_friday: dt.date):
+        _render_6_week_calc_body(symbol=symbol, spot_val=spot_val, start_friday=start_friday)
+
+
+def render_tab_friday_calculation_6_weeks(symbol: str, spot: float):
+    st.subheader("🗓️ Friday Calculation (6 Weeks)")
+
+    if not symbol:
+        st.warning("Symbol is required.")
+        return
+
+    spot_val = _to_num(spot)
+    if spot_val is None or spot_val <= 0:
+        st.warning("Valid spot price is required.")
+        return
+
+    start_friday = _next_friday(dt.date.today())
+    end_friday = start_friday + dt.timedelta(days=35)
+    st.caption(
+        f"Nearest upcoming Friday: **{start_friday.isoformat()}**  |  "
+        f"Range: **{start_friday.isoformat()} → {end_friday.isoformat()}**  |  "
+        f"Spot used for all weeks: **{spot_val:,.2f}**"
+    )
+
+    _render_6_week_calc_fragment(symbol=symbol, spot_val=spot_val, start_friday=start_friday)

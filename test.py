@@ -64,7 +64,16 @@ def parse_cookie_header(cookie_header: str) -> dict:
         if not part or "=" not in part:
             continue
         key, value = part.split("=", 1)
-        cookies[key.strip()] = value.strip()
+        key = key.strip()
+        value = value.strip()
+        # requests/http cookie handling requires latin-1 encodable values.
+        # Skip malformed/truncated entries copied from UI previews (e.g., containing unicode ellipsis).
+        try:
+            key.encode("latin-1")
+            value.encode("latin-1")
+        except UnicodeEncodeError:
+            continue
+        cookies[key] = value
     return cookies
 
 
@@ -117,6 +126,7 @@ def fetch_options_data(cookie_input: str, params: dict | None = None) -> dict:
     xsrf_override = os.getenv("BARCHART_XSRF_TOKEN") or os.getenv("BARCHART_DIRECT_XSRF")
 
     with requests.Session() as session:
+        session.trust_env = False
         session.headers.update(headers)
         session.cookies.update(cookies)
 

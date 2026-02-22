@@ -91,7 +91,7 @@ app.add_middleware(
 )
 
 # ---------------- Cache (avoid double-scraping) ----------------
-_OPTIONS_CACHE = {}  # (symbol,date) -> {"ts": float, "rows": list}
+_OPTIONS_CACHE = {}  # (symbol,date) -> {"ts": float, "rows": list, "direct_auth": dict|None}
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min default (was 5 min)
 CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "3600"))  # serve stale up to 1 hour
 # Spot cache: short TTL for "real-time" with stale fallback for stability.
@@ -137,7 +137,51 @@ _PENDING_SPOT = {}  # symbol -> asyncio.Event (signals when spot fetch completes
 _PENDING_SPOT_LOCK = asyncio.Lock()
 
 
-async def get_rows_cached(symbol: str, date: str):
+def _cache_key(symbol: str, date: str) -> tuple[str, str]:
+    return ((symbol or "").upper().strip(), (date or "").strip())
+
+
+def _headers_get_case_insensitive(headers: dict | None, name: str) -> str | None:
+    if not isinstance(headers, dict):
+        return None
+    needle = str(name).strip().lower()
+    for k, v in headers.items():
+        if str(k).strip().lower() == needle and v not in (None, ""):
+            return str(v)
+    return None
+
+
+def _extract_xsrf_from_cookie_header(cookie_header: str | None) -> str | None:
+    if not cookie_header:
+        return None
+    for part in str(cookie_header).split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        if key.strip().lower() == "xsrf-token":
+            return value.strip()
+    return None
+
+
+def _build_direct_auth_from_headers(headers: dict | None) -> dict | None:
+    cookie_header = _headers_get_case_insensitive(headers, "cookie")
+    if not cookie_header:
+        return None
+
+    xsrf_header = _headers_get_case_insensitive(headers, "x-xsrf-token")
+    xsrf_cookie = _extract_xsrf_from_cookie_header(cookie_header)
+    xsrf_token = xsrf_header or xsrf_cookie
+
+    return {
+        "cookie_header": cookie_header,
+        "xsrf_token": xsrf_token,
+        "captured_at": datetime.now().isoformat(),
+        "source": "backend_browser_network",
+    }
+
+
+async def get_rows_cached_with_meta(symbol: str, date: str, force_refresh: bool = False):
     """
     Fetch options with:
     1. Cache hit -> return immediately
@@ -145,19 +189,19 @@ async def get_rows_cached(symbol: str, date: str):
     3. Request deduplication -> wait for in-flight scrape instead of starting new one
     4. Otherwise -> scrape fresh data
     """
-    key = (symbol.upper().strip(), date.strip())
+    key = _cache_key(symbol, date)
     now = time()
 
     # 1. Fresh cache hit
     hit = _OPTIONS_CACHE.get(key)
-    if hit and (now - hit["ts"]) < CACHE_TTL_SECONDS:
+    if (not force_refresh) and hit and (now - hit["ts"]) < CACHE_TTL_SECONDS:
         print(f"[CACHE] Fresh cache hit for {key}")
-        return hit["rows"]
+        return hit["rows"], hit.get("direct_auth")
 
     # 2. Stale cache available + browser busy -> return stale immediately
-    if hit and (now - hit["ts"]) < CACHE_STALE_SECONDS and _BROWSER_SEMAPHORE.locked():
+    if (not force_refresh) and hit and (now - hit["ts"]) < CACHE_STALE_SECONDS and _BROWSER_SEMAPHORE.locked():
         print(f"[CACHE] Returning stale data for {key} (browser busy)")
-        return hit["rows"]
+        return hit["rows"], hit.get("direct_auth")
 
     # 3. Check if another request is already scraping this key
     async with _PENDING_OPTIONS_LOCK:
@@ -176,7 +220,7 @@ async def get_rows_cached(symbol: str, date: str):
         hit = _OPTIONS_CACHE.get(key)
         if hit:
             print(f"[DEDUP] Got result from parallel scrape for {key}")
-            return hit["rows"]
+            return hit["rows"], hit.get("direct_auth")
 
     # 4. Start a new scrape (register as pending first)
     event = asyncio.Event()
@@ -186,29 +230,34 @@ async def get_rows_cached(symbol: str, date: str):
     try:
         # Wait for the result with a timeout slightly shorter than the frontend timeout
         async with asyncio.timeout(110):
-            rows = await scrape_options(symbol, date)
-            _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows}
-            return rows
+            rows, direct_auth = await scrape_options(symbol, date)
+            _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows, "direct_auth": direct_auth}
+            return rows, direct_auth
     except asyncio.TimeoutError:
         print(f"[TIMEOUT] Scrape for {key} took too long.")
         # Serve stale if we have it
         hit = _OPTIONS_CACHE.get(key)
         if hit and (now - hit["ts"]) < CACHE_STALE_SECONDS:
             print(f"[STALE] Returning stale options for {key} after timeout.")
-            return hit["rows"]
+            return hit["rows"], hit.get("direct_auth")
         raise HTTPException(status_code=504, detail="Scrape timed out. Please try again.")
     except HTTPException:
         # Serve stale if we have it
         hit = _OPTIONS_CACHE.get(key)
         if hit and (now - hit["ts"]) < CACHE_STALE_SECONDS:
             print(f"[STALE] Returning stale options for {key} after scrape error.")
-            return hit["rows"]
+            return hit["rows"], hit.get("direct_auth")
         raise
     finally:
         # Signal other waiters that we're done
         event.set()
         async with _PENDING_OPTIONS_LOCK:
             _PENDING_OPTIONS.pop(key, None)
+
+
+async def get_rows_cached(symbol: str, date: str, force_refresh: bool = False):
+    rows, _direct_auth = await get_rows_cached_with_meta(symbol=symbol, date=date, force_refresh=force_refresh)
+    return rows
 
 
 async def get_spot_cached(symbol: str, date: str | None):
@@ -783,6 +832,38 @@ async def scrape_options(symbol: str, date: str):
 
     for attempt in range(OPTIONS_RETRY_COUNT + 1):
         captured_requests = {}
+        captured_direct_auth = None
+        request_url_by_id = {}
+
+        def _maybe_capture_direct_auth(headers: dict | None):
+            nonlocal captured_direct_auth
+            if captured_direct_auth is not None:
+                return
+            auth = _build_direct_auth_from_headers(headers)
+            if auth is not None:
+                captured_direct_auth = auth
+
+        async def on_request_will_be_sent(request_log):
+            params = request_log.get("params", {})
+            request_id = params.get("requestId")
+            request = params.get("request", {})
+            req_url = request.get("url", "")
+            headers = request.get("headers", {})
+
+            if request_id and req_url:
+                request_url_by_id[str(request_id)] = req_url
+
+            if "/proxies/core-api/v1/options/get" in req_url:
+                if "options" not in captured_requests:
+                    captured_requests["options"] = (request_id, req_url)
+                _maybe_capture_direct_auth(headers)
+
+        async def on_request_extra_info(extra_info_log):
+            params = extra_info_log.get("params", {})
+            request_id = str(params.get("requestId", ""))
+            req_url = request_url_by_id.get(request_id, "")
+            if "/proxies/core-api/v1/options/get" in req_url:
+                _maybe_capture_direct_auth(params.get("headers", {}))
 
         async def on_response(response_log):
             params = response_log.get("params", {})
@@ -791,6 +872,7 @@ async def scrape_options(symbol: str, date: str):
 
             if "/proxies/core-api/v1/options/get" in resp_url and "options" not in captured_requests:
                 captured_requests["options"] = (params.get("requestId"), resp_url)
+                _maybe_capture_direct_auth(response.get("requestHeaders", {}))
 
             elif "/proxies/core-api/v1/options-expirations/get" in resp_url and "expirations" not in captured_requests:
                 captured_requests["expirations"] = (params.get("requestId"), resp_url)
@@ -806,6 +888,8 @@ async def scrape_options(symbol: str, date: str):
                     tab = await browser.start()
 
                     await tab.enable_network_events()
+                    await tab.on("Network.requestWillBeSent", on_request_will_be_sent)
+                    await tab.on("Network.requestWillBeSentExtraInfo", on_request_extra_info)
                     await tab.on("Network.responseReceived", on_response)
 
                     try:
@@ -854,7 +938,7 @@ async def scrape_options(symbol: str, date: str):
                         if not rows:
                             raise HTTPException(status_code=404, detail=f"No options data found for {symbol} on {date}.")
 
-                        return rows
+                        return rows, captured_direct_auth
 
                     except json.JSONDecodeError as e:
                         raise HTTPException(status_code=500, detail=f"Failed to parse options data: {str(e)}")
@@ -1211,15 +1295,17 @@ async def yahoo_share_statistics(
 @app.get("/options")
 async def get_options_json(
     symbol: str = Query(..., description="Stock symbol (e.g., AAPL, $SPX, TSLA)"),
-    date: str = Query(..., description="Expiration date (e.g., 2026-01-16)")
+    date: str = Query(..., description="Expiration date (e.g., 2026-01-16)"),
+    force_refresh: bool = Query(False, description="Bypass cache and force fresh browser fetch"),
 ):
-    rows = await get_rows_cached(symbol, date)
+    rows, direct_auth = await get_rows_cached_with_meta(symbol=symbol, date=date, force_refresh=force_refresh)
     payload = {
         "success": True,
         "symbol": symbol,
         "date": date,
         "count": len(rows),
-        "data": rows
+        "data": rows,
+        "direct_auth": direct_auth,
     }
     return sanitize_json(payload)
 

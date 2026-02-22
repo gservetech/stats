@@ -253,6 +253,7 @@ def main():
         st.session_state["gex_result"] = None
         st.session_state["hist_df"] = pd.DataFrame()
         st.session_state["spot_at_fetch"] = None
+        st.session_state["barchart_direct_auth"] = None
         st.session_state["last_symbol"] = symbol
 
     # -------------------------------------------------------------------------
@@ -292,8 +293,13 @@ def main():
 
         with st.spinner(f"Analyzing market structure for {symbol}..."):
             st.session_state["options_result"] = fetch_with_retry(
-                fetch_options, "Options Chain", 3, symbol, date
+                fetch_options, "Options Chain", 3, symbol, date, True
             )
+
+            options_payload = (st.session_state.get("options_result") or {}).get("data", {})
+            direct_auth = options_payload.get("direct_auth") if isinstance(options_payload, dict) else None
+            if isinstance(direct_auth, dict) and direct_auth.get("cookie_header"):
+                st.session_state["barchart_direct_auth"] = direct_auth
 
             st.session_state["weekly_result"] = fetch_with_retry(
                 fetch_weekly_summary, "Weekly Summary", 3, symbol, date, spot
@@ -473,7 +479,11 @@ def main():
             _show_core_fetch_hint()
 
     with tF6:
-        render_tab_friday_calculation_6_weeks(symbol=symbol, spot=spot)
+        render_tab_friday_calculation_6_weeks(
+            symbol=symbol,
+            spot=spot,
+            direct_auth=st.session_state.get("barchart_direct_auth"),
+        )
 
     with t12:
         render_tab_friday_playbook(

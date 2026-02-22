@@ -60,11 +60,11 @@ def fetch_spot_quote(symbol: str, date: str, force_refresh: bool = False):
         return {"success": False, "error": str(e), "status_code": 500}
 
 @safe_cache_data(ttl=300, show_spinner=False)
-def fetch_options(symbol: str, date: str):
+def fetch_options(symbol: str, date: str, force_refresh: bool = False):
     try:
         r = requests.get(
             f"{API_BASE_URL}/options",
-            params={"symbol": symbol, "date": date},
+            params={"symbol": symbol, "date": date, "force_refresh": force_refresh},
             timeout=300
         )
         if r.status_code == 200:

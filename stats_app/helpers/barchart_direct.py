@@ -99,7 +99,16 @@ def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
         if not part or "=" not in part:
             continue
         key, value = part.split("=", 1)
-        cookies[key.strip()] = value.strip()
+        key = key.strip()
+        value = value.strip()
+        # requests/http cookie handling requires latin-1 encodable values.
+        # Skip malformed/truncated entries copied from UI previews (e.g., containing unicode ellipsis).
+        try:
+            key.encode("latin-1")
+            value.encode("latin-1")
+        except UnicodeEncodeError:
+            continue
+        cookies[key] = value
     return cookies
 
 
@@ -316,7 +325,7 @@ class BarchartDirectClient:
 
     @property
     def ready(self) -> bool:
-        return bool(self.cookie_header)
+        return bool(self.cookies)
 
     @classmethod
     def from_env(cls) -> "BarchartDirectClient":

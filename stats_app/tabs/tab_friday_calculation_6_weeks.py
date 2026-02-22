@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import streamlit as st
 
+from stats_app.helpers.api_client import fetch_weekly_gex, fetch_weekly_summary
 from stats_app.helpers.barchart_direct import BarchartDirectClient
 from stats_app.helpers.calculations import compute_gamma_map_artifacts
 from stats_app.helpers.ui_components import st_btn, st_df
@@ -22,31 +23,103 @@ def _to_num(val):
         return None
 
 
-def _run_6_week_calc(symbol: str, spot: float, start_friday: dt.date) -> tuple[pd.DataFrame, list[dict]]:
+def _run_6_week_calc(
+    symbol: str,
+    spot: float,
+    start_friday: dt.date,
+    direct_auth: dict | None = None,
+) -> tuple[pd.DataFrame, list[dict]]:
     rows: list[dict] = []
     errors: list[dict] = []
 
-    client = BarchartDirectClient.from_env()
-    if not client.ready:
-        errors.append(
-            {
-                "expiry": "all",
-                "summary_error": "Direct cookie missing",
-                "gex_error": "Set BARCHART_DIRECT_COOKIE in .env for Friday 6-week direct mode.",
-            }
-        )
-        return pd.DataFrame(rows), errors
-    client.close()
+    runtime_cookie = (direct_auth or {}).get("cookie_header")
+    runtime_xsrf = (direct_auth or {}).get("xsrf_token")
 
-    def _fetch_week_job(week_idx: int, expiry_str: str) -> tuple[int, str, dict]:
-        wk_client = BarchartDirectClient.from_env()
+    def _make_direct_client() -> BarchartDirectClient:
+        if runtime_cookie:
+            timeout_env = os.getenv("BARCHART_DIRECT_TIMEOUT_SECONDS", "30")
+            try:
+                timeout_seconds = max(5, int(timeout_env))
+            except Exception:
+                timeout_seconds = 30
+            return BarchartDirectClient(
+                cookie_input=str(runtime_cookie),
+                xsrf_override=str(runtime_xsrf) if runtime_xsrf else None,
+                timeout_seconds=timeout_seconds,
+            )
+        return BarchartDirectClient.from_env()
+
+    direct_probe_client = _make_direct_client()
+    direct_ready = direct_probe_client.ready
+    direct_probe_client.close()
+
+    def _fetch_week_direct(expiry_str: str) -> dict:
+        if not direct_ready:
+            return {
+                "success": False,
+                "error": "Direct cookie unavailable (no session-captured auth and no BARCHART_DIRECT_COOKIE).",
+                "source": "direct_api",
+            }
+        wk_client = _make_direct_client()
         try:
             res = wk_client.fetch_weekly_summary_and_gex(symbol=symbol, date=expiry_str, spot=float(spot))
         except Exception as exc:
             res = {"success": False, "error": str(exc)}
         finally:
             wk_client.close()
-        return week_idx, expiry_str, res
+        if res.get("success"):
+            res["source"] = "direct_api_session" if runtime_cookie else "direct_api"
+        else:
+            res.setdefault("source", "direct_api")
+        return res
+
+    def _fetch_week_browser(expiry_str: str) -> dict:
+        summary_res = fetch_weekly_summary(symbol=symbol, date=expiry_str, spot=float(spot))
+        gex_res = fetch_weekly_gex(symbol=symbol, date=expiry_str, spot=float(spot))
+
+        summary_ok = bool(summary_res.get("success"))
+        gex_ok = bool(gex_res.get("success"))
+        if summary_ok and gex_ok:
+            return {
+                "success": True,
+                "source": "browser_scrape",
+                "expiration_type": "weekly",
+                "summary": summary_res.get("data", {}),
+                "gex": gex_res.get("data", {}),
+            }
+
+        summary_err = summary_res.get("error", "weekly summary failed")
+        gex_err = gex_res.get("error", "weekly gex failed")
+        return {
+            "success": False,
+            "source": "browser_scrape",
+            "summary_error": summary_err,
+            "gex_error": gex_err,
+            "error": f"summary={summary_err}; gex={gex_err}",
+        }
+
+    def _fetch_week_job(week_idx: int, expiry_str: str) -> tuple[int, str, dict]:
+        direct_res = _fetch_week_direct(expiry_str)
+        if direct_res.get("success"):
+            return week_idx, expiry_str, direct_res
+
+        browser_res = _fetch_week_browser(expiry_str)
+        if browser_res.get("success"):
+            browser_res["direct_error"] = direct_res.get("error", "Direct request failed")
+            return week_idx, expiry_str, browser_res
+
+        combined_error = (
+            f"direct={direct_res.get('error', 'failed')} | "
+            f"browser={browser_res.get('error', 'failed')}"
+        )
+        return week_idx, expiry_str, {
+            "success": False,
+            "source": "direct_api->browser_scrape",
+            "error": combined_error,
+            "direct_error": direct_res.get("error", "Direct request failed"),
+            "summary_error": browser_res.get("summary_error"),
+            "gex_error": browser_res.get("gex_error"),
+        }
 
     work_items: list[tuple[int, str]] = []
     for i in range(6):
@@ -102,7 +175,7 @@ def _run_6_week_calc(symbol: str, spot: float, start_friday: dt.date) -> tuple[p
 
             row.update(
                 {
-                    "source": "direct_api",
+                    "source": direct_res.get("source", "direct_api"),
                     "exp_type": direct_res.get("expiration_type", "weekly"),
                     "call_gex_total": _to_num(totals.get("call_gex")),
                     "put_gex_total": _to_num(totals.get("put_gex")),
@@ -118,15 +191,22 @@ def _run_6_week_calc(symbol: str, spot: float, start_friday: dt.date) -> tuple[p
             )
         else:
             err = direct_res.get("error", "Direct weekly request failed")
-            row.update({"source": "direct_api", "status": "error", "error": f"direct={err}"})
-            errors.append({"expiry": expiry_str, "summary_error": err, "gex_error": err})
+            row.update({"source": direct_res.get("source", "direct_api"), "status": "error", "error": err})
+            errors.append(
+                {
+                    "expiry": expiry_str,
+                    "direct_error": direct_res.get("direct_error", err),
+                    "summary_error": direct_res.get("summary_error", err),
+                    "gex_error": direct_res.get("gex_error", err),
+                }
+            )
 
         rows.append(row)
 
     return pd.DataFrame(rows), errors
 
 
-def _render_6_week_calc_body(symbol: str, spot_val: float, start_friday: dt.date):
+def _render_6_week_calc_body(symbol: str, spot_val: float, start_friday: dt.date, direct_auth: dict | None = None):
     calculate_now = st.selectbox(
         "Calculate 6-week data now?",
         options=["No", "Yes"],
@@ -145,19 +225,27 @@ def _render_6_week_calc_body(symbol: str, spot_val: float, start_friday: dt.date
         cached_spot = float((cached or {}).get("spot", 0.0))
     except Exception:
         cached_spot = 0.0
+    auth_stamp = (direct_auth or {}).get("captured_at") or ""
     needs_run = (
         refresh
         or not cached
         or cached.get("start_friday") != start_friday.isoformat()
         or abs(cached_spot - spot_val) > 1e-9
+        or (cached.get("auth_stamp", "") != auth_stamp)
     )
 
     if needs_run:
         with st.spinner(f"Calculating 6 Friday snapshots for {symbol}..."):
-            out_df, errors = _run_6_week_calc(symbol=symbol, spot=spot_val, start_friday=start_friday)
+            out_df, errors = _run_6_week_calc(
+                symbol=symbol,
+                spot=spot_val,
+                start_friday=start_friday,
+                direct_auth=direct_auth,
+            )
         st.session_state[cache_key] = {
             "start_friday": start_friday.isoformat(),
             "spot": float(spot_val),
+            "auth_stamp": auth_stamp,
             "rows": out_df,
             "errors": errors,
             "updated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -209,16 +297,16 @@ def _render_6_week_calc_body(symbol: str, spot_val: float, start_friday: dt.date
 
 if hasattr(st, "fragment"):
     @st.fragment
-    def _render_6_week_calc_fragment(symbol: str, spot_val: float, start_friday: dt.date):
-        _render_6_week_calc_body(symbol=symbol, spot_val=spot_val, start_friday=start_friday)
+    def _render_6_week_calc_fragment(symbol: str, spot_val: float, start_friday: dt.date, direct_auth: dict | None = None):
+        _render_6_week_calc_body(symbol=symbol, spot_val=spot_val, start_friday=start_friday, direct_auth=direct_auth)
 else:
-    def _render_6_week_calc_fragment(symbol: str, spot_val: float, start_friday: dt.date):
-        _render_6_week_calc_body(symbol=symbol, spot_val=spot_val, start_friday=start_friday)
+    def _render_6_week_calc_fragment(symbol: str, spot_val: float, start_friday: dt.date, direct_auth: dict | None = None):
+        _render_6_week_calc_body(symbol=symbol, spot_val=spot_val, start_friday=start_friday, direct_auth=direct_auth)
 
 
-def render_tab_friday_calculation_6_weeks(symbol: str, spot: float):
+def render_tab_friday_calculation_6_weeks(symbol: str, spot: float, direct_auth: dict | None = None):
     st.subheader("🗓️ Friday Calculation (6 Weeks)")
-    st.caption("Data source for this tab: direct Barchart API (cookie-auth), no browser scraping.")
+    st.caption("Data source: direct Barchart API first (cookie-auth), with browser-scrape fallback per week.")
 
     if not symbol:
         st.warning("Symbol is required.")
@@ -237,4 +325,12 @@ def render_tab_friday_calculation_6_weeks(symbol: str, spot: float):
         f"Spot used for all weeks: **{spot_val:,.2f}**"
     )
 
-    _render_6_week_calc_fragment(symbol=symbol, spot_val=spot_val, start_friday=start_friday)
+    if isinstance(direct_auth, dict) and direct_auth.get("captured_at"):
+        st.caption(f"Session direct auth cached from Fetch Data at: {direct_auth.get('captured_at')}")
+
+    _render_6_week_calc_fragment(
+        symbol=symbol,
+        spot_val=spot_val,
+        start_friday=start_friday,
+        direct_auth=direct_auth,
+    )

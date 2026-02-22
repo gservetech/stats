@@ -473,10 +473,7 @@ def main():
             _show_core_fetch_hint()
 
     with tF6:
-        if has_core_data:
-            render_tab_friday_calculation_6_weeks(symbol=symbol, spot=spot)
-        else:
-            _show_core_fetch_hint()
+        render_tab_friday_calculation_6_weeks(symbol=symbol, spot=spot)
 
     with t12:
         render_tab_friday_playbook(

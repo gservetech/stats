@@ -3,7 +3,7 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-from stats_app.helpers.api_client import fetch_weekly_gex, fetch_weekly_summary
+from stats_app.helpers.barchart_direct import BarchartDirectClient
 from stats_app.helpers.calculations import compute_gamma_map_artifacts
 from stats_app.helpers.ui_components import st_btn, st_df
 
@@ -24,53 +24,67 @@ def _run_6_week_calc(symbol: str, spot: float, start_friday: dt.date) -> tuple[p
     rows: list[dict] = []
     errors: list[dict] = []
 
-    for i in range(6):
-        expiry = start_friday + dt.timedelta(days=7 * i)
-        expiry_str = expiry.isoformat()
+    client = BarchartDirectClient.from_env()
+    if not client.ready:
+        errors.append(
+            {
+                "expiry": "all",
+                "summary_error": "Direct cookie missing",
+                "gex_error": "Set BARCHART_DIRECT_COOKIE in .env for Friday 6-week direct mode.",
+            }
+        )
+        return pd.DataFrame(rows), errors
 
-        summary_res = fetch_weekly_summary(symbol, expiry_str, spot)
-        gex_res = fetch_weekly_gex(symbol, expiry_str, spot)
+    try:
+        for i in range(6):
+            expiry = start_friday + dt.timedelta(days=7 * i)
+            expiry_str = expiry.isoformat()
 
-        row = {
-            "week": i + 1,
-            "expiry": expiry_str,
-            "spot_used": float(spot),
-        }
+            row = {
+                "week": i + 1,
+                "expiry": expiry_str,
+                "spot_used": float(spot),
+            }
 
-        summary_ok = bool(summary_res and summary_res.get("success"))
-        gex_ok = bool(gex_res and gex_res.get("success"))
+            try:
+                direct_res = client.fetch_weekly_summary_and_gex(symbol=symbol, date=expiry_str, spot=float(spot))
+            except Exception as exc:
+                direct_res = {"success": False, "error": str(exc)}
 
-        if summary_ok and gex_ok:
-            summary_data = summary_res.get("data", {})
-            totals = summary_data.get("totals", {}) if isinstance(summary_data, dict) else {}
-            pcr = summary_data.get("pcr", {}) if isinstance(summary_data, dict) else {}
+            if direct_res.get("success"):
+                summary_data = direct_res.get("summary", {})
+                totals = summary_data.get("totals", {}) if isinstance(summary_data, dict) else {}
+                pcr = summary_data.get("pcr", {}) if isinstance(summary_data, dict) else {}
 
-            gex_data = gex_res.get("data", {}) if isinstance(gex_res, dict) else {}
-            gex_rows = gex_data.get("data", []) if isinstance(gex_data, dict) else []
-            gex_df = pd.DataFrame(gex_rows)
-            art = compute_gamma_map_artifacts(gex_df, spot=float(spot), top_n=10) if not gex_df.empty else {}
+                gex_payload = direct_res.get("gex", {})
+                gex_rows = gex_payload.get("data", []) if isinstance(gex_payload, dict) else []
+                gex_df = pd.DataFrame(gex_rows)
+                art = compute_gamma_map_artifacts(gex_df, spot=float(spot), top_n=10) if not gex_df.empty else {}
 
-            row.update(
-                {
-                    "call_gex_total": _to_num(totals.get("call_gex")),
-                    "put_gex_total": _to_num(totals.get("put_gex")),
-                    "net_gex_total": _to_num(totals.get("net_gex")),
-                    "pcr_oi": _to_num(pcr.get("oi")),
-                    "pcr_volume": _to_num(pcr.get("volume")),
-                    "call_wall": _to_num(art.get("call_wall")),
-                    "put_wall": _to_num(art.get("put_wall")),
-                    "magnet": _to_num(art.get("magnet")),
-                    "zero_gamma": _to_num(art.get("zero_gamma")),
-                    "status": "ok",
-                }
-            )
-        else:
-            summary_err = summary_res.get("error", "Unknown summary error") if isinstance(summary_res, dict) else "Summary request failed"
-            gex_err = gex_res.get("error", "Unknown gex error") if isinstance(gex_res, dict) else "GEX request failed"
-            row.update({"status": "error", "error": f"summary={summary_err}; gex={gex_err}"})
-            errors.append({"expiry": expiry_str, "summary_error": summary_err, "gex_error": gex_err})
+                row.update(
+                    {
+                        "source": "direct_api",
+                        "exp_type": direct_res.get("expiration_type", "weekly"),
+                        "call_gex_total": _to_num(totals.get("call_gex")),
+                        "put_gex_total": _to_num(totals.get("put_gex")),
+                        "net_gex_total": _to_num(totals.get("net_gex")),
+                        "pcr_oi": _to_num(pcr.get("oi")),
+                        "pcr_volume": _to_num(pcr.get("volume")),
+                        "call_wall": _to_num(art.get("call_wall")),
+                        "put_wall": _to_num(art.get("put_wall")),
+                        "magnet": _to_num(art.get("magnet")),
+                        "zero_gamma": _to_num(art.get("zero_gamma")),
+                        "status": "ok",
+                    }
+                )
+            else:
+                err = direct_res.get("error", "Direct weekly request failed")
+                row.update({"source": "direct_api", "status": "error", "error": f"direct={err}"})
+                errors.append({"expiry": expiry_str, "summary_error": err, "gex_error": err})
 
-        rows.append(row)
+            rows.append(row)
+    finally:
+        client.close()
 
     return pd.DataFrame(rows), errors
 
@@ -131,6 +145,8 @@ def _render_6_week_calc_body(symbol: str, spot_val: float, start_friday: dt.date
     show_cols = [
         "week",
         "expiry",
+        "source",
+        "exp_type",
         "spot_used",
         "call_gex_total",
         "put_gex_total",
@@ -165,6 +181,7 @@ else:
 
 def render_tab_friday_calculation_6_weeks(symbol: str, spot: float):
     st.subheader("🗓️ Friday Calculation (6 Weeks)")
+    st.caption("Data source for this tab: direct Barchart API (cookie-auth), no browser scraping.")
 
     if not symbol:
         st.warning("Symbol is required.")

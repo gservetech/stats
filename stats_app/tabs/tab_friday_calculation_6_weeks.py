@@ -1,4 +1,6 @@
 import datetime as dt
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import streamlit as st
@@ -34,57 +36,92 @@ def _run_6_week_calc(symbol: str, spot: float, start_friday: dt.date) -> tuple[p
             }
         )
         return pd.DataFrame(rows), errors
+    client.close()
 
+    def _fetch_week_job(week_idx: int, expiry_str: str) -> tuple[int, str, dict]:
+        wk_client = BarchartDirectClient.from_env()
+        try:
+            res = wk_client.fetch_weekly_summary_and_gex(symbol=symbol, date=expiry_str, spot=float(spot))
+        except Exception as exc:
+            res = {"success": False, "error": str(exc)}
+        finally:
+            wk_client.close()
+        return week_idx, expiry_str, res
+
+    work_items: list[tuple[int, str]] = []
+    for i in range(6):
+        expiry = start_friday + dt.timedelta(days=7 * i)
+        work_items.append((i + 1, expiry.isoformat()))
+
+    max_workers_env = os.getenv("FRIDAY_6W_MAX_WORKERS", "6")
     try:
-        for i in range(6):
-            expiry = start_friday + dt.timedelta(days=7 * i)
-            expiry_str = expiry.isoformat()
+        max_workers = max(1, min(len(work_items), int(max_workers_env)))
+    except Exception:
+        max_workers = min(len(work_items), 6)
 
-            row = {
-                "week": i + 1,
-                "expiry": expiry_str,
-                "spot_used": float(spot),
-            }
+    results_by_week: dict[int, tuple[str, dict]] = {}
+    failed_weeks: list[tuple[int, str]] = []
 
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_fetch_week_job, week_idx, expiry_str) for week_idx, expiry_str in work_items]
+        for fut in as_completed(futures):
             try:
-                direct_res = client.fetch_weekly_summary_and_gex(symbol=symbol, date=expiry_str, spot=float(spot))
+                week_idx, expiry_str, direct_res = fut.result()
             except Exception as exc:
-                direct_res = {"success": False, "error": str(exc)}
+                # Should be rare since _fetch_week_job already catches, but keep this as a safeguard.
+                week_idx, expiry_str, direct_res = -1, "unknown", {"success": False, "error": str(exc)}
 
-            if direct_res.get("success"):
-                summary_data = direct_res.get("summary", {})
-                totals = summary_data.get("totals", {}) if isinstance(summary_data, dict) else {}
-                pcr = summary_data.get("pcr", {}) if isinstance(summary_data, dict) else {}
+            if week_idx != -1:
+                results_by_week[week_idx] = (expiry_str, direct_res)
+                if not direct_res.get("success"):
+                    failed_weeks.append((week_idx, expiry_str))
 
-                gex_payload = direct_res.get("gex", {})
-                gex_rows = gex_payload.get("data", []) if isinstance(gex_payload, dict) else []
-                gex_df = pd.DataFrame(gex_rows)
-                art = compute_gamma_map_artifacts(gex_df, spot=float(spot), top_n=10) if not gex_df.empty else {}
+    # One retry pass for failures (sequential) to smooth transient API hiccups.
+    for week_idx, expiry_str in failed_weeks:
+        _, _, retry_res = _fetch_week_job(week_idx, expiry_str)
+        if retry_res.get("success"):
+            results_by_week[week_idx] = (expiry_str, retry_res)
 
-                row.update(
-                    {
-                        "source": "direct_api",
-                        "exp_type": direct_res.get("expiration_type", "weekly"),
-                        "call_gex_total": _to_num(totals.get("call_gex")),
-                        "put_gex_total": _to_num(totals.get("put_gex")),
-                        "net_gex_total": _to_num(totals.get("net_gex")),
-                        "pcr_oi": _to_num(pcr.get("oi")),
-                        "pcr_volume": _to_num(pcr.get("volume")),
-                        "call_wall": _to_num(art.get("call_wall")),
-                        "put_wall": _to_num(art.get("put_wall")),
-                        "magnet": _to_num(art.get("magnet")),
-                        "zero_gamma": _to_num(art.get("zero_gamma")),
-                        "status": "ok",
-                    }
-                )
-            else:
-                err = direct_res.get("error", "Direct weekly request failed")
-                row.update({"source": "direct_api", "status": "error", "error": f"direct={err}"})
-                errors.append({"expiry": expiry_str, "summary_error": err, "gex_error": err})
+    for week_idx, expiry_str in work_items:
+        direct_res = (results_by_week.get(week_idx) or (expiry_str, {"success": False, "error": "Missing result"}))[1]
+        row = {
+            "week": week_idx,
+            "expiry": expiry_str,
+            "spot_used": float(spot),
+        }
 
-            rows.append(row)
-    finally:
-        client.close()
+        if direct_res.get("success"):
+            summary_data = direct_res.get("summary", {})
+            totals = summary_data.get("totals", {}) if isinstance(summary_data, dict) else {}
+            pcr = summary_data.get("pcr", {}) if isinstance(summary_data, dict) else {}
+
+            gex_payload = direct_res.get("gex", {})
+            gex_rows = gex_payload.get("data", []) if isinstance(gex_payload, dict) else []
+            gex_df = pd.DataFrame(gex_rows)
+            art = compute_gamma_map_artifacts(gex_df, spot=float(spot), top_n=10) if not gex_df.empty else {}
+
+            row.update(
+                {
+                    "source": "direct_api",
+                    "exp_type": direct_res.get("expiration_type", "weekly"),
+                    "call_gex_total": _to_num(totals.get("call_gex")),
+                    "put_gex_total": _to_num(totals.get("put_gex")),
+                    "net_gex_total": _to_num(totals.get("net_gex")),
+                    "pcr_oi": _to_num(pcr.get("oi")),
+                    "pcr_volume": _to_num(pcr.get("volume")),
+                    "call_wall": _to_num(art.get("call_wall")),
+                    "put_wall": _to_num(art.get("put_wall")),
+                    "magnet": _to_num(art.get("magnet")),
+                    "zero_gamma": _to_num(art.get("zero_gamma")),
+                    "status": "ok",
+                }
+            )
+        else:
+            err = direct_res.get("error", "Direct weekly request failed")
+            row.update({"source": "direct_api", "status": "error", "error": f"direct={err}"})
+            errors.append({"expiry": expiry_str, "summary_error": err, "gex_error": err})
+
+        rows.append(row)
 
     return pd.DataFrame(rows), errors
 

@@ -23,6 +23,37 @@ def _to_num(val):
         return None
 
 
+def _to_date(date_str: str) -> dt.date | None:
+    try:
+        return dt.date.fromisoformat(str(date_str))
+    except Exception:
+        return None
+
+
+def _week_expiry_candidates(target_expiry_str: str) -> list[str]:
+    d = _to_date(target_expiry_str)
+    if d is None:
+        return [target_expiry_str]
+    # Weekly expiries can shift earlier (e.g., Friday holiday -> Thursday).
+    prev = d - dt.timedelta(days=1)
+    return [d.isoformat(), prev.isoformat()]
+
+
+def _is_retryable_error(status_code: int | None, err_text: str | None) -> bool:
+    if status_code is not None:
+        return int(status_code) in {408, 429, 500, 502, 503, 504}
+    t = (err_text or "").lower()
+    non_retryable_signals = (
+        "no contracts found",
+        "missing",
+        "not found",
+        "404",
+    )
+    if any(s in t for s in non_retryable_signals):
+        return False
+    return True
+
+
 def _run_6_week_calc(
     symbol: str,
     spot: float,
@@ -59,6 +90,7 @@ def _run_6_week_calc(
                 "success": False,
                 "error": "Direct cookie unavailable (no session-captured auth and no BARCHART_DIRECT_COOKIE).",
                 "source": "direct_api",
+                "retryable": False,
             }
         wk_client = _make_direct_client()
         try:
@@ -69,23 +101,39 @@ def _run_6_week_calc(
             wk_client.close()
         if res.get("success"):
             res["source"] = "direct_api_session" if runtime_cookie else "direct_api"
+            res["retryable"] = False
         else:
             res.setdefault("source", "direct_api")
+            res["retryable"] = _is_retryable_error(None, res.get("error"))
         return res
 
     def _fetch_week_browser(expiry_str: str) -> dict:
         summary_res = fetch_weekly_summary(symbol=symbol, date=expiry_str, spot=float(spot))
-        gex_res = fetch_weekly_gex(symbol=symbol, date=expiry_str, spot=float(spot))
-
         summary_ok = bool(summary_res.get("success"))
+        summary_status = summary_res.get("status_code")
+        if not summary_ok:
+            summary_err = summary_res.get("error", "weekly summary failed")
+            return {
+                "success": False,
+                "source": "browser_scrape",
+                "summary_error": summary_err,
+                "gex_error": "Skipped because summary failed.",
+                "status_code": summary_status,
+                "retryable": _is_retryable_error(summary_status, summary_err),
+                "error": f"summary={summary_err}",
+            }
+
+        gex_res = fetch_weekly_gex(symbol=symbol, date=expiry_str, spot=float(spot))
         gex_ok = bool(gex_res.get("success"))
-        if summary_ok and gex_ok:
+        gex_status = gex_res.get("status_code")
+        if gex_ok:
             return {
                 "success": True,
                 "source": "browser_scrape",
                 "expiration_type": "weekly",
                 "summary": summary_res.get("data", {}),
                 "gex": gex_res.get("data", {}),
+                "retryable": False,
             }
 
         summary_err = summary_res.get("error", "weekly summary failed")
@@ -95,30 +143,46 @@ def _run_6_week_calc(
             "source": "browser_scrape",
             "summary_error": summary_err,
             "gex_error": gex_err,
+            "status_code": gex_status,
+            "retryable": _is_retryable_error(gex_status, gex_err),
             "error": f"summary={summary_err}; gex={gex_err}",
         }
 
-    def _fetch_week_job(week_idx: int, expiry_str: str) -> tuple[int, str, dict]:
-        direct_res = _fetch_week_direct(expiry_str)
-        if direct_res.get("success"):
-            return week_idx, expiry_str, direct_res
+    def _fetch_week_job(week_idx: int, target_expiry_str: str) -> tuple[int, str, dict]:
+        candidates = _week_expiry_candidates(target_expiry_str)
 
-        browser_res = _fetch_week_browser(expiry_str)
-        if browser_res.get("success"):
-            browser_res["direct_error"] = direct_res.get("error", "Direct request failed")
-            return week_idx, expiry_str, browser_res
+        last_direct_res: dict | None = None
+        for candidate in candidates:
+            direct_res = _fetch_week_direct(candidate)
+            last_direct_res = direct_res
+            if direct_res.get("success"):
+                direct_res["target_expiry"] = target_expiry_str
+                direct_res["resolved_expiry"] = candidate
+                return week_idx, candidate, direct_res
 
-        combined_error = (
-            f"direct={direct_res.get('error', 'failed')} | "
-            f"browser={browser_res.get('error', 'failed')}"
-        )
-        return week_idx, expiry_str, {
+        last_browser_res: dict | None = None
+        for candidate in candidates:
+            browser_res = _fetch_week_browser(candidate)
+            last_browser_res = browser_res
+            if browser_res.get("success"):
+                browser_res["direct_error"] = (last_direct_res or {}).get("error", "Direct request failed")
+                browser_res["target_expiry"] = target_expiry_str
+                browser_res["resolved_expiry"] = candidate
+                return week_idx, candidate, browser_res
+
+        direct_error = (last_direct_res or {}).get("error", "Direct request failed")
+        browser_error = (last_browser_res or {}).get("error", "Browser fallback failed")
+        combined_error = f"direct={direct_error} | browser={browser_error}"
+        return week_idx, target_expiry_str, {
             "success": False,
             "source": "direct_api->browser_scrape",
             "error": combined_error,
-            "direct_error": direct_res.get("error", "Direct request failed"),
-            "summary_error": browser_res.get("summary_error"),
-            "gex_error": browser_res.get("gex_error"),
+            "direct_error": direct_error,
+            "summary_error": (last_browser_res or {}).get("summary_error"),
+            "gex_error": (last_browser_res or {}).get("gex_error"),
+            "retryable": bool((last_direct_res or {}).get("retryable") or (last_browser_res or {}).get("retryable")),
+            "target_expiry": target_expiry_str,
+            "resolved_expiry": target_expiry_str,
         }
 
     work_items: list[tuple[int, str]] = []
@@ -142,11 +206,11 @@ def _run_6_week_calc(
                 week_idx, expiry_str, direct_res = fut.result()
             except Exception as exc:
                 # Should be rare since _fetch_week_job already catches, but keep this as a safeguard.
-                week_idx, expiry_str, direct_res = -1, "unknown", {"success": False, "error": str(exc)}
+                week_idx, expiry_str, direct_res = -1, "unknown", {"success": False, "error": str(exc), "retryable": True}
 
             if week_idx != -1:
                 results_by_week[week_idx] = (expiry_str, direct_res)
-                if not direct_res.get("success"):
+                if not direct_res.get("success") and direct_res.get("retryable"):
                     failed_weeks.append((week_idx, expiry_str))
 
     # One retry pass for failures (sequential) to smooth transient API hiccups.
@@ -155,11 +219,15 @@ def _run_6_week_calc(
         if retry_res.get("success"):
             results_by_week[week_idx] = (expiry_str, retry_res)
 
-    for week_idx, expiry_str in work_items:
-        direct_res = (results_by_week.get(week_idx) or (expiry_str, {"success": False, "error": "Missing result"}))[1]
+    for week_idx, target_expiry_str in work_items:
+        resolved_expiry, direct_res = (
+            results_by_week.get(week_idx)
+            or (target_expiry_str, {"success": False, "error": "Missing result", "target_expiry": target_expiry_str})
+        )
         row = {
             "week": week_idx,
-            "expiry": expiry_str,
+            "target_expiry": target_expiry_str,
+            "expiry": resolved_expiry,
             "spot_used": float(spot),
         }
 
@@ -194,7 +262,8 @@ def _run_6_week_calc(
             row.update({"source": direct_res.get("source", "direct_api"), "status": "error", "error": err})
             errors.append(
                 {
-                    "expiry": expiry_str,
+                    "target_expiry": direct_res.get("target_expiry", target_expiry_str),
+                    "expiry": direct_res.get("resolved_expiry", resolved_expiry),
                     "direct_error": direct_res.get("direct_error", err),
                     "summary_error": direct_res.get("summary_error", err),
                     "gex_error": direct_res.get("gex_error", err),
@@ -269,6 +338,7 @@ def _render_6_week_calc_body(symbol: str, spot_val: float, start_friday: dt.date
 
     show_cols = [
         "week",
+        "target_expiry",
         "expiry",
         "source",
         "exp_type",

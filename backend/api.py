@@ -34,7 +34,7 @@ try:
 except Exception:
     ZoneInfo = None
     ZoneInfoNotFoundError = Exception
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, unquote
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -116,6 +116,27 @@ _BROWSER_ACQUIRE_TIMEOUT = 100 # Max wait for a browser slot before erroring
 OPTIONS_PAGELOAD_TIMEOUT = int(os.getenv("OPTIONS_PAGELOAD_TIMEOUT", "60"))
 OPTIONS_WAIT_SECONDS = int(os.getenv("OPTIONS_WAIT_SECONDS", "45"))
 OPTIONS_RETRY_COUNT = int(os.getenv("OPTIONS_RETRY_COUNT", "1"))
+DIRECT_AUTH_CACHE_TTL_SECONDS = int(os.getenv("DIRECT_AUTH_CACHE_TTL_SECONDS", "1800"))
+DIRECT_API_TIMEOUT_SECONDS = int(os.getenv("DIRECT_API_TIMEOUT_SECONDS", "30"))
+BARCHART_OPTIONS_API_URL = "https://www.barchart.com/proxies/core-api/v1/options/get"
+BARCHART_OPTIONS_FIELDS = (
+    "symbol,baseSymbol,strikePrice,expirationDate,moneyness,bidPrice,midpoint,askPrice,"
+    "lastPrice,priceChange,percentChange,volume,openInterest,openInterestChange,volatility,"
+    "delta,optionType,daysToExpiration,tradeTime,averageVolatility,historicVolatility30d,"
+    "baseNextEarningsDate,dividendExDate,baseTimeCode,expirationType,impliedVolatilityRank1y,"
+    "symbolCode,symbolType"
+)
+DIRECT_API_HEADERS_BASE = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Origin": "https://www.barchart.com",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "X-Requested-With": "XMLHttpRequest",
+}
 _EXPIRY_TZ = None
 if ZoneInfo:
     try:
@@ -135,6 +156,8 @@ _PENDING_OPTIONS = {}  # (symbol,date) -> asyncio.Event (signals when scrape com
 _PENDING_OPTIONS_LOCK = asyncio.Lock()
 _PENDING_SPOT = {}  # symbol -> asyncio.Event (signals when spot fetch completes)
 _PENDING_SPOT_LOCK = asyncio.Lock()
+_DIRECT_AUTH_CACHE = {"ts": 0.0, "auth": None}  # {"ts": float, "auth": dict|None}
+_DIRECT_AUTH_LOCK = threading.Lock()
 
 
 def _cache_key(symbol: str, date: str) -> tuple[str, str]:
@@ -164,6 +187,61 @@ def _extract_xsrf_from_cookie_header(cookie_header: str | None) -> str | None:
     return None
 
 
+def _normalize_direct_auth(auth: dict | None, source_override: str | None = None) -> dict | None:
+    if not isinstance(auth, dict):
+        return None
+    cookie_header = str(auth.get("cookie_header") or "").strip()
+    if not cookie_header:
+        return None
+
+    xsrf_token = str(auth.get("xsrf_token") or "").strip()
+    if not xsrf_token:
+        xsrf_token = _extract_xsrf_from_cookie_header(cookie_header) or ""
+    if xsrf_token:
+        xsrf_token = unquote(xsrf_token)
+
+    normalized = {
+        "cookie_header": cookie_header,
+        "xsrf_token": xsrf_token or None,
+        "captured_at": str(auth.get("captured_at") or datetime.now().isoformat()),
+        "source": source_override or str(auth.get("source") or "backend_direct_auth_cache"),
+    }
+    if auth.get("validated_at"):
+        normalized["validated_at"] = str(auth.get("validated_at"))
+    return normalized
+
+
+def _cache_direct_auth(auth: dict | None) -> dict | None:
+    normalized = _normalize_direct_auth(auth)
+    if not normalized:
+        return None
+    with _DIRECT_AUTH_LOCK:
+        _DIRECT_AUTH_CACHE["ts"] = time()
+        _DIRECT_AUTH_CACHE["auth"] = dict(normalized)
+    return normalized
+
+
+def _get_cached_direct_auth(max_age_seconds: int | None = None) -> dict | None:
+    if max_age_seconds is None:
+        max_age_seconds = DIRECT_AUTH_CACHE_TTL_SECONDS
+    with _DIRECT_AUTH_LOCK:
+        ts = float(_DIRECT_AUTH_CACHE.get("ts", 0.0) or 0.0)
+        auth = _DIRECT_AUTH_CACHE.get("auth")
+    if not isinstance(auth, dict):
+        return None
+    if max_age_seconds is not None and max_age_seconds > 0 and (time() - ts) > max_age_seconds:
+        return None
+    return dict(auth)
+
+
+def _clear_direct_auth_cache(reason: str = "") -> None:
+    with _DIRECT_AUTH_LOCK:
+        _DIRECT_AUTH_CACHE["ts"] = 0.0
+        _DIRECT_AUTH_CACHE["auth"] = None
+    if reason:
+        print(f"[DIRECT_AUTH] cleared cache: {reason}")
+
+
 def _build_direct_auth_from_headers(headers: dict | None) -> dict | None:
     cookie_header = _headers_get_case_insensitive(headers, "cookie")
     if not cookie_header:
@@ -181,13 +259,106 @@ def _build_direct_auth_from_headers(headers: dict | None) -> dict | None:
     }
 
 
+def _build_direct_options_params(symbol: str, date: str, expiration_type: str) -> dict:
+    symbol_clean = (symbol or "").strip().upper()
+    return {
+        "baseSymbol": symbol_clean,
+        "fields": BARCHART_OPTIONS_FIELDS,
+        "groupBy": "optionType",
+        "expirationDate": date,
+        "meta": "field.shortName,expirations,field.description",
+        "orderBy": "strikePrice",
+        "orderDir": "asc",
+        "optionsOverview": "true",
+        "expirationType": expiration_type,
+        "raw": "1",
+    }
+
+
+def _is_auth_expired_error(error_text: str | None, status_code: int | None) -> bool:
+    if status_code in (401, 403):
+        return True
+    t = str(error_text or "").lower()
+    auth_signals = (
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "xsrf",
+        "csrf",
+        "token",
+        "session",
+    )
+    return any(signal in t for signal in auth_signals)
+
+
+def _fetch_options_rows_via_direct_api(
+    symbol: str,
+    date: str,
+    direct_auth: dict | None,
+) -> tuple[list[dict] | None, dict | None, str | None, int | None]:
+    auth = _normalize_direct_auth(direct_auth, source_override="backend_direct_auth_cache")
+    if not auth:
+        return None, None, "missing_direct_auth", None
+
+    safe_symbol = quote((symbol or "").strip().upper(), safe="")
+    referer = f"https://www.barchart.com/stocks/quotes/{safe_symbol}/options?expiration={date}&view=sbs"
+    last_error = None
+    last_status = None
+
+    for exp_type in ("weekly", "monthly"):
+        params = _build_direct_options_params(symbol=symbol, date=date, expiration_type=exp_type)
+        headers = dict(DIRECT_API_HEADERS_BASE)
+        headers["Referer"] = referer
+        headers["Cookie"] = auth["cookie_header"]
+        if auth.get("xsrf_token"):
+            headers["X-XSRF-TOKEN"] = str(auth["xsrf_token"])
+
+        try:
+            response = requests.get(
+                BARCHART_OPTIONS_API_URL,
+                params=params,
+                headers=headers,
+                timeout=max(5, int(DIRECT_API_TIMEOUT_SECONDS)),
+            )
+        except Exception as exc:
+            last_error = f"direct_request_exception: {exc}"
+            last_status = None
+            continue
+
+        last_status = int(response.status_code)
+
+        if response.status_code in (401, 403):
+            return None, auth, f"direct_auth_failed_http_{response.status_code}", response.status_code
+        if response.status_code >= 400:
+            last_error = f"direct_http_{response.status_code}: {response.text[:220]}"
+            continue
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            last_error = f"direct_invalid_json: {exc}"
+            continue
+
+        rows = process_options_data(payload)
+        if rows:
+            validated_auth = dict(auth)
+            validated_auth["validated_at"] = datetime.now().isoformat()
+            validated_auth["source"] = "backend_direct_api_cache"
+            return rows, validated_auth, None, response.status_code
+        last_error = f"direct_no_rows_for_{exp_type}"
+
+    return None, auth, last_error or "direct_fetch_failed", last_status
+
+
 async def get_rows_cached_with_meta(symbol: str, date: str, force_refresh: bool = False):
     """
     Fetch options with:
     1. Cache hit -> return immediately
     2. Stale cache + busy browser -> return stale data (fast)
-    3. Request deduplication -> wait for in-flight scrape instead of starting new one
-    4. Otherwise -> scrape fresh data
+    3. Try direct API with cached cookie/token auth
+    4. If auth expired/invalid -> launch browser to recapture auth and retry path next time
+    5. Request deduplication -> wait for in-flight scrape instead of starting new one
     """
     key = _cache_key(symbol, date)
     now = time()
@@ -230,9 +401,40 @@ async def get_rows_cached_with_meta(symbol: str, date: str, force_refresh: bool 
     try:
         # Wait for the result with a timeout slightly shorter than the frontend timeout
         async with asyncio.timeout(110):
-            rows, direct_auth = await scrape_options(symbol, date)
-            _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows, "direct_auth": direct_auth}
-            return rows, direct_auth
+            direct_candidates: list[dict] = []
+            hit_auth = _normalize_direct_auth((hit or {}).get("direct_auth") if isinstance(hit, dict) else None)
+            if hit_auth:
+                direct_candidates.append(hit_auth)
+            cached_auth = _get_cached_direct_auth()
+            if cached_auth and (
+                not direct_candidates or cached_auth.get("cookie_header") != direct_candidates[0].get("cookie_header")
+            ):
+                direct_candidates.append(cached_auth)
+
+            direct_error = None
+            direct_status = None
+            for auth_candidate in direct_candidates:
+                rows, direct_auth, direct_error, direct_status = await asyncio.to_thread(
+                    _fetch_options_rows_via_direct_api,
+                    symbol,
+                    date,
+                    auth_candidate,
+                )
+                if rows:
+                    direct_auth = _cache_direct_auth(direct_auth) or direct_auth
+                    _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows, "direct_auth": direct_auth}
+                    print(f"[DIRECT_API] Success for {key} using cached session auth.")
+                    return rows, direct_auth
+                if _is_auth_expired_error(direct_error, direct_status):
+                    _clear_direct_auth_cache(reason=f"expired auth while fetching {key} (status={direct_status})")
+
+            if direct_candidates and direct_error:
+                print(f"[DIRECT_API] Failed for {key}: {direct_error}. Falling back to browser capture.")
+
+            rows, captured_auth = await scrape_options(symbol, date)
+            normalized_auth = _cache_direct_auth(captured_auth) if captured_auth else _get_cached_direct_auth()
+            _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows, "direct_auth": normalized_auth}
+            return rows, normalized_auth
     except asyncio.TimeoutError:
         print(f"[TIMEOUT] Scrape for {key} took too long.")
         # Serve stale if we have it
@@ -1296,7 +1498,7 @@ async def yahoo_share_statistics(
 async def get_options_json(
     symbol: str = Query(..., description="Stock symbol (e.g., AAPL, $SPX, TSLA)"),
     date: str = Query(..., description="Expiration date (e.g., 2026-01-16)"),
-    force_refresh: bool = Query(False, description="Bypass cache and force fresh browser fetch"),
+    force_refresh: bool = Query(False, description="Bypass row cache and fetch fresh data (direct API first, browser fallback)."),
 ):
     rows, direct_auth = await get_rows_cached_with_meta(symbol=symbol, date=date, force_refresh=force_refresh)
     payload = {

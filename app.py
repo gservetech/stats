@@ -54,6 +54,7 @@ from stats_app.tabs.tab_capital_flow import render_tab_capital_flow
 
 # ✅ Existing Nobel tab (you already added)
 from stats_app.tabs.tab_nobel_pattern import render_tab_nobel_pattern
+from stats_app.tabs.tab_nobel_predictor_firecrawl import render_tab_nobel_predictor_firecrawl
 
 # ✅ NEW TABS (this answer)
 from stats_app.tabs.tab_expected_move import render_tab_expected_move
@@ -359,133 +360,148 @@ def main():
     elif fetch_btn and api_ok:
         st.error("Data fetch failed after multiple retries. Please check the backend connection.")
 
-    # ---------------- Tabs (Capital Flow LAST) ----------------
-    t1, t2, t3, t4, t5, t6, t7, tNOBEL, tEM, tGF, tIVTS, t8, t9, t10, t11, tF6, t12, t13, t14, t15, t16, t17, t18 = st.tabs(
-        [
-            "📋 Chain",
-            "📊 OI",
-            "📌 Weekly GEX",
-            "🧲 Map",
-            "🧮 Greeks",
-            "🏆 Pro Edge",
-            "🔳 Folding",
-            "🧠 Nobel Pattern",
-            "📦 Expected Move",
-            "🧲 Gamma Flip",
-            "🧾 IV Term Structure",
-            "📈 VWAP",
-            "🎯 Vol Cone",
-            "🔮 Friday Predictor",
-            "🧠 Friday Predictor+",
-            "🗓️ Friday Calculation (6 Weeks)",
-            "📜 Friday Playbook",
-            "🌊 Vanna/Charm",
-            "📊 Orderflow/Delta",
-            "🧠 Interpretation",
-            "🧾 Share Stats",
-            "📈 Yahoo Data",
-            "💸 Capital Flow",   # ✅ LAST
-        ]
+    # ---------------- Stateful navigation (keeps selected tab across reruns) ----------------
+    tab_labels = [
+        "📋 Chain",
+        "📊 OI",
+        "📌 Weekly GEX",
+        "🧲 Map",
+        "🧮 Greeks",
+        "🏆 Pro Edge",
+        "🔳 Folding",
+        "🧠 Nobel Pattern",
+        "🧠 Nobel Predictor (FC)",
+        "📦 Expected Move",
+        "🧲 Gamma Flip",
+        "🧾 IV Term Structure",
+        "📈 VWAP",
+        "🎯 Vol Cone",
+        "🔮 Friday Predictor",
+        "🧠 Friday Predictor+",
+        "🗓️ Friday Calculation (6 Weeks)",
+        "📜 Friday Playbook",
+        "🌊 Vanna/Charm",
+        "📊 Orderflow/Delta",
+        "🧠 Interpretation",
+        "🧾 Share Stats",
+        "📈 Yahoo Data",
+        "💸 Capital Flow",   # ✅ LAST
+    ]
+    if "active_main_tab" not in st.session_state or st.session_state["active_main_tab"] not in tab_labels:
+        st.session_state["active_main_tab"] = tab_labels[0]
+
+    active_tab = st.pills(
+        "Dashboard Tabs",
+        options=tab_labels,
+        selection_mode="single",
+        key="active_main_tab",
+        label_visibility="collapsed",
+        width="stretch",
     )
+    if active_tab is None:
+        active_tab = st.session_state.get("active_main_tab", tab_labels[0])
 
     def _show_core_fetch_hint():
         st.info("Click `🔄 Fetch Data` in the sidebar to load this tab.")
 
-    with t1:
+    if active_tab == "📋 Chain":
         if has_core_data:
             render_tab_options_chain(df)
         else:
             _show_core_fetch_hint()
 
-    with t2:
+    elif active_tab == "📊 OI":
         if has_core_data:
             render_tab_oi_charts(df)
         else:
             _show_core_fetch_hint()
 
-    with t3:
+    elif active_tab == "📌 Weekly GEX":
         if has_core_data:
             render_tab_weekly_gamma(pcr, totals, w, spot, gex_df)
         else:
             _show_core_fetch_hint()
 
-    with t4:
+    elif active_tab == "🧲 Map":
         if has_core_data:
             render_tab_gamma_map_filters(symbol, date, spot, gex_df if not gex_df.empty else pd.DataFrame())
         else:
             _show_core_fetch_hint()
 
-    with t5:
+    elif active_tab == "🧮 Greeks":
         if has_core_data:
             render_tab_vol_greeks(df, spot, symbol, date)
         else:
             _show_core_fetch_hint()
 
-    with t6:
+    elif active_tab == "🏆 Pro Edge":
         if has_core_data:
             render_tab_pro_edge(symbol, date, spot, hist_df, totals, df)
         else:
             _show_core_fetch_hint()
 
-    with t7:
+    elif active_tab == "🔳 Folding":
         if has_core_data:
             render_tab_market_folding(symbol)
         else:
             _show_core_fetch_hint()
 
-    with tNOBEL:
+    elif active_tab == "🧠 Nobel Pattern":
         render_tab_nobel_pattern(symbol=symbol, spot=spot, hist_df=hist_df)
 
-    with tEM:
+    elif active_tab == "🧠 Nobel Predictor (FC)":
+        render_tab_nobel_predictor_firecrawl(symbol=symbol)
+
+    elif active_tab == "📦 Expected Move":
         if has_core_data:
             render_tab_expected_move(df=df, spot=spot, expiry_date=date, symbol=symbol)
         else:
             _show_core_fetch_hint()
 
-    with tGF:
+    elif active_tab == "🧲 Gamma Flip":
         if has_core_data and not gex_df.empty:
             render_tab_gamma_flip_detector(gex_df=gex_df, spot=spot, symbol=symbol)
         else:
             st.info("Run Fetch Data (needs Weekly GEX table).")
 
-    with tIVTS:
+    elif active_tab == "🧾 IV Term Structure":
         if has_core_data:
             render_tab_iv_term_structure(df=df, spot=spot, expiry_date=date, symbol=symbol)
         else:
             _show_core_fetch_hint()
 
-    with t8:
+    elif active_tab == "📈 VWAP":
         if has_core_data:
             render_tab_vwap_obv(symbol)
         else:
             _show_core_fetch_hint()
 
-    with t9:
+    elif active_tab == "🎯 Vol Cone":
         if has_core_data:
             render_tab_vol_cone(symbol)
         else:
             _show_core_fetch_hint()
 
-    with t10:
+    elif active_tab == "🔮 Friday Predictor":
         if has_core_data:
             render_tab_friday_predictor(symbol, date, hist_df, spot)
         else:
             _show_core_fetch_hint()
 
-    with t11:
+    elif active_tab == "🧠 Friday Predictor+":
         if has_core_data:
             render_tab_friday_predictor_plus(symbol, w, hist_df, spot)
         else:
             _show_core_fetch_hint()
 
-    with tF6:
+    elif active_tab == "🗓️ Friday Calculation (6 Weeks)":
         render_tab_friday_calculation_6_weeks(
             symbol=symbol,
             spot=spot,
             direct_auth=st.session_state.get("barchart_direct_auth"),
         )
 
-    with t12:
+    elif active_tab == "📜 Friday Playbook":
         render_tab_friday_playbook(
             symbol,
             spot,
@@ -495,34 +511,34 @@ def main():
             twelve_outputsize=friday_twelve_outputsize,
         )
 
-    with t13:
+    elif active_tab == "🌊 Vanna/Charm":
         if has_core_data:
             render_tab_vanna_charm(symbol, date, spot, hist_df)
         else:
             _show_core_fetch_hint()
 
-    with t14:
+    elif active_tab == "📊 Orderflow/Delta":
         if has_core_data:
             render_tab_orderflow_delta(symbol, hist_df, spot)
         else:
             _show_core_fetch_hint()
 
-    with t15:
+    elif active_tab == "🧠 Interpretation":
         if has_core_data:
             render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
         else:
             _show_core_fetch_hint()
 
-    with t16:
+    elif active_tab == "🧾 Share Stats":
         if has_core_data:
             render_tab_share_statistics(symbol, gex_df=gex_df, spot=spot)
         else:
             _show_core_fetch_hint()
 
-    with t17:
+    elif active_tab == "📈 Yahoo Data":
         render_tab_yahoo_data(symbol)
 
-    with t18:
+    elif active_tab == "💸 Capital Flow":
         if has_core_data:
             render_tab_capital_flow(df, spot=spot, expiry_date=date, symbol=symbol)
         else:

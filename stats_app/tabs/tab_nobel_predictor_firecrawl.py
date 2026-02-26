@@ -282,13 +282,18 @@ def _parse_yahoo_history_payload_text(payload_text: str) -> pd.DataFrame:
     raise ValueError("Could not parse Yahoo historical table from Firecrawl output.")
 
 
-def _scrape_yahoo_history_with_firecrawl(symbol: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+def _scrape_yahoo_history_with_firecrawl(
+    symbol: str,
+    force_fresh: bool = True,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     api_key = (_get_secret_or_env("FIRECRAWL_API_KEY", "") or "").strip()
     if not api_key:
         raise ValueError("Missing FIRECRAWL_API_KEY (set it in .streamlit/secrets.toml or environment).")
 
     api_url = (_get_secret_or_env("FIRECRAWL_API_URL", "https://api.firecrawl.dev/v2/scrape") or "").strip()
     max_age_ms = _to_int(_get_secret_or_env("FIRECRAWL_MAX_AGE_MS", "172800000"), 172800000)
+    if force_fresh:
+        max_age_ms = 0
     timeout_seconds = _to_int(_get_secret_or_env("FIRECRAWL_TIMEOUT_SECONDS", "60"), 60)
 
     payload = {
@@ -624,7 +629,10 @@ def render_tab_nobel_predictor_firecrawl(symbol: str) -> None:
 
         try:
             with st.spinner(f"Scraping Yahoo history for {target_symbol} via Firecrawl..."):
-                parsed_df, raw_response = _scrape_yahoo_history_with_firecrawl(target_symbol)
+                parsed_df, raw_response = _scrape_yahoo_history_with_firecrawl(
+                    target_symbol,
+                    force_fresh=True,
+                )
         except Exception as exc:
             st.error(f"Failed to scrape/parse history: {exc}")
             return

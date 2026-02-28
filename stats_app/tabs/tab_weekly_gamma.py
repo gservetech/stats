@@ -94,7 +94,7 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, gex_df, art=None):
             how="inner"
         )
         if not top_combined.empty and "call_gex" in top_combined.columns and "put_gex" in top_combined.columns:
-            top_combined["net_gex"] = top_combined["call_gex"] + top_combined["put_gex"]
+            top_combined["net_gex"] = top_combined["call_gex"] - top_combined["put_gex"]
             top_combined["net_gex_abs"] = top_combined["net_gex"].abs()
             top_combined = top_combined.sort_values("net_gex_abs", ascending=False)
             st_df(top_combined)

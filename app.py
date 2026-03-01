@@ -60,6 +60,7 @@ from stats_app.tabs.tab_nobel_predictor_firecrawl import render_tab_nobel_predic
 from stats_app.tabs.tab_expected_move import render_tab_expected_move
 from stats_app.tabs.tab_gamma_flip_detector import render_tab_gamma_flip_detector
 from stats_app.tabs.tab_iv_term_structure import render_tab_iv_term_structure
+from stats_app.tabs.tab_trending_oi import render_tab_trending_oi
 
 
 # Configure Streamlit Page
@@ -364,6 +365,7 @@ def main():
     tab_labels = [
         "📋 Chain",
         "📊 OI",
+        "📈 Trending OI",
         "📌 Weekly GEX",
         "🧲 Map",
         "🧮 Greeks",
@@ -413,6 +415,12 @@ def main():
     elif active_tab == "📊 OI":
         if has_core_data:
             render_tab_oi_charts(df)
+        else:
+            _show_core_fetch_hint()
+
+    elif active_tab == "📈 Trending OI":
+        if has_core_data:
+            render_tab_trending_oi(df=df, spot=spot, symbol=symbol, expiry_date=str(date))
         else:
             _show_core_fetch_hint()
 

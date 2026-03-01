@@ -49,6 +49,7 @@ from stats_app.tabs.tab_interpretation_engine import render_tab_interpretation_e
 from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
 from stats_app.tabs.tab_share_statistics import render_tab_share_statistics
 from stats_app.tabs.tab_yahoo_data import render_tab_yahoo_data
+from stats_app.tabs.tab_trend_engine import render_tab_trend_engine
 from stats_app.tabs.tab_friday_playbook import render_tab_friday_playbook
 from stats_app.tabs.tab_capital_flow import render_tab_capital_flow
 
@@ -387,6 +388,7 @@ def main():
         "🧠 Interpretation",
         "🧾 Share Stats",
         "📈 Yahoo Data",
+        "📉 Trend Engine",
         "💸 Capital Flow",   # ✅ LAST
     ]
     if "active_main_tab" not in st.session_state or st.session_state["active_main_tab"] not in tab_labels:
@@ -545,6 +547,9 @@ def main():
 
     elif active_tab == "📈 Yahoo Data":
         render_tab_yahoo_data(symbol)
+
+    elif active_tab == "📉 Trend Engine":
+        render_tab_trend_engine(symbol)
 
     elif active_tab == "💸 Capital Flow":
         if has_core_data:

@@ -14,3 +14,4 @@ twelvedata>=1.2.25
 
 
 
+scikit-learn>=1.4.0

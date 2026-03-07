@@ -50,6 +50,7 @@ from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
 from stats_app.tabs.tab_share_statistics import render_tab_share_statistics
 from stats_app.tabs.tab_yahoo_data import render_tab_yahoo_data
 from stats_app.tabs.tab_market_signals import render_tab_market_signals
+from stats_app.tabs.tab_ml_rsi_pro import render_tab_ml_rsi_pro
 from stats_app.tabs.tab_trend_engine import render_tab_trend_engine
 from stats_app.tabs.tab_friday_playbook import render_tab_friday_playbook
 from stats_app.tabs.tab_capital_flow import render_tab_capital_flow
@@ -390,6 +391,7 @@ def main():
         "🧾 Share Stats",
         "📈 Yahoo Data",
         "📡 Market Signals",
+        "🧠 ML RSI Pro",
         "📉 Trend Engine",
         "💸 Capital Flow",   # ✅ LAST
     ]
@@ -553,6 +555,9 @@ def main():
 
     elif active_tab == "📡 Market Signals":
         render_tab_market_signals(symbol)
+
+    elif active_tab == "🧠 ML RSI Pro":
+        render_tab_ml_rsi_pro(symbol)
     elif active_tab == "📉 Trend Engine":
         render_tab_trend_engine(symbol)
 

@@ -175,6 +175,30 @@ def build_features(
     return out
 
 
+def _minmax_scale(train: np.ndarray, current: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mins = np.nanmin(train, axis=0)
+    maxs = np.nanmax(train, axis=0)
+    spans = np.where((maxs - mins) == 0, 1.0, (maxs - mins))
+    return (train - mins) / spans, (current - mins) / spans
+
+
+def _distance_weighted_knn_predict(x_train: np.ndarray, y_train: np.ndarray, x_current: np.ndarray, neighbors: int) -> float:
+    diffs = x_train - x_current
+    distances = np.sqrt(np.sum(diffs * diffs, axis=1))
+    order = np.argsort(distances)
+    top_idx = order[:neighbors]
+    top_dist = distances[top_idx]
+    top_y = y_train[top_idx]
+
+    if len(top_y) == 0:
+        return float("nan")
+    if np.any(top_dist == 0):
+        return float(np.mean(top_y[top_dist == 0]))
+
+    weights = 1.0 / np.maximum(top_dist, 1e-9)
+    return float(np.sum(weights * top_y) / np.sum(weights))
+
+
 def compute_ml_rsi(
     df: pd.DataFrame,
     rsi_length: int = 14,
@@ -190,12 +214,6 @@ def compute_ml_rsi(
     overbought: float = 70.0,
     oversold: float = 30.0,
 ) -> pd.DataFrame:
-    try:
-        from sklearn.neighbors import KNeighborsRegressor
-        from sklearn.preprocessing import MinMaxScaler
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("ML RSI Pro requires scikit-learn. Add `scikit-learn` to the environment.") from exc
-
     out = df.copy()
     out["rsi_raw"] = compute_rsi(out["Close"], length=rsi_length)
     out["standard_rsi"] = (
@@ -212,7 +230,6 @@ def compute_ml_rsi(
     out["knn_rsi"] = np.nan
     out["ml_rsi_raw"] = np.nan
 
-    scaler = MinMaxScaler()
     knn_weight = float(np.clip(knn_weight, 0.0, 1.0))
     knn_neighbors = max(1, int(knn_neighbors))
     knn_lookback = max(knn_neighbors + 5, int(knn_lookback))
@@ -226,19 +243,17 @@ def compute_ml_rsi(
         if len(window_df) < knn_neighbors:
             continue
 
-        x_train = window_df[selected_features].values
-        y_train = window_df["standard_rsi"].values
-        x_curr = out.loc[[idx], selected_features].values
-        if np.isnan(x_curr).any():
+        x_train = window_df[selected_features].to_numpy(dtype=float)
+        y_train = window_df["standard_rsi"].to_numpy(dtype=float)
+        x_curr = out.loc[[idx], selected_features].to_numpy(dtype=float)
+        if np.isnan(x_curr).any() or np.isnan(x_train).any() or np.isnan(y_train).any():
             continue
 
-        x_train_scaled = scaler.fit_transform(x_train)
-        x_curr_scaled = scaler.transform(x_curr)
+        x_train_scaled, x_curr_scaled = _minmax_scale(x_train, x_curr)
+        pred = _distance_weighted_knn_predict(x_train_scaled, y_train, x_curr_scaled[0], knn_neighbors)
+        if np.isnan(pred):
+            continue
 
-        model = KNeighborsRegressor(n_neighbors=knn_neighbors, weights="distance")
-        model.fit(x_train_scaled, y_train)
-
-        pred = float(model.predict(x_curr_scaled)[0])
         base = float(out.at[idx, "standard_rsi"])
         ml_raw = ((1.0 - knn_weight) * base) + (knn_weight * pred)
 
@@ -433,14 +448,14 @@ def _classify_signal(row: pd.Series) -> str:
 def render_tab_ml_rsi_pro(symbol: str) -> None:
     target_symbol = (symbol or "AAPL").upper().strip()
     st.subheader("ML RSI Pro")
-    st.caption("Adaptive RSI using KNN pattern matching and smoothing on Yahoo Finance history.")
+    st.caption("Adaptive RSI using KNN-style pattern matching and smoothing on Yahoo Finance history.")
 
     with st.expander("What this tab does", expanded=False):
         st.write(
             "- Computes standard RSI\n"
             "- Builds RSI momentum, volatility, slope, and price momentum features\n"
-            "- Finds similar historical setups with KNN\n"
-            "- Blends standard RSI with KNN-adjusted RSI\n"
+            "- Finds similar historical setups with distance-weighted nearest neighbors\n"
+            "- Blends standard RSI with neighbor-adjusted RSI\n"
             "- Smooths the final output and marks BUY / SHORT / EXIT events"
         )
 

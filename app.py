@@ -60,11 +60,14 @@ from stats_app.tabs.tab_capital_flow import render_tab_capital_flow
 from stats_app.tabs.tab_nobel_pattern import render_tab_nobel_pattern
 from stats_app.tabs.tab_nobel_predictor_firecrawl import render_tab_nobel_predictor_firecrawl
 
-# ✅ NEW TABS (this answer)
+# ✅ NEW TABS (existing in your app)
 from stats_app.tabs.tab_expected_move import render_tab_expected_move
 from stats_app.tabs.tab_gamma_flip_detector import render_tab_gamma_flip_detector
 from stats_app.tabs.tab_iv_term_structure import render_tab_iv_term_structure
 from stats_app.tabs.tab_trending_oi import render_tab_trending_oi
+
+# ✅ NEW TAB (Microstructure Engine)
+from stats_app.tabs.tab_microstructure_engine import render_tab_microstructure_engine
 
 
 # Configure Streamlit Page
@@ -372,6 +375,7 @@ def main():
         "📈 Trending OI",
         "📌 Weekly GEX",
         "🧲 Map",
+        "🎰 Microstructure",   # ✅ NEW TAB
         "🧮 Greeks",
         "🏆 Pro Edge",
         "🔳 Folding",
@@ -443,6 +447,19 @@ def main():
             render_tab_gamma_map_filters(symbol, date, spot, gex_df if not gex_df.empty else pd.DataFrame())
         else:
             _show_core_fetch_hint()
+
+    elif active_tab == "🎰 Microstructure":
+        if has_core_data and not gex_df.empty:
+            render_tab_microstructure_engine(
+                symbol=symbol,
+                spot=spot,
+                gex_df=gex_df,
+                expected_move=None,         # optional (you can pass from expected move tab later)
+                gamma_flip_strike=None,     # optional (auto-estimated if not provided)
+                iv_annual=None,             # optional (if you want auto expected move)
+            )
+        else:
+            st.info("Run Fetch Data (needs Weekly GEX table).")
 
     elif active_tab == "🧮 Greeks":
         if has_core_data:
@@ -575,4 +592,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

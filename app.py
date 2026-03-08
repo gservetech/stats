@@ -50,6 +50,7 @@ from stats_app.tabs.tab_orderflow_delta import render_tab_orderflow_delta
 from stats_app.tabs.tab_share_statistics import render_tab_share_statistics
 from stats_app.tabs.tab_yahoo_data import render_tab_yahoo_data
 from stats_app.tabs.tab_market_signals import render_tab_market_signals
+from stats_app.tabs.tab_envelope_gator_signal import render_tab_envelope_gator_signals
 from stats_app.tabs.tab_ml_rsi_pro import render_tab_ml_rsi_pro
 from stats_app.tabs.tab_crossover_strategy_guide import render_tab_crossover_strategy_guide
 from stats_app.tabs.tab_trend_engine import render_tab_trend_engine
@@ -375,7 +376,7 @@ def main():
         "📈 Trending OI",
         "📌 Weekly GEX",
         "🧲 Map",
-        "🎰 Microstructure",   # ✅ NEW TAB
+        "🎰 Microstructure",
         "🧮 Greeks",
         "🏆 Pro Edge",
         "🔳 Folding",
@@ -396,10 +397,11 @@ def main():
         "🧾 Share Stats",
         "📈 Yahoo Data",
         "📡 Market Signals",
+        "🧭 Envelope Gator",
         "🧠 ML RSI Pro",
         "🧭 Crossover Strategy Guide",
         "📉 Trend Engine",
-        "💸 Capital Flow",   # ✅ LAST
+        "💸 Capital Flow",
     ]
     if "active_main_tab" not in st.session_state or st.session_state["active_main_tab"] not in tab_labels:
         st.session_state["active_main_tab"] = tab_labels[0]
@@ -454,9 +456,9 @@ def main():
                 symbol=symbol,
                 spot=spot,
                 gex_df=gex_df,
-                expected_move=None,         # optional (you can pass from expected move tab later)
-                gamma_flip_strike=None,     # optional (auto-estimated if not provided)
-                iv_annual=None,             # optional (if you want auto expected move)
+                expected_move=None,
+                gamma_flip_strike=None,
+                iv_annual=None,
             )
         else:
             st.info("Run Fetch Data (needs Weekly GEX table).")
@@ -571,15 +573,18 @@ def main():
     elif active_tab == "📈 Yahoo Data":
         render_tab_yahoo_data(symbol)
 
-
     elif active_tab == "📡 Market Signals":
         render_tab_market_signals(symbol)
+
+    elif active_tab == "🧭 Envelope Gator":
+        render_tab_envelope_gator_signals(symbol)
 
     elif active_tab == "🧠 ML RSI Pro":
         render_tab_ml_rsi_pro(symbol)
 
     elif active_tab == "🧭 Crossover Strategy Guide":
         render_tab_crossover_strategy_guide(symbol)
+
     elif active_tab == "📉 Trend Engine":
         render_tab_trend_engine(symbol)
 

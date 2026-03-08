@@ -160,12 +160,12 @@ def apply_kalman_like_smoothing(series: pd.Series, strength: float = 0.30) -> pd
 
 
 def build_features(
-    df: pd.DataFrame,
-    standard_rsi_col: str = "standard_rsi",
-    rsi_mom_lag: int = 3,
-    rsi_vol_window: int = 10,
-    rsi_slope_window: int = 5,
-    price_mom_lag: int = 5,
+        df: pd.DataFrame,
+        standard_rsi_col: str = "standard_rsi",
+        rsi_mom_lag: int = 3,
+        rsi_vol_window: int = 10,
+        rsi_slope_window: int = 5,
+        price_mom_lag: int = 5,
 ) -> pd.DataFrame:
     out = df.copy()
     out["rsi_mom"] = out[standard_rsi_col] - out[standard_rsi_col].shift(rsi_mom_lag)
@@ -182,7 +182,8 @@ def _minmax_scale(train: np.ndarray, current: np.ndarray) -> tuple[np.ndarray, n
     return (train - mins) / spans, (current - mins) / spans
 
 
-def _distance_weighted_knn_predict(x_train: np.ndarray, y_train: np.ndarray, x_current: np.ndarray, neighbors: int) -> float:
+def _distance_weighted_knn_predict(x_train: np.ndarray, y_train: np.ndarray, x_current: np.ndarray,
+                                   neighbors: int) -> float:
     diffs = x_train - x_current
     distances = np.sqrt(np.sum(diffs * diffs, axis=1))
     order = np.argsort(distances)
@@ -200,19 +201,19 @@ def _distance_weighted_knn_predict(x_train: np.ndarray, y_train: np.ndarray, x_c
 
 
 def compute_ml_rsi(
-    df: pd.DataFrame,
-    rsi_length: int = 14,
-    use_rsi_smoothing: bool = True,
-    rsi_smoothing_method: str = "EMA",
-    rsi_smoothing_length: int = 3,
-    knn_neighbors: int = 5,
-    knn_lookback: int = 100,
-    knn_weight: float = 0.50,
-    feature_count: int = 5,
-    use_filter: bool = True,
-    filter_strength: float = 0.30,
-    overbought: float = 70.0,
-    oversold: float = 30.0,
+        df: pd.DataFrame,
+        rsi_length: int = 14,
+        use_rsi_smoothing: bool = True,
+        rsi_smoothing_method: str = "EMA",
+        rsi_smoothing_length: int = 3,
+        knn_neighbors: int = 5,
+        knn_lookback: int = 100,
+        knn_weight: float = 0.50,
+        feature_count: int = 5,
+        use_filter: bool = True,
+        filter_strength: float = 0.30,
+        overbought: float = 70.0,
+        oversold: float = 30.0,
 ) -> pd.DataFrame:
     out = df.copy()
     out["rsi_raw"] = compute_rsi(out["Close"], length=rsi_length)
@@ -274,14 +275,14 @@ def compute_ml_rsi(
     )
 
     out["buy_signal"] = (
-        (out["ml_rsi"].shift(1) < 50)
-        & (out["ml_rsi"] >= 50)
-        & (out["Close"] > out["Close"].rolling(20, min_periods=1).mean())
+            (out["ml_rsi"].shift(1) < 50)
+            & (out["ml_rsi"] >= 50)
+            & (out["Close"] > out["Close"].rolling(20, min_periods=1).mean())
     )
     out["sell_signal"] = (
-        (out["ml_rsi"].shift(1) > 50)
-        & (out["ml_rsi"] <= 50)
-        & (out["Close"] < out["Close"].rolling(20, min_periods=1).mean())
+            (out["ml_rsi"].shift(1) > 50)
+            & (out["ml_rsi"] <= 50)
+            & (out["Close"] < out["Close"].rolling(20, min_periods=1).mean())
     )
     out["exit_long"] = (out["ml_rsi"].shift(1) > overbought) & (out["ml_rsi"] <= overbought)
     out["exit_short"] = (out["ml_rsi"].shift(1) < oversold) & (out["ml_rsi"] >= oversold)
@@ -319,13 +320,15 @@ def build_signal_summary(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def make_ml_rsi_chart(df: pd.DataFrame, overbought: float = 70.0, oversold: float = 30.0, title: str = "ML RSI Pro") -> go.Figure:
+def make_ml_rsi_chart(df: pd.DataFrame, overbought: float = 70.0, oversold: float = 30.0,
+                      title: str = "ML RSI Pro") -> go.Figure:
     fig = make_subplots(
         rows=2,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.05,
         row_heights=[0.62, 0.38],
+        specs=[[{"secondary_y": False}], [{"secondary_y": True}]]
     )
 
     fig.add_trace(
@@ -346,15 +349,16 @@ def make_ml_rsi_chart(df: pd.DataFrame, overbought: float = 70.0, oversold: floa
     exit_long_df = df[df["exit_long"]]
     exit_short_df = df[df["exit_short"]]
 
+    # --- MARKERS ON ROW 1 (PRICE CHART) ---
     fig.add_trace(
         go.Scatter(
             x=buy_df["Date"],
-            y=buy_df["Low"] * 0.995,
-            mode="markers+text",
-            name="BUY1",
-            text=["BUY1"] * len(buy_df),
-            textposition="top center",
-            marker=dict(size=10, symbol="triangle-up", color="#00d084"),
+            y=buy_df["Low"] * 0.99,
+            mode="markers",
+            name="BUY",
+            hovertext=["BUY Signal"] * len(buy_df),
+            hovertemplate="%{x}<br>Price: %{y:.2f}<br><b>%{hovertext}</b><extra></extra>",
+            marker=dict(size=20, symbol="triangle-up", color="#00d084", line=dict(width=2, color="black")),
         ),
         row=1,
         col=1,
@@ -362,12 +366,12 @@ def make_ml_rsi_chart(df: pd.DataFrame, overbought: float = 70.0, oversold: floa
     fig.add_trace(
         go.Scatter(
             x=sell_df["Date"],
-            y=sell_df["High"] * 1.005,
-            mode="markers+text",
-            name="SELL1",
-            text=["SELL1"] * len(sell_df),
-            textposition="top center",
-            marker=dict(size=10, symbol="triangle-down", color="#ff6377"),
+            y=sell_df["High"] * 1.01,
+            mode="markers",
+            name="SELL",
+            hovertext=["SELL Signal"] * len(sell_df),
+            hovertemplate="%{x}<br>Price: %{y:.2f}<br><b>%{hovertext}</b><extra></extra>",
+            marker=dict(size=20, symbol="triangle-down", color="#ff6377", line=dict(width=2, color="black")),
         ),
         row=1,
         col=1,
@@ -375,12 +379,12 @@ def make_ml_rsi_chart(df: pd.DataFrame, overbought: float = 70.0, oversold: floa
     fig.add_trace(
         go.Scatter(
             x=exit_long_df["Date"],
-            y=exit_long_df["High"] * 1.01,
-            mode="markers+text",
+            y=exit_long_df["High"] * 1.015,
+            mode="markers",
             name="EXIT LONG",
-            text=["EXIT L"] * len(exit_long_df),
-            textposition="top center",
-            marker=dict(size=9, symbol="x", color="#ffd166"),
+            hovertext=["EXIT LONG"] * len(exit_long_df),
+            hovertemplate="%{x}<br>Price: %{y:.2f}<br><b>%{hovertext}</b><extra></extra>",
+            marker=dict(size=14, symbol="circle", color="#ffd166", line=dict(width=2, color="black")),
         ),
         row=1,
         col=1,
@@ -388,35 +392,119 @@ def make_ml_rsi_chart(df: pd.DataFrame, overbought: float = 70.0, oversold: floa
     fig.add_trace(
         go.Scatter(
             x=exit_short_df["Date"],
-            y=exit_short_df["Low"] * 0.99,
-            mode="markers+text",
+            y=exit_short_df["Low"] * 0.985,
+            mode="markers",
             name="EXIT SHORT",
-            text=["EXIT S"] * len(exit_short_df),
-            textposition="bottom center",
-            marker=dict(size=9, symbol="x", color="#9d8cff"),
+            hovertext=["EXIT SHORT"] * len(exit_short_df),
+            hovertemplate="%{x}<br>Price: %{y:.2f}<br><b>%{hovertext}</b><extra></extra>",
+            marker=dict(size=14, symbol="circle", color="#9d8cff", line=dict(width=2, color="black")),
         ),
         row=1,
         col=1,
     )
 
+    # --- PRICE OVERLAY ON ROW 2 (RSI CHART) ---
     fig.add_trace(
-        go.Scatter(x=df["Date"], y=df["standard_rsi"], mode="lines", name="Standard RSI", line=dict(width=1, dash="dot", color="#67b7ff")),
+        go.Scatter(
+            x=df["Date"],
+            y=df["Close"],
+            mode="lines",
+            name="Close Price (Overlay)",
+            line=dict(width=2, color="rgba(255, 255, 255, 0.15)")
+        ),
         row=2,
         col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=df["Date"], y=df["knn_rsi"], mode="lines", name="KNN RSI", line=dict(width=1, dash="dash", color="#ffd166")),
-        row=2,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=df["Date"], y=df["ml_rsi"], mode="lines", name="Final ML RSI", line=dict(width=3, color="#00d084")),
-        row=2,
-        col=1,
+        secondary_y=True,
     )
 
+    # --- RSI LINES ON ROW 2 ---
+    fig.add_trace(
+        go.Scatter(x=df["Date"], y=df["standard_rsi"], mode="lines", name="Standard RSI",
+                   line=dict(width=1, dash="dot", color="#67b7ff")),
+        row=2,
+        col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(x=df["Date"], y=df["knn_rsi"], mode="lines", name="KNN RSI",
+                   line=dict(width=1, dash="dash", color="#ffd166")),
+        row=2,
+        col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(x=df["Date"], y=df["ml_rsi"], mode="lines", name="Final ML RSI",
+                   line=dict(width=3, color="#00d084")),
+        row=2,
+        col=1,
+        secondary_y=False,
+    )
+
+    # --- MARKERS ON ROW 2 (RSI CHART) ---
+    fig.add_trace(
+        go.Scatter(
+            x=buy_df["Date"],
+            y=buy_df["ml_rsi"],
+            mode="markers",
+            name="BUY (RSI)",
+            showlegend=False,
+            hovertext=["BUY Signal"] * len(buy_df),
+            hovertemplate="%{x}<br>RSI: %{y:.2f}<br><b>%{hovertext}</b><extra></extra>",
+            marker=dict(size=18, symbol="triangle-up", color="#00d084", line=dict(width=2, color="black")),
+        ),
+        row=2,
+        col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=sell_df["Date"],
+            y=sell_df["ml_rsi"],
+            mode="markers",
+            name="SELL (RSI)",
+            showlegend=False,
+            hovertext=["SELL Signal"] * len(sell_df),
+            hovertemplate="%{x}<br>RSI: %{y:.2f}<br><b>%{hovertext}</b><extra></extra>",
+            marker=dict(size=18, symbol="triangle-down", color="#ff6377", line=dict(width=2, color="black")),
+        ),
+        row=2,
+        col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=exit_long_df["Date"],
+            y=exit_long_df["ml_rsi"],
+            mode="markers",
+            name="EXIT LONG (RSI)",
+            showlegend=False,
+            hovertext=["EXIT LONG"] * len(exit_long_df),
+            hovertemplate="%{x}<br>RSI: %{y:.2f}<br><b>%{hovertext}</b><extra></extra>",
+            marker=dict(size=14, symbol="circle", color="#ffd166", line=dict(width=2, color="black")),
+        ),
+        row=2,
+        col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=exit_short_df["Date"],
+            y=exit_short_df["ml_rsi"],
+            mode="markers",
+            name="EXIT SHORT (RSI)",
+            showlegend=False,
+            hovertext=["EXIT SHORT"] * len(exit_short_df),
+            hovertemplate="%{x}<br>RSI: %{y:.2f}<br><b>%{hovertext}</b><extra></extra>",
+            marker=dict(size=14, symbol="circle", color="#9d8cff", line=dict(width=2, color="black")),
+        ),
+        row=2,
+        col=1,
+        secondary_y=False,
+    )
+
+    # --- HORIZONTAL THRESHOLD LINES ---
     for level in (overbought, 50, oversold):
-        fig.add_hline(y=level, line_dash="dash", line_color="rgba(255,255,255,0.28)", row=2, col=1)
+        fig.add_hline(y=level, line_dash="dash", line_color="rgba(255,255,255,0.28)", row=2, col=1, secondary_y=False)
 
     fig.update_layout(
         title=title,
@@ -427,16 +515,19 @@ def make_ml_rsi_chart(df: pd.DataFrame, overbought: float = 70.0, oversold: floa
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         margin=dict(l=20, r=20, t=60, b=20),
     )
+
     fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="RSI", range=[0, 100], row=2, col=1)
+    fig.update_yaxes(title_text="RSI", range=[0, 100], row=2, col=1, secondary_y=False)
+    fig.update_yaxes(showgrid=False, zeroline=False, row=2, col=1, secondary_y=True)
+
     return fig
 
 
 def _classify_signal(row: pd.Series) -> str:
     if row["buy_signal"]:
-        return "BUY1"
+        return "BUY"
     if row["sell_signal"]:
-        return "SELL1"
+        return "SELL"
     if row["exit_long"]:
         return "EXIT LONG"
     if row["exit_short"]:
@@ -492,25 +583,34 @@ def render_tab_ml_rsi_pro(symbol: str) -> None:
     st.markdown("### Parameters")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        rsi_length = st.number_input("RSI Length", min_value=2, max_value=100, value=14, step=1, key=f"ml_rsi_len_{target_symbol}")
-        knn_neighbors = st.number_input("KNN Neighbors", min_value=1, max_value=50, value=5, step=1, key=f"ml_rsi_knn_n_{target_symbol}")
+        rsi_length = st.number_input("RSI Length", min_value=2, max_value=100, value=14, step=1,
+                                     key=f"ml_rsi_len_{target_symbol}")
+        knn_neighbors = st.number_input("KNN Neighbors", min_value=1, max_value=50, value=5, step=1,
+                                        key=f"ml_rsi_knn_n_{target_symbol}")
     with c2:
-        knn_lookback = st.number_input("KNN Lookback", min_value=20, max_value=1000, value=100, step=10, key=f"ml_rsi_knn_lb_{target_symbol}")
-        knn_weight = st.slider("KNN Weight", min_value=0.0, max_value=1.0, value=0.50, step=0.05, key=f"ml_rsi_knn_w_{target_symbol}")
+        knn_lookback = st.number_input("KNN Lookback", min_value=20, max_value=1000, value=100, step=10,
+                                       key=f"ml_rsi_knn_lb_{target_symbol}")
+        knn_weight = st.slider("KNN Weight", min_value=0.0, max_value=1.0, value=0.50, step=0.05,
+                               key=f"ml_rsi_knn_w_{target_symbol}")
     with c3:
-        feature_count = st.slider("Feature Count", min_value=2, max_value=5, value=5, step=1, key=f"ml_rsi_feat_{target_symbol}")
-        overbought = st.slider("Overbought", min_value=50, max_value=95, value=70, step=1, key=f"ml_rsi_ob_{target_symbol}")
+        feature_count = st.slider("Feature Count", min_value=2, max_value=5, value=5, step=1,
+                                  key=f"ml_rsi_feat_{target_symbol}")
+        overbought = st.slider("Overbought", min_value=50, max_value=95, value=70, step=1,
+                               key=f"ml_rsi_ob_{target_symbol}")
     with c4:
         oversold = st.slider("Oversold", min_value=5, max_value=50, value=30, step=1, key=f"ml_rsi_os_{target_symbol}")
-        filter_strength = st.slider("Filter Strength", min_value=0.01, max_value=0.99, value=0.30, step=0.01, key=f"ml_rsi_filter_{target_symbol}")
+        filter_strength = st.slider("Filter Strength", min_value=0.01, max_value=0.99, value=0.30, step=0.01,
+                                    key=f"ml_rsi_filter_{target_symbol}")
 
     s1, s2, s3 = st.columns(3)
     with s1:
         use_rsi_smoothing = st.checkbox("Use RSI Smoothing", value=True, key=f"ml_rsi_smooth_enable_{target_symbol}")
     with s2:
-        rsi_smoothing_method = st.selectbox("RSI Smoothing Method", options=["EMA", "SMA"], index=0, key=f"ml_rsi_smooth_method_{target_symbol}")
+        rsi_smoothing_method = st.selectbox("RSI Smoothing Method", options=["EMA", "SMA"], index=0,
+                                            key=f"ml_rsi_smooth_method_{target_symbol}")
     with s3:
-        rsi_smoothing_length = st.number_input("RSI Smoothing Length", min_value=1, max_value=50, value=3, step=1, key=f"ml_rsi_smooth_len_{target_symbol}")
+        rsi_smoothing_length = st.number_input("RSI Smoothing Length", min_value=1, max_value=50, value=3, step=1,
+                                               key=f"ml_rsi_smooth_len_{target_symbol}")
 
     use_filter = st.checkbox("Use Final Smoothing Filter", value=True, key=f"ml_rsi_filter_enable_{target_symbol}")
 

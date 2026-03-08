@@ -97,14 +97,14 @@ def compute_indicators(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
 
     prev_ema_fast = out["EMA_FAST"].shift(1)
     out["LONG_SIGNAL"] = (
-        (out["EMA_FAST"] > out["EMA_SLOW"])
-        & (prev_close < prev_ema_fast)
-        & (out["Close"] > out["EMA_FAST"])
+            (out["EMA_FAST"] > out["EMA_SLOW"])
+            & (prev_close < prev_ema_fast)
+            & (out["Close"] > out["EMA_FAST"])
     )
     out["SHORT_SIGNAL"] = (
-        (out["EMA_FAST"] < out["EMA_SLOW"])
-        & (prev_close > prev_ema_fast)
-        & (out["Close"] < out["EMA_FAST"])
+            (out["EMA_FAST"] < out["EMA_SLOW"])
+            & (prev_close > prev_ema_fast)
+            & (out["Close"] < out["EMA_FAST"])
     )
     return out
 
@@ -324,34 +324,32 @@ def performance_summary(trades_df: pd.DataFrame, cfg: StrategyConfig) -> dict[st
 
 def build_trade_chart(df: pd.DataFrame, trades_df: pd.DataFrame, max_labels: int = 12) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df["Date"],
-            y=df["Close"],
-            mode="lines",
-            name="Close",
-            line=dict(color="#67b7ff", width=2.5),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df["Date"],
-            y=df["EMA_FAST"],
-            mode="lines",
-            name="EMA Fast",
-            line=dict(color="#00d084", width=1.7),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=df["Date"],
-            y=df["EMA_SLOW"],
-            mode="lines",
-            name="EMA Slow",
-            line=dict(color="#ffb84d", width=1.7),
-        )
-    )
 
+    # 1. Base Lines
+    fig.add_trace(
+        go.Scatter(x=df["Date"], y=df["Close"], mode="lines", name="Close", line=dict(color="#67b7ff", width=2.5)))
+    fig.add_trace(go.Scatter(x=df["Date"], y=df["EMA_FAST"], mode="lines", name="EMA Fast",
+                             line=dict(color="#00d084", width=1.7)))
+    fig.add_trace(go.Scatter(x=df["Date"], y=df["EMA_SLOW"], mode="lines", name="EMA Slow",
+                             line=dict(color="#ffb84d", width=1.7)))
+
+    # 2. DUMMY TRACES FOR THE LEGEND (These stay at the top of the chart)
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name="Enter Buy",
+                             marker=dict(symbol="triangle-up", size=14, color="#00d084",
+                                         line=dict(width=2, color="black"))))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name="Enter Short",
+                             marker=dict(symbol="triangle-down", size=14, color="#ff6377",
+                                         line=dict(width=2, color="black"))))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name="Exit Buy",
+                             marker=dict(symbol="circle", size=12, color="#ffd166", line=dict(width=2, color="black"))))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name="Exit Short",
+                             marker=dict(symbol="circle", size=12, color="#9d8cff", line=dict(width=2, color="black"))))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", name="Winning Trade",
+                             line=dict(color="#00d084", width=2, dash="dash")))
+    fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", name="Losing Trade",
+                             line=dict(color="#ff6377", width=2, dash="dash")))
+
+    # 3. Plot Actual Trades
     plot_trades = trades_df.head(max_labels).copy() if not trades_df.empty else pd.DataFrame()
     buy_num = 1
     sell_num = 1
@@ -360,58 +358,94 @@ def build_trade_chart(df: pd.DataFrame, trades_df: pd.DataFrame, max_labels: int
         x2 = df.iloc[int(trade["Exit Idx"])]["Date"]
         y1 = float(trade["Entry Price"])
         y2 = float(trade["Exit Price"])
-        connector_color = "#00d084" if float(trade["PnL"]) > 0 else "#ff6377"
+        pnl = float(trade["PnL"])
+
+        connector_color = "#00d084" if pnl > 0 else "#ff6377"
         is_buy = trade["Type"] == "BUY"
+
         entry_label = f"Buy {buy_num}" if is_buy else f"Sell {sell_num}"
         exit_label = f"Exit Buy {buy_num}" if is_buy else f"Exit Sell {sell_num}"
+
+        # Color specific to the exit type
+        exit_color = "#ffd166" if is_buy else "#9d8cff"
+
+        entry_hovertext = [f"{entry_label}"]
+        exit_hovertext = [f"{exit_label}"]
+
+        entry_customdata = [[y1, pnl]]
+        exit_customdata = [[y2, pnl]]
+
         if is_buy:
             buy_num += 1
         else:
             sell_num += 1
 
+        # Trade connector line
         fig.add_trace(
             go.Scatter(
                 x=[x1, x2],
                 y=[y1, y2],
                 mode="lines",
                 showlegend=False,
+                hoverinfo="skip",
                 line=dict(color=connector_color, width=2, dash="dash"),
             )
         )
+
+        # Entry Marker
         fig.add_trace(
             go.Scatter(
                 x=[x1],
                 y=[y1],
-                mode="markers+text",
-                text=[entry_label],
-                textposition="top center" if is_buy else "bottom center",
+                mode="markers",
+                name=entry_label,
+                customdata=entry_customdata,
+                hovertext=entry_hovertext,
+                hovertemplate="%{x}<br>Entry Price: $%{customdata[0]:.2f}<br><b>%{hovertext}</b><extra></extra>",
                 marker=dict(
                     symbol="triangle-up" if is_buy else "triangle-down",
-                    size=13,
+                    size=20,
                     color="#00d084" if is_buy else "#ff6377",
+                    line=dict(width=2, color="black")
                 ),
                 showlegend=False,
             )
         )
+
+        # Exit Marker
         fig.add_trace(
             go.Scatter(
                 x=[x2],
                 y=[y2],
-                mode="markers+text",
-                text=[exit_label],
-                textposition="top center",
-                marker=dict(symbol="x", size=11, color="#9d8cff"),
+                mode="markers",
+                name=exit_label,
+                customdata=exit_customdata,
+                hovertext=exit_hovertext,
+                hovertemplate="%{x}<br>Exit Price: $%{customdata[0]:.2f}<br>PnL: $%{customdata[1]:.2f}<br><b>%{hovertext}</b><extra></extra>",
+                marker=dict(
+                    symbol="circle",
+                    size=16,
+                    color=exit_color,
+                    line=dict(width=2, color="black")
+                ),
                 showlegend=False,
             )
         )
 
     fig.update_layout(
         title="Trade Chart",
-        height=620,
+        height=680,  # Made slightly taller to comfortably fit the legend
         template="plotly_dark",
         hovermode="x unified",
-        margin=dict(l=12, r=12, t=48, b=12),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=12, r=12, t=80, b=12),  # Expanded top margin
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            bgcolor="rgba(0,0,0,0)"  # Keeps the background clean behind the legend
+        ),
         xaxis_title="Date",
         yaxis_title="Price",
     )
@@ -482,9 +516,12 @@ def render_tab_market_signals(symbol: str) -> None:
 
     with st.expander("Strategy Parameters", expanded=False):
         p1, p2, p3 = st.columns(3)
-        fast_ema = p1.number_input("Fast EMA", min_value=5, max_value=100, value=20, step=1, key=f"ms_fast_{target_symbol}")
-        slow_ema = p2.number_input("Slow EMA", min_value=10, max_value=200, value=50, step=1, key=f"ms_slow_{target_symbol}")
-        atr_period = p3.number_input("ATR Period", min_value=5, max_value=50, value=14, step=1, key=f"ms_atr_{target_symbol}")
+        fast_ema = p1.number_input("Fast EMA", min_value=5, max_value=100, value=20, step=1,
+                                   key=f"ms_fast_{target_symbol}")
+        slow_ema = p2.number_input("Slow EMA", min_value=10, max_value=200, value=50, step=1,
+                                   key=f"ms_slow_{target_symbol}")
+        atr_period = p3.number_input("ATR Period", min_value=5, max_value=50, value=14, step=1,
+                                     key=f"ms_atr_{target_symbol}")
 
         p4, p5, p6 = st.columns(3)
         stop_atr_mult = p4.number_input(
@@ -503,7 +540,8 @@ def render_tab_market_signals(symbol: str) -> None:
             step=0.1,
             key=f"ms_target_{target_symbol}",
         )
-        rsi_period = p6.number_input("RSI Period", min_value=5, max_value=50, value=14, step=1, key=f"ms_rsi_{target_symbol}")
+        rsi_period = p6.number_input("RSI Period", min_value=5, max_value=50, value=14, step=1,
+                                     key=f"ms_rsi_{target_symbol}")
 
         p7, p8, p9 = st.columns(3)
         initial_capital = p7.number_input(

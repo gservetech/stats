@@ -149,15 +149,32 @@ def render_tab_gamma_map_filters(symbol, date, spot, gex_df_input: pd.DataFrame 
         else:
             gex_totals = art.get("totals", {})
 
-            cA, cB, cC, cD, cE = st.columns(5)
-            cA.metric("Total Net GEX", f"{float(gex_totals.get('net_gex', 0.0)):,.0f}")
-            cB.metric("Main Magnet", f"{art['magnet']:g}" if art["magnet"] is not None else "N/A")
-            cC.metric("Put Wall (Lower)", f"{art['put_wall']:g}" if art["put_wall"] is not None else "N/A")
-            cD.metric("Call Wall (Upper)", f"{art['call_wall']:g}" if art["call_wall"] is not None else "N/A")
-            cE.metric("Spot Used", f"{art['spot_used']:.2f}" if art["spot_used"] is not None else "N/A")
-            st.caption("Total Net GEX is summed from the same weekly GEX table plotted in this map.")
+            st.markdown("### Total GEX")
+            cA, cB, cC, cD = st.columns(4)
+            cA.metric("Total Call GEX", f"{float(gex_totals.get('call_gex', 0.0)):,.0f}")
+            cB.metric("Total Put GEX", f"{float(gex_totals.get('put_gex', 0.0)):,.0f}")
+            cC.metric("Total Net GEX", f"{float(gex_totals.get('net_gex', 0.0)):,.0f}")
+            cD.metric("Spot Used", f"{art['spot_used']:.2f}" if art["spot_used"] is not None else "N/A")
+            st.caption("These totals are summed from the same per-strike weekly GEX table used by the map below.")
+
+            st.markdown("### Key Levels")
+            cE, cF, cG = st.columns(3)
+            cE.metric("Main Magnet", f"{art['magnet']:g}" if art["magnet"] is not None else "N/A")
+            cF.metric("Put Wall (Lower)", f"{art['put_wall']:g}" if art["put_wall"] is not None else "N/A")
+            cG.metric("Call Wall (Upper)", f"{art['call_wall']:g}" if art["call_wall"] is not None else "N/A")
 
             st_plot(plot_net_gex_map(gex_df, spot=spot, art=art), key="gamma_map_net_gex")
+
+            st.markdown("### Per-Strike Net GEX")
+            per_strike_cols = [c for c in ["strike", "call_gex", "put_gex", "net_gex"] if c in gex_df.columns]
+            if per_strike_cols:
+                per_strike_df = gex_df[per_strike_cols].copy()
+                for col in per_strike_cols:
+                    per_strike_df[col] = pd.to_numeric(per_strike_df[col], errors="coerce")
+                if "strike" in per_strike_df.columns:
+                    per_strike_df = per_strike_df.sort_values("strike")
+                st_df(per_strike_df)
+                st.caption("`net_gex` per strike is calculated from the same map dataset as `call_gex - put_gex`.")
 
             st.markdown("### 🧲 Gamma Walls (Top Call/Put GEX)")
             w1, w2 = st.columns(2)

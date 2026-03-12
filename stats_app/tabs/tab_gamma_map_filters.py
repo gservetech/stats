@@ -165,19 +165,17 @@ def render_tab_gamma_map_filters(symbol, date, spot, gex_df_input: pd.DataFrame 
 
             st_plot(plot_net_gex_map(gex_df, spot=spot, art=art), key="gamma_map_net_gex")
 
-            st.markdown("### Per-Strike Net GEX")
             per_strike_cols = [c for c in ["strike", "call_gex", "put_gex", "net_gex"] if c in gex_df.columns]
+            per_strike_df = pd.DataFrame()
             if per_strike_cols:
                 per_strike_df = gex_df[per_strike_cols].copy()
                 for col in per_strike_cols:
                     per_strike_df[col] = pd.to_numeric(per_strike_df[col], errors="coerce")
                 if "strike" in per_strike_df.columns:
                     per_strike_df = per_strike_df.sort_values("strike")
-                st_df(per_strike_df)
-                st.caption("`net_gex` per strike is calculated from the same map dataset as `call_gex - put_gex`.")
 
             st.markdown("### 🧲 Gamma Walls (Top Call/Put GEX)")
-            w1, w2 = st.columns(2)
+            w1, w2, w3 = st.columns(3)
             
             top_call = art["top_call"]
             top_put = art["top_put"]
@@ -198,6 +196,13 @@ def render_tab_gamma_map_filters(symbol, date, spot, gex_df_input: pd.DataFrame 
                         st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"), key="gamma_map_top_put_gex")
                 else:
                     st.info("Put GEX data not available.")
+            with w3:
+                st.markdown("**Per-Strike Net GEX**")
+                if not per_strike_df.empty:
+                    st_df(per_strike_df)
+                    st.caption("`net_gex` per strike uses the same map dataset as `call_gex - put_gex`.")
+                else:
+                    st.info("Per-strike GEX data not available.")
     else:
         st.warning("No per-strike GEX returned from backend.")
 

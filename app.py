@@ -350,6 +350,7 @@ def main():
         totals = w.get("totals", {})
         pcr = w.get("pcr", {})
         gex_df = pd.DataFrame(gex_result["data"].get("data", [])) if gex_result and gex_result.get("success") else pd.DataFrame()
+        spot_for_gex_views = float(w.get("spot") or st.session_state.get("spot_at_fetch") or spot)
 
         with st.expander("📈 Price + Moving Averages", expanded=True):
             if hist_df is not None and not hist_df.empty:
@@ -367,6 +368,8 @@ def main():
         st.success(f"✓ Loaded {len(df)} strikes for **{symbol}**")
     elif fetch_btn and api_ok:
         st.error("Data fetch failed after multiple retries. Please check the backend connection.")
+    else:
+        spot_for_gex_views = float(st.session_state.get("spot_at_fetch") or spot)
 
     # ---------------- Stateful navigation (keeps selected tab across reruns) ----------------
     tab_labels = [
@@ -438,13 +441,13 @@ def main():
 
     elif active_tab == "📌 Weekly GEX":
         if has_core_data:
-            render_tab_weekly_gamma(pcr, totals, w, spot, gex_df)
+            render_tab_weekly_gamma(pcr, totals, w, spot_for_gex_views, gex_df)
         else:
             _show_core_fetch_hint()
 
     elif active_tab == "🧲 Map":
         if has_core_data:
-            render_tab_gamma_map_filters(symbol, date, spot, gex_df if not gex_df.empty else pd.DataFrame())
+            render_tab_gamma_map_filters(symbol, date, spot_for_gex_views, gex_df if not gex_df.empty else pd.DataFrame())
         else:
             _show_core_fetch_hint()
 

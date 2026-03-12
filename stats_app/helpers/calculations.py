@@ -613,6 +613,16 @@ def compute_gamma_map_artifacts(gex_df: pd.DataFrame, spot: float, top_n: int = 
         temp["net_gex_abs"] = temp["net_gex"].abs()
         top_net = temp.sort_values("net_gex_abs", ascending=False).head(top_n)
 
+    totals = {
+        "call_gex": float(df["call_gex"].sum()) if "call_gex" in df.columns else 0.0,
+        "put_gex": float(df["put_gex"].sum()) if "put_gex" in df.columns else 0.0,
+    }
+    totals["net_gex"] = (
+        float(df["net_gex"].sum())
+        if "net_gex" in df.columns
+        else float(totals["call_gex"] - totals["put_gex"])
+    )
+
     # ---- MAGNET (max abs(net_gex) strike) ----
     magnet = None
     if "net_gex" in df.columns and not df.empty:
@@ -630,6 +640,7 @@ def compute_gamma_map_artifacts(gex_df: pd.DataFrame, spot: float, top_n: int = 
 
     return {
         "spot_used": float(spot) if spot is not None else None,
+        "totals": totals,
         "call_wall": call_wall,
         "put_wall": put_wall,
         "magnet": magnet,

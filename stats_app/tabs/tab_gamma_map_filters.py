@@ -147,11 +147,15 @@ def render_tab_gamma_map_filters(symbol, date, spot, gex_df_input: pd.DataFrame 
         if not art:
             st.warning("Could not compute gamma levels.")
         else:
-            cA, cB, cC, cD = st.columns(4)
-            cA.metric("Main Magnet", f"{art['magnet']:g}" if art["magnet"] is not None else "N/A")
-            cB.metric("Put Wall (Lower)", f"{art['put_wall']:g}" if art["put_wall"] is not None else "N/A")
-            cC.metric("Call Wall (Upper)", f"{art['call_wall']:g}" if art["call_wall"] is not None else "N/A")
-            cD.metric("Spot Used", f"{art['spot_used']:.2f}" if art["spot_used"] is not None else "N/A")
+            gex_totals = art.get("totals", {})
+
+            cA, cB, cC, cD, cE = st.columns(5)
+            cA.metric("Total Net GEX", f"{float(gex_totals.get('net_gex', 0.0)):,.0f}")
+            cB.metric("Main Magnet", f"{art['magnet']:g}" if art["magnet"] is not None else "N/A")
+            cC.metric("Put Wall (Lower)", f"{art['put_wall']:g}" if art["put_wall"] is not None else "N/A")
+            cD.metric("Call Wall (Upper)", f"{art['call_wall']:g}" if art["call_wall"] is not None else "N/A")
+            cE.metric("Spot Used", f"{art['spot_used']:.2f}" if art["spot_used"] is not None else "N/A")
+            st.caption("Total Net GEX is summed from the same weekly GEX table plotted in this map.")
 
             st_plot(plot_net_gex_map(gex_df, spot=spot, art=art), key="gamma_map_net_gex")
 

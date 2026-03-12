@@ -23,12 +23,18 @@ def render_tab_weekly_gamma(pcr, totals, w, spot, gex_df, art=None):
         art = compute_gamma_map_artifacts(gex_df, spot=spot, top_n=10)
     
     spot_used = art.get("spot_used") if art else (w.get("spot") or spot)
+    gex_totals = art.get("totals", {}) if art else {}
+    total_net_gex = gex_totals.get("net_gex")
+    if total_net_gex is None:
+        total_net_gex = totals.get("net_gex") or 0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Put/Call Ratio (OI)", f"{(pcr.get('oi') or 0):.3f}" if pcr.get("oi") is not None else "N/A")
     c2.metric("Put/Call Ratio (Volume)", f"{(pcr.get('volume') or 0):.3f}" if pcr.get("volume") is not None else "N/A")
-    c3.metric("Total Net GEX", f"{(totals.get('net_gex') or 0):,.0f}")
+    c3.metric("Total Net GEX", f"{float(total_net_gex):,.0f}")
     c4.metric("Spot Used", f"{float(spot_used):,.2f}" if spot_used is not None else "N/A")
+    if art and "net_gex" in gex_totals:
+        st.caption("Total Net GEX is summed from the same weekly GEX table used by the charts below.")
 
     # Get tables from artifacts (same df, same spot)
     top_call = art.get("top_call") if art else None

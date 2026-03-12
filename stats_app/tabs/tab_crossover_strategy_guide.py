@@ -112,11 +112,11 @@ def _fetch_yahoo_price_df(symbol: str, range_key: str, interval: str) -> pd.Data
 
 
 def compute_crossover_indicators(
-    df: pd.DataFrame,
-    price_ma_length: int = 20,
-    fast_ma: int = 20,
-    slow_ma: int = 50,
-    ma_type: str = "EMA",
+        df: pd.DataFrame,
+        price_ma_length: int = 20,
+        fast_ma: int = 20,
+        slow_ma: int = 50,
+        ma_type: str = "EMA",
 ) -> pd.DataFrame:
     out = df.copy()
     ma_type = ma_type.upper()
@@ -131,21 +131,21 @@ def compute_crossover_indicators(
         out["SLOW_MA"] = out["Close"].ewm(span=slow_ma, adjust=False).mean()
 
     out["PRICE_CROSS_BUY"] = (
-        (out["Close"].shift(1) <= out["PRICE_MA"].shift(1))
-        & (out["Close"] > out["PRICE_MA"])
+            (out["Close"].shift(1) <= out["PRICE_MA"].shift(1))
+            & (out["Close"] > out["PRICE_MA"])
     )
     out["PRICE_CROSS_SELL"] = (
-        (out["Close"].shift(1) >= out["PRICE_MA"].shift(1))
-        & (out["Close"] < out["PRICE_MA"])
+            (out["Close"].shift(1) >= out["PRICE_MA"].shift(1))
+            & (out["Close"] < out["PRICE_MA"])
     )
 
     out["GOLDEN_CROSS"] = (
-        (out["FAST_MA"].shift(1) <= out["SLOW_MA"].shift(1))
-        & (out["FAST_MA"] > out["SLOW_MA"])
+            (out["FAST_MA"].shift(1) <= out["SLOW_MA"].shift(1))
+            & (out["FAST_MA"] > out["SLOW_MA"])
     )
     out["DEATH_CROSS"] = (
-        (out["FAST_MA"].shift(1) >= out["SLOW_MA"].shift(1))
-        & (out["FAST_MA"] < out["SLOW_MA"])
+            (out["FAST_MA"].shift(1) >= out["SLOW_MA"].shift(1))
+            & (out["FAST_MA"] < out["SLOW_MA"])
     )
 
     ma_gap_pct = ((out["FAST_MA"] - out["SLOW_MA"]).abs() / out["Close"].replace(0, np.nan)) * 100
@@ -230,12 +230,13 @@ def make_price_crossover_chart(df: pd.DataFrame) -> go.Figure:
         fig.add_trace(
             go.Scatter(
                 x=buy_df["Date"],
-                y=buy_df["Low"] * 0.995,
-                mode="markers+text",
-                text=["BUY"] * len(buy_df),
-                textposition="top center",
-                name="Price Cross BUY",
-                marker=dict(size=11, symbol="triangle-up", color="#16a34a"),
+                y=buy_df["Low"] * 0.99,
+                mode="markers",
+                name="BUY",
+                customdata=buy_df["Close"],
+                hovertext=["Price Cross BUY"] * len(buy_df),
+                hovertemplate="%{x}<br>Close Price: $%{customdata:.2f}<br><b>%{hovertext}</b><extra></extra>",
+                marker=dict(size=20, symbol="triangle-up", color="#16a34a", line=dict(width=2, color="black")),
             )
         )
 
@@ -243,12 +244,13 @@ def make_price_crossover_chart(df: pd.DataFrame) -> go.Figure:
         fig.add_trace(
             go.Scatter(
                 x=sell_df["Date"],
-                y=sell_df["High"] * 1.005,
-                mode="markers+text",
-                text=["SELL"] * len(sell_df),
-                textposition="bottom center",
-                name="Price Cross SELL",
-                marker=dict(size=11, symbol="triangle-down", color="#dc2626"),
+                y=sell_df["High"] * 1.01,
+                mode="markers",
+                name="SELL",
+                customdata=sell_df["Close"],
+                hovertext=["Price Cross SELL"] * len(sell_df),
+                hovertemplate="%{x}<br>Close Price: $%{customdata:.2f}<br><b>%{hovertext}</b><extra></extra>",
+                marker=dict(size=20, symbol="triangle-down", color="#dc2626", line=dict(width=2, color="black")),
             )
         )
 
@@ -302,12 +304,13 @@ def make_double_ma_chart(df: pd.DataFrame) -> go.Figure:
         fig.add_trace(
             go.Scatter(
                 x=golden_df["Date"],
-                y=golden_df["FAST_MA"],
-                mode="markers+text",
-                text=["Golden Cross"] * len(golden_df),
-                textposition="top center",
+                y=golden_df["FAST_MA"] * 0.99,
+                mode="markers",
                 name="Golden Cross",
-                marker=dict(size=12, symbol="triangle-up", color="#16a34a"),
+                customdata=golden_df["Close"],
+                hovertext=["Golden Cross BUY"] * len(golden_df),
+                hovertemplate="%{x}<br>Close Price: $%{customdata:.2f}<br><b>%{hovertext}</b><extra></extra>",
+                marker=dict(size=20, symbol="triangle-up", color="#16a34a", line=dict(width=2, color="black")),
             )
         )
 
@@ -315,12 +318,13 @@ def make_double_ma_chart(df: pd.DataFrame) -> go.Figure:
         fig.add_trace(
             go.Scatter(
                 x=death_df["Date"],
-                y=death_df["FAST_MA"],
-                mode="markers+text",
-                text=["Death Cross"] * len(death_df),
-                textposition="bottom center",
+                y=death_df["FAST_MA"] * 1.01,
+                mode="markers",
                 name="Death Cross",
-                marker=dict(size=12, symbol="triangle-down", color="#dc2626"),
+                customdata=death_df["Close"],
+                hovertext=["Death Cross SELL"] * len(death_df),
+                hovertemplate="%{x}<br>Close Price: $%{customdata:.2f}<br><b>%{hovertext}</b><extra></extra>",
+                marker=dict(size=20, symbol="triangle-down", color="#dc2626", line=dict(width=2, color="black")),
             )
         )
 
@@ -354,6 +358,74 @@ def make_sideways_warning_chart(df: pd.DataFrame) -> go.Figure:
         row=1,
         col=1,
     )
+
+    # Calculate all signals for this chart
+    buy_df = df[df["PRICE_CROSS_BUY"]]
+    sell_df = df[df["PRICE_CROSS_SELL"]]
+    golden_df = df[df["GOLDEN_CROSS"]]
+    death_df = df[df["DEATH_CROSS"]]
+
+    # Price Crosses (Slightly smaller, lighter colors)
+    if not buy_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=buy_df["Date"],
+                y=buy_df["Low"] * 0.99,
+                mode="markers",
+                name="Price Cross BUY",
+                customdata=buy_df["Close"],
+                hovertext=["Price Cross BUY"] * len(buy_df),
+                hovertemplate="%{x}<br>Close Price: $%{customdata:.2f}<br><b>%{hovertext}</b><extra></extra>",
+                marker=dict(size=14, symbol="triangle-up", color="#00d084", line=dict(width=1, color="black")),
+            ),
+            row=1, col=1
+        )
+    if not sell_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=sell_df["Date"],
+                y=sell_df["High"] * 1.01,
+                mode="markers",
+                name="Price Cross SELL",
+                customdata=sell_df["Close"],
+                hovertext=["Price Cross SELL"] * len(sell_df),
+                hovertemplate="%{x}<br>Close Price: $%{customdata:.2f}<br><b>%{hovertext}</b><extra></extra>",
+                marker=dict(size=14, symbol="triangle-down", color="#ff6377", line=dict(width=1, color="black")),
+            ),
+            row=1, col=1
+        )
+
+    # MA Crosses (Larger, bolder colors)
+    if not golden_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=golden_df["Date"],
+                y=golden_df["FAST_MA"] * 0.99,
+                mode="markers",
+                name="Golden Cross",
+                customdata=golden_df["Close"],
+                hovertext=["Golden Cross BUY"] * len(golden_df),
+                hovertemplate="%{x}<br>Close Price: $%{customdata:.2f}<br><b>%{hovertext}</b><extra></extra>",
+                marker=dict(size=20, symbol="triangle-up", color="#16a34a", line=dict(width=2, color="black")),
+            ),
+            row=1, col=1
+        )
+    if not death_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=death_df["Date"],
+                y=death_df["FAST_MA"] * 1.01,
+                mode="markers",
+                name="Death Cross",
+                customdata=death_df["Close"],
+                hovertext=["Death Cross SELL"] * len(death_df),
+                hovertemplate="%{x}<br>Close Price: $%{customdata:.2f}<br><b>%{hovertext}</b><extra></extra>",
+                marker=dict(size=20, symbol="triangle-down", color="#dc2626", line=dict(width=2, color="black")),
+            ),
+            row=1, col=1
+        )
+
+    # Sideways zone
     fig.add_trace(
         go.Bar(x=df["Date"], y=df["SIDEWAYS_ZONE"].astype(int), name="Sideways Zone", marker_color="#ff6377"),
         row=2,
@@ -420,11 +492,14 @@ def render_tab_crossover_strategy_guide(symbol: str) -> None:
     with c1:
         ma_type = st.selectbox("MA Type", ["EMA", "SMA"], index=0, key=f"cross_guide_type_{target_symbol}")
     with c2:
-        price_ma_length = st.number_input("Single MA Length", min_value=2, max_value=300, value=20, step=1, key=f"cross_guide_price_ma_{target_symbol}")
+        price_ma_length = st.number_input("Single MA Length", min_value=2, max_value=300, value=20, step=1,
+                                          key=f"cross_guide_price_ma_{target_symbol}")
     with c3:
-        fast_ma = st.number_input("Fast MA", min_value=2, max_value=300, value=20, step=1, key=f"cross_guide_fast_ma_{target_symbol}")
+        fast_ma = st.number_input("Fast MA", min_value=2, max_value=300, value=20, step=1,
+                                  key=f"cross_guide_fast_ma_{target_symbol}")
     with c4:
-        slow_ma = st.number_input("Slow MA", min_value=3, max_value=400, value=50, step=1, key=f"cross_guide_slow_ma_{target_symbol}")
+        slow_ma = st.number_input("Slow MA", min_value=3, max_value=400, value=50, step=1,
+                                  key=f"cross_guide_slow_ma_{target_symbol}")
 
     if fast_ma >= slow_ma:
         st.warning("Fast MA should usually be smaller than Slow MA.")
@@ -565,4 +640,5 @@ def render_tab_crossover_strategy_guide(symbol: str) -> None:
             "- late entry after trend already started"
         )
 
-    st.warning("Crossovers work best in trending markets. In sideways markets, frequent crossing can create whipsaw signals.")
+    st.warning(
+        "Crossovers work best in trending markets. In sideways markets, frequent crossing can create whipsaw signals.")

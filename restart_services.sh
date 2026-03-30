@@ -21,12 +21,12 @@ else
 fi
 
 # 2. Restart FastAPI Backend (Docker Compose)
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Restarting FastAPI Backend (/opt/barchart-api)..." >> "$LOG_FILE"
-if cd /opt/barchart-api && docker-compose restart; then
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Restarting FastAPI Backend (/opt/stats/backend)..." >> "$LOG_FILE"
+if cd /opt/stats/backend && docker-compose restart; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] FastAPI Backend restarted successfully." >> "$LOG_FILE"
 else
     # Fallback in case they use 'docker compose' instead of 'docker-compose'
-    if cd /opt/barchart-api && docker compose restart; then
+    if cd /opt/stats/backend && docker compose restart; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] FastAPI Backend restarted successfully." >> "$LOG_FILE"
     else
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Failed to restart FastAPI Backend." >> "$LOG_FILE"

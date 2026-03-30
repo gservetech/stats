@@ -28,7 +28,7 @@ import math
 import threading
 from io import StringIO
 from time import time
-from datetime import datetime
+from datetime import datetime, timedelta
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 except Exception:
@@ -94,6 +94,8 @@ app.add_middleware(
 _OPTIONS_CACHE = {}  # (symbol,date) -> {"ts": float, "rows": list, "direct_auth": dict|None}
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # 15 min default (was 5 min)
 CACHE_STALE_SECONDS = int(os.getenv("CACHE_STALE_SECONDS", "3600"))  # serve stale up to 1 hour
+_EXPIRATIONS_CACHE = {}  # symbol -> {"ts": float, "items": list[dict]}
+EXPIRATIONS_TTL_SECONDS = int(os.getenv("EXPIRATIONS_TTL_SECONDS", "900"))
 # Spot cache: short TTL for "real-time" with stale fallback for stability.
 _SPOT_CACHE = {}  # symbol -> {"ts": float, "data": dict}
 SPOT_TTL_SECONDS = int(os.getenv("SPOT_TTL_SECONDS", "5"))
@@ -118,6 +120,7 @@ OPTIONS_WAIT_SECONDS = int(os.getenv("OPTIONS_WAIT_SECONDS", "45"))
 OPTIONS_RETRY_COUNT = int(os.getenv("OPTIONS_RETRY_COUNT", "1"))
 DIRECT_AUTH_CACHE_TTL_SECONDS = int(os.getenv("DIRECT_AUTH_CACHE_TTL_SECONDS", "1800"))
 DIRECT_API_TIMEOUT_SECONDS = int(os.getenv("DIRECT_API_TIMEOUT_SECONDS", "30"))
+ENABLE_DIRECT_OPTIONS_FETCH = os.getenv("ENABLE_DIRECT_OPTIONS_FETCH", "0") == "1"
 BARCHART_OPTIONS_API_URL = "https://www.barchart.com/proxies/core-api/v1/options/get"
 BARCHART_OPTIONS_FIELDS = (
     "symbol,baseSymbol,strikePrice,expirationDate,moneyness,bidPrice,midpoint,askPrice,"
@@ -275,6 +278,193 @@ def _build_direct_options_params(symbol: str, date: str, expiration_type: str) -
     }
 
 
+def _build_options_page_url(symbol: str, date: str, expiration_type: str | None = None) -> str:
+    symbol_q = quote((symbol or "").strip().upper(), safe="")
+    expiry = (date or "").strip()
+    if expiration_type == "weekly" and expiry and not expiry.endswith("-w"):
+        expiry = f"{expiry}-w"
+    return f"https://www.barchart.com/stocks/quotes/{symbol_q}/options?expiration={expiry}&view=sbs"
+
+
+def _build_browser_page_candidates(symbol: str, date: str) -> list[tuple[str, str | None]]:
+    candidates: list[tuple[str, str | None]] = []
+
+    default_url = _build_options_page_url(symbol=symbol, date=date)
+    candidates.append((default_url, None))
+
+    weekly_url = _build_options_page_url(symbol=symbol, date=date, expiration_type="weekly")
+    if weekly_url != default_url:
+        candidates.append((weekly_url, "weekly"))
+
+    return candidates
+
+
+def _decode_network_body(body_data) -> str:
+    if isinstance(body_data, dict):
+        body = body_data.get("body", "")
+        if body_data.get("base64Encoded"):
+            body = base64.b64decode(body).decode("utf-8", errors="ignore")
+        return body
+    if body_data is None:
+        return ""
+    return str(body_data)
+
+
+def _coerce_expiration_type(val) -> str | None:
+    text = str(val or "").strip().lower()
+    if not text:
+        return None
+    if text in {"w", "weekly"} or "week" in text:
+        return "weekly"
+    if text in {"m", "monthly"} or "month" in text:
+        return "monthly"
+    return None
+
+
+def _build_expiration_item(date_str: str, expiration_type: str | None = None) -> dict | None:
+    date_clean = str(date_str or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_clean):
+        return None
+    exp_type = _coerce_expiration_type(expiration_type)
+    suffix = ""
+    if exp_type == "weekly":
+        suffix = " (w)"
+    elif exp_type == "monthly":
+        suffix = " (m)"
+    return {
+        "date": date_clean,
+        "expiration_type": exp_type,
+        "label": f"{date_clean}{suffix}",
+    }
+
+
+def _dedupe_expiration_items(items: list[dict] | None) -> list[dict]:
+    deduped: dict[str, dict] = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        date_str = str(item.get("date") or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+            continue
+        current = deduped.get(date_str) or {
+            "date": date_str,
+            "expiration_type": None,
+            "label": date_str,
+        }
+        exp_type = _coerce_expiration_type(item.get("expiration_type"))
+        if current.get("expiration_type") is None and exp_type:
+            current["expiration_type"] = exp_type
+            current["label"] = f"{date_str} ({'w' if exp_type == 'weekly' else 'm'})"
+        deduped[date_str] = current
+    return sorted(deduped.values(), key=lambda x: x["date"])
+
+
+def _extract_expiration_items_from_text(text: str, expiration_type: str | None = None) -> list[dict]:
+    items: list[dict] = []
+    if not text:
+        return items
+    pattern = re.compile(r"(\d{4}-\d{2}-\d{2})(?:\s*\(([wm])\))?", flags=re.IGNORECASE)
+    for match in pattern.finditer(text):
+        item = _build_expiration_item(
+            match.group(1),
+            _coerce_expiration_type(match.group(2)) or expiration_type,
+        )
+        if item:
+            items.append(item)
+    return items
+
+
+def _extract_expiration_items_from_payload(payload) -> list[dict]:
+    items: list[dict] = []
+
+    def _walk(obj, inherited_type: str | None = None):
+        local_type = inherited_type
+
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_lower = str(key).strip().lower()
+                if local_type is None and key_lower in {"expirationtype", "type", "tag"}:
+                    maybe_type = _coerce_expiration_type(value)
+                    if maybe_type:
+                        local_type = maybe_type
+
+            for key, value in obj.items():
+                key_lower = str(key).strip().lower()
+                if isinstance(value, str) and "expiration" in key_lower:
+                    item = _build_expiration_item(value, local_type)
+                    if item:
+                        items.append(item)
+
+            for key, value in obj.items():
+                next_type = local_type
+                key_lower = str(key).strip().lower()
+                if "weekly" in key_lower:
+                    next_type = "weekly"
+                elif "monthly" in key_lower:
+                    next_type = "monthly"
+                _walk(value, next_type)
+            return
+
+        if isinstance(obj, list):
+            for value in obj:
+                _walk(value, local_type)
+            return
+
+        if isinstance(obj, str):
+            items.extend(_extract_expiration_items_from_text(obj, local_type))
+
+    _walk(payload)
+    return _dedupe_expiration_items(items)
+
+
+def _choose_best_available_expiration(requested_date: str, items: list[dict] | None) -> str | None:
+    available_dates = [str(item.get("date") or "").strip() for item in (items or [])]
+    available_dates = [d for d in available_dates if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)]
+    if not available_dates:
+        return None
+    if requested_date in available_dates:
+        return requested_date
+
+    try:
+        requested_dt = datetime.strptime(str(requested_date), "%Y-%m-%d").date()
+    except Exception:
+        return available_dates[0]
+
+    prev_day = (requested_dt - timedelta(days=1)).isoformat()
+    if prev_day in available_dates:
+        return prev_day
+
+    parsed = []
+    for candidate in available_dates:
+        try:
+            parsed.append(datetime.strptime(candidate, "%Y-%m-%d").date())
+        except Exception:
+            continue
+    if not parsed:
+        return available_dates[0]
+
+    best = min(parsed, key=lambda candidate: (abs((candidate - requested_dt).days), candidate > requested_dt))
+    return best.isoformat()
+
+
+def _get_cached_expirations(symbol: str) -> list[dict] | None:
+    key = (symbol or "").strip().upper()
+    hit = _EXPIRATIONS_CACHE.get(key)
+    if not hit:
+        return None
+    if (time() - float(hit.get("ts", 0.0) or 0.0)) > EXPIRATIONS_TTL_SECONDS:
+        return None
+    return list(hit.get("items") or [])
+
+
+def _cache_expirations(symbol: str, items: list[dict] | None) -> list[dict]:
+    normalized = _dedupe_expiration_items(items)
+    if normalized:
+        key = (symbol or "").strip().upper()
+        _EXPIRATIONS_CACHE[key] = {"ts": time(), "items": normalized}
+    return normalized
+
+
 def _is_auth_expired_error(error_text: str | None, status_code: int | None) -> bool:
     if status_code in (401, 403):
         return True
@@ -301,15 +491,13 @@ def _fetch_options_rows_via_direct_api(
     if not auth:
         return None, None, "missing_direct_auth", None
 
-    safe_symbol = quote((symbol or "").strip().upper(), safe="")
-    referer = f"https://www.barchart.com/stocks/quotes/{safe_symbol}/options?expiration={date}&view=sbs"
     last_error = None
     last_status = None
 
     for exp_type in ("weekly", "monthly"):
         params = _build_direct_options_params(symbol=symbol, date=date, expiration_type=exp_type)
         headers = dict(DIRECT_API_HEADERS_BASE)
-        headers["Referer"] = referer
+        headers["Referer"] = _build_options_page_url(symbol=symbol, date=date, expiration_type="weekly" if exp_type == "weekly" else None)
         headers["Cookie"] = auth["cookie_header"]
         if auth.get("xsrf_token"):
             headers["X-XSRF-TOKEN"] = str(auth["xsrf_token"])
@@ -401,35 +589,36 @@ async def get_rows_cached_with_meta(symbol: str, date: str, force_refresh: bool 
     try:
         # Wait for the result with a timeout slightly shorter than the frontend timeout
         async with asyncio.timeout(110):
-            direct_candidates: list[dict] = []
-            hit_auth = _normalize_direct_auth((hit or {}).get("direct_auth") if isinstance(hit, dict) else None)
-            if hit_auth:
-                direct_candidates.append(hit_auth)
-            cached_auth = _get_cached_direct_auth()
-            if cached_auth and (
-                not direct_candidates or cached_auth.get("cookie_header") != direct_candidates[0].get("cookie_header")
-            ):
-                direct_candidates.append(cached_auth)
+            if ENABLE_DIRECT_OPTIONS_FETCH:
+                direct_candidates: list[dict] = []
+                hit_auth = _normalize_direct_auth((hit or {}).get("direct_auth") if isinstance(hit, dict) else None)
+                if hit_auth:
+                    direct_candidates.append(hit_auth)
+                cached_auth = _get_cached_direct_auth()
+                if cached_auth and (
+                    not direct_candidates or cached_auth.get("cookie_header") != direct_candidates[0].get("cookie_header")
+                ):
+                    direct_candidates.append(cached_auth)
 
-            direct_error = None
-            direct_status = None
-            for auth_candidate in direct_candidates:
-                rows, direct_auth, direct_error, direct_status = await asyncio.to_thread(
-                    _fetch_options_rows_via_direct_api,
-                    symbol,
-                    date,
-                    auth_candidate,
-                )
-                if rows:
-                    direct_auth = _cache_direct_auth(direct_auth) or direct_auth
-                    _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows, "direct_auth": direct_auth}
-                    print(f"[DIRECT_API] Success for {key} using cached session auth.")
-                    return rows, direct_auth
-                if _is_auth_expired_error(direct_error, direct_status):
-                    _clear_direct_auth_cache(reason=f"expired auth while fetching {key} (status={direct_status})")
+                direct_error = None
+                direct_status = None
+                for auth_candidate in direct_candidates:
+                    rows, direct_auth, direct_error, direct_status = await asyncio.to_thread(
+                        _fetch_options_rows_via_direct_api,
+                        symbol,
+                        date,
+                        auth_candidate,
+                    )
+                    if rows:
+                        direct_auth = _cache_direct_auth(direct_auth) or direct_auth
+                        _OPTIONS_CACHE[key] = {"ts": time(), "rows": rows, "direct_auth": direct_auth}
+                        print(f"[DIRECT_API] Success for {key} using cached session auth.")
+                        return rows, direct_auth
+                    if _is_auth_expired_error(direct_error, direct_status):
+                        _clear_direct_auth_cache(reason=f"expired auth while fetching {key} (status={direct_status})")
 
-            if direct_candidates and direct_error:
-                print(f"[DIRECT_API] Failed for {key}: {direct_error}. Falling back to browser capture.")
+                if direct_candidates and direct_error:
+                    print(f"[DIRECT_API] Failed for {key}: {direct_error}. Falling back to browser capture.")
 
             rows, captured_auth = await scrape_options(symbol, date)
             normalized_auth = _cache_direct_auth(captured_auth) if captured_auth else _get_cached_direct_auth()
@@ -1027,127 +1216,203 @@ def build_chrome_options() -> ChromiumOptions:
 
 
 # ---------------- Scraper ----------------
+async def _scrape_options_from_page(symbol: str, date: str, page_url: str):
+    print(f"[INFO] Scraping: {page_url}")
+
+    captured_requests = {}
+    captured_direct_auth = None
+    request_url_by_id = {}
+
+    def _maybe_capture_direct_auth(headers: dict | None):
+        nonlocal captured_direct_auth
+        if captured_direct_auth is not None:
+            return
+        auth = _build_direct_auth_from_headers(headers)
+        if auth is not None:
+            captured_direct_auth = auth
+
+    async def on_request_will_be_sent(request_log):
+        params = request_log.get("params", {})
+        request_id = params.get("requestId")
+        request = params.get("request", {})
+        req_url = request.get("url", "")
+        headers = request.get("headers", {})
+
+        if request_id and req_url:
+            request_url_by_id[str(request_id)] = req_url
+
+        if "/proxies/core-api/v1/options/get" in req_url:
+            if "options" not in captured_requests:
+                captured_requests["options"] = (request_id, req_url)
+            _maybe_capture_direct_auth(headers)
+
+    async def on_request_extra_info(extra_info_log):
+        params = extra_info_log.get("params", {})
+        request_id = str(params.get("requestId", ""))
+        req_url = request_url_by_id.get(request_id, "")
+        if "/proxies/core-api/v1/options/get" in req_url:
+            _maybe_capture_direct_auth(params.get("headers", {}))
+
+    async def on_response(response_log):
+        params = response_log.get("params", {})
+        response = params.get("response", {})
+        resp_url = response.get("url", "")
+
+        if "/proxies/core-api/v1/options/get" in resp_url and "options" not in captured_requests:
+            captured_requests["options"] = (params.get("requestId"), resp_url)
+            _maybe_capture_direct_auth(response.get("requestHeaders", {}))
+
+        elif "/proxies/core-api/v1/options-expirations/get" in resp_url and "expirations" not in captured_requests:
+            captured_requests["expirations"] = (params.get("requestId"), resp_url)
+
+    async with _BROWSER_SEMAPHORE:
+        options = build_chrome_options()
+
+        print("[INFO] Starting browser (headless mode)...")
+        print("[INFO] Chrome binary:", getattr(options, "binary_location", None) or "(auto-detect)")
+
+        async with Chrome(options=options) as browser:
+            tab = await browser.start()
+
+            await tab.enable_network_events()
+            await tab.on("Network.requestWillBeSent", on_request_will_be_sent)
+            await tab.on("Network.requestWillBeSentExtraInfo", on_request_extra_info)
+            await tab.on("Network.responseReceived", on_response)
+
+            try:
+                await asyncio.wait_for(tab.go_to(page_url), timeout=OPTIONS_PAGELOAD_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail="Barchart took too long to respond.")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
+
+            print(f"[INFO] Waiting for network requests (max {OPTIONS_WAIT_SECONDS}s)...")
+            poll_interval = 0.25
+            polls = max(1, int(OPTIONS_WAIT_SECONDS / poll_interval))
+            for _ in range(polls):
+                await asyncio.sleep(poll_interval)
+                if "options" in captured_requests:
+                    await asyncio.sleep(0.5)
+                    break
+
+            if "options" not in captured_requests:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Options data not found for {symbol} on {date}. "
+                        f"Verify symbol + expiration date, or Barchart may be blocking headless requests."
+                    )
+                )
+
+            request_id, _api_url = captured_requests["options"]
+            print(f"[INFO] Captured options API URL: {_api_url}")
+            available_expirations = []
+
+            try:
+                body_data = await tab.get_network_response_body(request_id)
+                body = _decode_network_body(body_data)
+
+                opt_json = json.loads(body)
+                available_expirations = _extract_expiration_items_from_payload(opt_json)
+                if not available_expirations and "expirations" in captured_requests:
+                    try:
+                        expirations_request_id, _ = captured_requests["expirations"]
+                        expirations_body = _decode_network_body(
+                            await tab.get_network_response_body(expirations_request_id)
+                        )
+                        available_expirations = _extract_expiration_items_from_payload(
+                            json.loads(expirations_body)
+                        )
+                    except Exception:
+                        available_expirations = []
+                if available_expirations:
+                    _cache_expirations(symbol, available_expirations)
+                rows = process_options_data(opt_json)
+                return rows, captured_direct_auth, {
+                    "requested_date": date,
+                    "page_url": page_url,
+                    "captured_options_api_url": _api_url,
+                    "available_expirations": available_expirations,
+                    "resolved_date": _choose_best_available_expiration(date, available_expirations),
+                }
+
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=500, detail=f"Failed to parse options data: {str(e)}")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
+
+
 async def scrape_options(symbol: str, date: str):
-    symbol_q = quote(symbol, safe="")
-    url = f"https://www.barchart.com/stocks/quotes/{symbol_q}/options?expiration={date}&view=sbs"
-    print(f"[INFO] Scraping: {url}")
+    requested_date = str(date or "").strip()
 
     for attempt in range(OPTIONS_RETRY_COUNT + 1):
-        captured_requests = {}
-        captured_direct_auth = None
-        request_url_by_id = {}
+        last_http_error = None
+        candidate_dates: list[str] = [requested_date]
+        tried_dates: set[str] = set()
 
-        def _maybe_capture_direct_auth(headers: dict | None):
-            nonlocal captured_direct_auth
-            if captured_direct_auth is not None:
-                return
-            auth = _build_direct_auth_from_headers(headers)
-            if auth is not None:
-                captured_direct_auth = auth
+        while candidate_dates:
+            candidate_date = candidate_dates.pop(0)
+            if candidate_date in tried_dates:
+                continue
+            tried_dates.add(candidate_date)
+            candidate_pages = _build_browser_page_candidates(symbol=symbol, date=candidate_date)
 
-        async def on_request_will_be_sent(request_log):
-            params = request_log.get("params", {})
-            request_id = params.get("requestId")
-            request = params.get("request", {})
-            req_url = request.get("url", "")
-            headers = request.get("headers", {})
+            for idx, (page_url, expiration_type) in enumerate(candidate_pages):
+                try:
+                    rows, captured_auth, meta = await _scrape_options_from_page(
+                        symbol=symbol,
+                        date=candidate_date,
+                        page_url=page_url,
+                    )
+                    if rows:
+                        return rows, captured_auth
 
-            if request_id and req_url:
-                request_url_by_id[str(request_id)] = req_url
+                    resolved_date = str(meta.get("resolved_date") or "").strip()
+                    if (
+                        resolved_date
+                        and resolved_date != candidate_date
+                        and resolved_date not in tried_dates
+                        and resolved_date not in candidate_dates
+                    ):
+                        print(
+                            f"[INFO] Browser session resolved requested expiration {candidate_date} -> {resolved_date} "
+                            f"from captured page/network metadata."
+                        )
+                        candidate_dates.insert(0, resolved_date)
 
-            if "/proxies/core-api/v1/options/get" in req_url:
-                if "options" not in captured_requests:
-                    captured_requests["options"] = (request_id, req_url)
-                _maybe_capture_direct_auth(headers)
+                    available_expirations = meta.get("available_expirations") or _get_cached_expirations(symbol) or []
+                    detail = f"No options data found for {symbol} on {candidate_date}."
+                    if available_expirations:
+                        labels = [str(item.get("label") or item.get("date") or "") for item in available_expirations[:12]]
+                        detail = f"{detail} Available expirations from browser session: {', '.join(labels)}"
+                    last_http_error = HTTPException(status_code=404, detail=detail)
 
-        async def on_request_extra_info(extra_info_log):
-            params = extra_info_log.get("params", {})
-            request_id = str(params.get("requestId", ""))
-            req_url = request_url_by_id.get(request_id, "")
-            if "/proxies/core-api/v1/options/get" in req_url:
-                _maybe_capture_direct_auth(params.get("headers", {}))
+                    is_last_candidate = idx == (len(candidate_pages) - 1)
+                    if not is_last_candidate:
+                        print(
+                            f"[INFO] Browser scrape returned no rows for {candidate_date} via default page. "
+                            f"Trying {expiration_type or 'alternate'} expiration page..."
+                        )
+                        continue
+                    break
+                except HTTPException as e:
+                    last_http_error = e
+                    is_last_candidate = idx == (len(candidate_pages) - 1)
+                    if e.status_code == 404 and not is_last_candidate:
+                        print(
+                            f"[INFO] Browser scrape returned no rows for {candidate_date} via default page. "
+                            f"Trying {expiration_type or 'alternate'} expiration page..."
+                        )
+                        continue
+                    break
 
-        async def on_response(response_log):
-            params = response_log.get("params", {})
-            response = params.get("response", {})
-            resp_url = response.get("url", "")
-
-            if "/proxies/core-api/v1/options/get" in resp_url and "options" not in captured_requests:
-                captured_requests["options"] = (params.get("requestId"), resp_url)
-                _maybe_capture_direct_auth(response.get("requestHeaders", {}))
-
-            elif "/proxies/core-api/v1/options-expirations/get" in resp_url and "expirations" not in captured_requests:
-                captured_requests["expirations"] = (params.get("requestId"), resp_url)
+        if last_http_error is None:
+            raise HTTPException(status_code=500, detail="Options scrape failed without an explicit error.")
 
         try:
-            async with _BROWSER_SEMAPHORE:
-                options = build_chrome_options()
-
-                print("[INFO] Starting browser (headless mode)...")
-                print("[INFO] Chrome binary:", getattr(options, "binary_location", None) or "(auto-detect)")
-
-                async with Chrome(options=options) as browser:
-                    tab = await browser.start()
-
-                    await tab.enable_network_events()
-                    await tab.on("Network.requestWillBeSent", on_request_will_be_sent)
-                    await tab.on("Network.requestWillBeSentExtraInfo", on_request_extra_info)
-                    await tab.on("Network.responseReceived", on_response)
-
-                    try:
-                        # Add a timeout to the initial page load to avoid hanging the semaphore
-                        await asyncio.wait_for(tab.go_to(url), timeout=OPTIONS_PAGELOAD_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        raise HTTPException(status_code=504, detail="Barchart took too long to respond.")
-                    except Exception as e:
-                        raise HTTPException(status_code=500, detail=f"Failed to load page: {str(e)}")
-
-                    print(f"[INFO] Waiting for network requests (max {OPTIONS_WAIT_SECONDS}s)...")
-                    poll_interval = 0.25
-                    polls = max(1, int(OPTIONS_WAIT_SECONDS / poll_interval))
-                    for _ in range(polls):
-                        await asyncio.sleep(poll_interval)
-                        if "options" in captured_requests:
-                            # Once request is seen, wait just a tiny bit for the body to be populateable
-                            await asyncio.sleep(0.5)
-                            break
-
-                    if "options" not in captured_requests:
-                        raise HTTPException(
-                            status_code=404,
-                            detail=(
-                                f"Options data not found for {symbol} on {date}. "
-                                f"Verify symbol + expiration date, or Barchart may be blocking headless requests."
-                            )
-                        )
-
-                    request_id, _api_url = captured_requests["options"]
-                    print(f"[INFO] Captured options API URL: {_api_url}")
-
-                    try:
-                        body_data = await tab.get_network_response_body(request_id)
-
-                        if isinstance(body_data, dict):
-                            body = body_data.get("body", "")
-                            if body_data.get("base64Encoded"):
-                                body = base64.b64decode(body).decode("utf-8", errors="ignore")
-                        else:
-                            body = body_data
-
-                        opt_json = json.loads(body)
-                        rows = process_options_data(opt_json)
-
-                        if not rows:
-                            raise HTTPException(status_code=404, detail=f"No options data found for {symbol} on {date}.")
-
-                        return rows, captured_direct_auth
-
-                    except json.JSONDecodeError as e:
-                        raise HTTPException(status_code=500, detail=f"Failed to parse options data: {str(e)}")
-                    except HTTPException:
-                        raise
-                    except Exception as e:
-                        raise HTTPException(status_code=500, detail=f"Failed to process data: {str(e)}")
+            raise last_http_error
         except HTTPException as e:
             if attempt < OPTIONS_RETRY_COUNT and e.status_code in (404, 500, 502, 503, 504):
                 print(f"[RETRY] scrape_options failed ({e.status_code}). Retrying ({attempt + 1}/{OPTIONS_RETRY_COUNT})...")
@@ -1176,6 +1441,43 @@ async def _query_text_any(tab, selectors: list[str]) -> str | None:
             if text:
                 return text
     return None
+
+
+def _default_expiration_probe_date() -> str:
+    base = datetime.now(_EXPIRY_TZ).date() if _EXPIRY_TZ else datetime.now().date()
+    days_ahead = (4 - base.weekday()) % 7
+    return (base + timedelta(days=days_ahead)).isoformat()
+
+
+async def scrape_available_expirations(symbol: str, date_hint: str | None = None, force_refresh: bool = False) -> list[dict]:
+    symbol_clean = (symbol or "").strip().upper()
+    if not symbol_clean:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+
+    if not force_refresh:
+        cached = _get_cached_expirations(symbol_clean)
+        if cached:
+            return cached
+
+    probe_date = str(date_hint or _default_expiration_probe_date()).strip()
+    last_error = None
+    for page_url, _expiration_type in _build_browser_page_candidates(symbol=symbol_clean, date=probe_date):
+        try:
+            _rows, _auth, meta = await _scrape_options_from_page(symbol=symbol_clean, date=probe_date, page_url=page_url)
+        except HTTPException as exc:
+            last_error = exc
+            continue
+
+        items = _dedupe_expiration_items(meta.get("available_expirations") or [])
+        if items:
+            return _cache_expirations(symbol_clean, items)
+
+    cached = _get_cached_expirations(symbol_clean)
+    if cached:
+        return cached
+    if last_error is not None:
+        raise last_error
+    raise HTTPException(status_code=404, detail=f"No expirations found for {symbol_clean}")
 
 
 async def scrape_spot(symbol: str, date: str | None = None):
@@ -1494,6 +1796,23 @@ async def yahoo_share_statistics(
     return sanitize_json(result)
 
 
+@app.get("/expirations")
+async def get_expirations(
+    symbol: str = Query(..., description="Stock symbol (e.g., AAPL, $SPX, TSLA)"),
+    date: str | None = Query(None, description="Optional date hint to open the relevant options page (YYYY-MM-DD)"),
+    force_refresh: bool = Query(False, description="Bypass cache and fetch expirations from a fresh browser session."),
+):
+    items = await scrape_available_expirations(symbol=symbol, date_hint=date, force_refresh=force_refresh)
+    payload = {
+        "success": True,
+        "symbol": symbol,
+        "date_hint": date,
+        "count": len(items),
+        "expirations": items,
+    }
+    return sanitize_json(payload)
+
+
 @app.get("/options")
 async def get_options_json(
     symbol: str = Query(..., description="Stock symbol (e.g., AAPL, $SPX, TSLA)"),
@@ -1508,6 +1827,7 @@ async def get_options_json(
         "count": len(rows),
         "data": rows,
         "direct_auth": direct_auth,
+        "available_expirations": _get_cached_expirations(symbol),
     }
     return sanitize_json(payload)
 

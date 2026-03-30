@@ -23,6 +23,7 @@ except Exception:
 from stats_app.styles import apply_custom_styles
 from stats_app.helpers.api_client import (
     check_api,
+    fetch_expirations,
     fetch_spot_quote,
     fetch_options,
     fetch_weekly_summary,
@@ -78,6 +79,42 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _to_date(date_str: str) -> dt.date | None:
+    try:
+        return dt.date.fromisoformat(str(date_str))
+    except Exception:
+        return None
+
+
+def _week_expiry_candidates(target_expiry_str: str) -> list[str]:
+    d = _to_date(target_expiry_str)
+    if d is None:
+        return [target_expiry_str]
+    candidates = [d.isoformat()]
+    if d.weekday() == 4:
+        prev = (d - dt.timedelta(days=1)).isoformat()
+        if prev not in candidates:
+            candidates.append(prev)
+    return candidates
+
+
+def _is_not_found_result(res) -> bool:
+    if not isinstance(res, dict) or res.get("success"):
+        return False
+    status_code = res.get("status_code")
+    err_text = str(res.get("error") or "").lower()
+    if status_code == 404:
+        return True
+    not_found_signals = (
+        "404",
+        "not found",
+        "no options data found",
+        "no data returned",
+        "no contracts found",
+    )
+    return any(signal in err_text for signal in not_found_signals)
 
 
 def main():
@@ -151,8 +188,28 @@ def main():
 
         today = dt.date.today()
         default_friday = _next_friday(today)
-        expiry_date = st.date_input("Expiration Date", value=default_friday)
-        date = expiry_date.isoformat()
+        default_date = default_friday.isoformat()
+        expirations_res = fetch_expirations(symbol, default_date) if api_ok and symbol else None
+        expirations_payload = expirations_res.get("data", {}) if isinstance(expirations_res, dict) and expirations_res.get("success") else {}
+        expirations = expirations_payload.get("expirations", []) if isinstance(expirations_payload, dict) else []
+
+        if expirations:
+            label_map = {
+                str(item.get("date") or ""): str(item.get("label") or item.get("date") or "")
+                for item in expirations
+                if str(item.get("date") or "").strip()
+            }
+            date_options = list(label_map.keys())
+            default_index = date_options.index(default_date) if default_date in label_map else 0
+            date = st.selectbox(
+                "Expiration Date",
+                options=date_options,
+                index=default_index,
+                format_func=lambda d: label_map.get(str(d), str(d)),
+            )
+        else:
+            expiry_date = st.date_input("Expiration Date", value=default_friday)
+            date = expiry_date.isoformat()
 
         spot_source = st.selectbox("Spot Price Source", options=["CNBC", "Manual"])
         refresh_spot_btn = st_btn("🔄 Refresh Spot")
@@ -263,6 +320,7 @@ def main():
         st.session_state["gex_result"] = None
         st.session_state["hist_df"] = pd.DataFrame()
         st.session_state["spot_at_fetch"] = None
+        st.session_state["effective_expiry_date"] = None
         st.session_state["barchart_direct_auth"] = None
         st.session_state["last_symbol"] = symbol
 
@@ -301,23 +359,60 @@ def main():
                         placeholder.error(f"❌ {func_name} crashed: {e}")
             return None
 
+        def fetch_core_market_data(requested_date: str):
+            candidate_dates = _week_expiry_candidates(requested_date)
+            last_options_res = None
+            last_weekly_res = None
+            last_gex_res = None
+
+            for idx, candidate_date in enumerate(candidate_dates):
+                if candidate_date != requested_date:
+                    st.info(
+                        f"No chain found for {requested_date}. Retrying weekly expiry fallback {candidate_date}."
+                    )
+
+                options_res = fetch_with_retry(
+                    fetch_options, "Options Chain", 3, symbol, candidate_date, True
+                )
+                last_options_res = options_res
+                if not (isinstance(options_res, dict) and options_res.get("success")):
+                    if idx < len(candidate_dates) - 1 and _is_not_found_result(options_res):
+                        continue
+                    return candidate_date, options_res, last_weekly_res, last_gex_res
+
+                weekly_res = fetch_with_retry(
+                    fetch_weekly_summary, "Weekly Summary", 3, symbol, candidate_date, spot
+                )
+                last_weekly_res = weekly_res
+                if not (isinstance(weekly_res, dict) and weekly_res.get("success")):
+                    if idx < len(candidate_dates) - 1 and _is_not_found_result(weekly_res):
+                        continue
+                    gex_res = fetch_with_retry(
+                        fetch_weekly_gex, "Weekly GEX", 3, symbol, candidate_date, spot
+                    )
+                    last_gex_res = gex_res
+                    return candidate_date, options_res, weekly_res, gex_res
+
+                gex_res = fetch_with_retry(
+                    fetch_weekly_gex, "Weekly GEX", 3, symbol, candidate_date, spot
+                )
+                last_gex_res = gex_res
+                return candidate_date, options_res, weekly_res, gex_res
+
+            return requested_date, last_options_res, last_weekly_res, last_gex_res
+
         with st.spinner(f"Analyzing market structure for {symbol}..."):
-            st.session_state["options_result"] = fetch_with_retry(
-                fetch_options, "Options Chain", 3, symbol, date, True
-            )
+            effective_date, options_res, weekly_res, gex_res = fetch_core_market_data(date)
+            st.session_state["effective_expiry_date"] = effective_date
+            st.session_state["options_result"] = options_res
 
             options_payload = (st.session_state.get("options_result") or {}).get("data", {})
             direct_auth = options_payload.get("direct_auth") if isinstance(options_payload, dict) else None
             if isinstance(direct_auth, dict) and direct_auth.get("cookie_header"):
                 st.session_state["barchart_direct_auth"] = direct_auth
 
-            st.session_state["weekly_result"] = fetch_with_retry(
-                fetch_weekly_summary, "Weekly Summary", 3, symbol, date, spot
-            )
-
-            st.session_state["gex_result"] = fetch_with_retry(
-                fetch_weekly_gex, "Weekly GEX", 3, symbol, date, spot
-            )
+            st.session_state["weekly_result"] = weekly_res
+            st.session_state["gex_result"] = gex_res
 
             try:
                 st.session_state["hist_df"] = fetch_price_history(symbol).copy()
@@ -326,11 +421,14 @@ def main():
                 st.session_state["hist_df"] = pd.DataFrame()
 
             st.session_state["spot_at_fetch"] = spot
+    elif "effective_expiry_date" not in st.session_state:
+        st.session_state["effective_expiry_date"] = None
 
     options_result = st.session_state.get("options_result")
     weekly_result = st.session_state.get("weekly_result")
     gex_result = st.session_state.get("gex_result")
     hist_df = st.session_state.get("hist_df")
+    analysis_date = st.session_state.get("effective_expiry_date") or date
 
     has_chain_data = bool(options_result and options_result.get("success"))
     chain_df_for_playbook = (
@@ -352,6 +450,9 @@ def main():
         pcr = w.get("pcr", {})
         gex_df = pd.DataFrame(gex_result["data"].get("data", [])) if gex_result and gex_result.get("success") else pd.DataFrame()
         spot_for_gex_views = float(w.get("spot") or st.session_state.get("spot_at_fetch") or spot)
+
+        if analysis_date != date:
+            st.info(f"Using weekly expiry fallback {analysis_date} for chain and gamma calculations.")
 
         with st.expander("📈 Price + Moving Averages", expanded=True):
             if hist_df is not None and not hist_df.empty:
@@ -437,7 +538,7 @@ def main():
 
     elif active_tab == "📈 Trending OI":
         if has_core_data:
-            render_tab_trending_oi(df=df, spot=spot, symbol=symbol, expiry_date=str(date))
+            render_tab_trending_oi(df=df, spot=spot, symbol=symbol, expiry_date=str(analysis_date))
         else:
             _show_core_fetch_hint()
 
@@ -449,7 +550,7 @@ def main():
 
     elif active_tab == "🧲 Map":
         if has_core_data:
-            render_tab_gamma_map_filters(symbol, date, spot_for_gex_views, gex_df if not gex_df.empty else pd.DataFrame())
+            render_tab_gamma_map_filters(symbol, analysis_date, spot_for_gex_views, gex_df if not gex_df.empty else pd.DataFrame())
         else:
             _show_core_fetch_hint()
 
@@ -468,13 +569,13 @@ def main():
 
     elif active_tab == "🧮 Greeks":
         if has_core_data:
-            render_tab_vol_greeks(df, spot, symbol, date)
+            render_tab_vol_greeks(df, spot, symbol, analysis_date)
         else:
             _show_core_fetch_hint()
 
     elif active_tab == "🏆 Pro Edge":
         if has_core_data:
-            render_tab_pro_edge(symbol, date, spot, hist_df, totals, df)
+            render_tab_pro_edge(symbol, analysis_date, spot, hist_df, totals, df)
         else:
             _show_core_fetch_hint()
 
@@ -492,7 +593,7 @@ def main():
 
     elif active_tab == "📦 Expected Move":
         if has_core_data:
-            render_tab_expected_move(df=df, spot=spot, expiry_date=date, symbol=symbol)
+            render_tab_expected_move(df=df, spot=spot, expiry_date=analysis_date, symbol=symbol)
         else:
             _show_core_fetch_hint()
 
@@ -504,7 +605,7 @@ def main():
 
     elif active_tab == "🧾 IV Term Structure":
         if has_core_data:
-            render_tab_iv_term_structure(df=df, spot=spot, expiry_date=date, symbol=symbol)
+            render_tab_iv_term_structure(df=df, spot=spot, expiry_date=analysis_date, symbol=symbol)
         else:
             _show_core_fetch_hint()
 
@@ -522,7 +623,7 @@ def main():
 
     elif active_tab == "🔮 Friday Predictor":
         if has_core_data:
-            render_tab_friday_predictor(symbol, date, hist_df, spot)
+            render_tab_friday_predictor(symbol, analysis_date, hist_df, spot)
         else:
             _show_core_fetch_hint()
 
@@ -551,7 +652,7 @@ def main():
 
     elif active_tab == "🌊 Vanna/Charm":
         if has_core_data:
-            render_tab_vanna_charm(symbol, date, spot, hist_df)
+            render_tab_vanna_charm(symbol, analysis_date, spot, hist_df)
         else:
             _show_core_fetch_hint()
 
@@ -563,7 +664,7 @@ def main():
 
     elif active_tab == "🧠 Interpretation":
         if has_core_data:
-            render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(date))
+            render_tab_interpretation_engine(symbol, spot, df, hist_df, expiry_date=str(analysis_date))
         else:
             _show_core_fetch_hint()
 
@@ -593,7 +694,7 @@ def main():
 
     elif active_tab == "💸 Capital Flow":
         if has_core_data:
-            render_tab_capital_flow(df, spot=spot, expiry_date=date, symbol=symbol)
+            render_tab_capital_flow(df, spot=spot, expiry_date=analysis_date, symbol=symbol)
         else:
             _show_core_fetch_hint()
 

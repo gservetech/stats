@@ -81,6 +81,32 @@ def fetch_options(symbol: str, date: str, force_refresh: bool = False):
     except Exception as e:
         return {"success": False, "error": str(e), "status_code": 500}
 
+
+@safe_cache_data(ttl=300, show_spinner=False)
+def fetch_expirations(symbol: str, date: str | None = None, force_refresh: bool = False):
+    try:
+        params = {"symbol": symbol, "force_refresh": force_refresh}
+        if date:
+            params["date"] = date
+        r = requests.get(
+            f"{API_BASE_URL}/expirations",
+            params=params,
+            timeout=90,
+        )
+        if r.status_code == 200:
+            return {"success": True, "data": r.json()}
+        try:
+            detail = r.json().get("detail", f"HTTP {r.status_code}")
+        except Exception:
+            detail = f"HTTP {r.status_code}"
+        return {"success": False, "error": detail, "status_code": r.status_code}
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": "Timeout calling backend expirations endpoint.", "status_code": 408}
+    except requests.exceptions.ConnectionError:
+        return {"success": False, "error": "Cannot connect to backend.", "status_code": 503}
+    except Exception as e:
+        return {"success": False, "error": str(e), "status_code": 500}
+
 @safe_cache_data(ttl=300, show_spinner=False)
 def fetch_weekly_summary(symbol: str, date: str, spot: float, r: float = 0.05, q: float = 0.0, multiplier: int = 100):
     try:

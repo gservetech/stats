@@ -1,37 +1,105 @@
 #!/bin/bash
+#
+# Restart Stats production services (FastAPI Docker + Streamlit systemd).
+# Intended for daily cron at 08:00 — see install_daily_restart_cron.sh
+#
+# Optional overrides (export before run or set in cron):
+#   STATS_ROOT=/opt/stats
+#   STREAMLIT_SERVICE=stats-streamlit
+#   LOG_FILE=/var/log/stats_restart.log
 
-# ==========================================
-# Service Restart Script for VPS (Hostinger)
-# ==========================================
-# This script restarts the Streamlit systemd service and the FastAPI Docker containers.
-# It is designed to be run via cron every day to keep the services fresh.
+set -u
 
-# Log file for the restarts
-LOG_FILE="/var/log/stats_restart.log"
+STATS_ROOT="${STATS_ROOT:-/opt/stats}"
+BACKEND_DIR="${BACKEND_DIR:-${STATS_ROOT}/backend}"
+STREAMLIT_SERVICE="${STREAMLIT_SERVICE:-stats-streamlit}"
+LOG_FILE="${LOG_FILE:-/var/log/stats_restart.log}"
 
-echo "----------------------------------------" >> "$LOG_FILE"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting daily restart of services..." >> "$LOG_FILE"
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
 
-# 1. Restart Streamlit Service
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Restarting Streamlit (stats-streamlit.service)..." >> "$LOG_FILE"
-if systemctl restart stats-streamlit; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Streamlit restarted successfully." >> "$LOG_FILE"
-else
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Failed to restart Streamlit." >> "$LOG_FILE"
-fi
+restart_backend() {
+  if [[ ! -d "$BACKEND_DIR" ]]; then
+    log "ERROR: Backend directory not found: $BACKEND_DIR"
+    return 1
+  fi
 
-# 2. Restart FastAPI Backend (Docker Compose)
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Restarting FastAPI Backend (/opt/stats/backend)..." >> "$LOG_FILE"
-if cd /opt/stats/backend && docker-compose restart; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] FastAPI Backend restarted successfully." >> "$LOG_FILE"
-else
-    # Fallback in case they use 'docker compose' instead of 'docker-compose'
-    if cd /opt/stats/backend && docker compose restart; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] FastAPI Backend restarted successfully." >> "$LOG_FILE"
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Failed to restart FastAPI Backend." >> "$LOG_FILE"
+  log "Restarting FastAPI backend ($BACKEND_DIR)..."
+  if (cd "$BACKEND_DIR" && docker compose restart >> "$LOG_FILE" 2>&1); then
+    log "FastAPI backend restarted successfully (docker compose)."
+    return 0
+  fi
+
+  if (cd "$BACKEND_DIR" && docker-compose restart >> "$LOG_FILE" 2>&1); then
+    log "FastAPI backend restarted successfully (docker-compose)."
+    return 0
+  fi
+
+  log "ERROR: Failed to restart FastAPI backend."
+  return 1
+}
+
+restart_frontend() {
+  log "Restarting Streamlit ($STREAMLIT_SERVICE)..."
+  if systemctl restart "$STREAMLIT_SERVICE" >> "$LOG_FILE" 2>&1; then
+    log "Streamlit restarted successfully."
+    return 0
+  fi
+  log "ERROR: Failed to restart Streamlit ($STREAMLIT_SERVICE)."
+  return 1
+}
+
+wait_for_health() {
+  local url="$1"
+  local label="$2"
+  local i
+
+  for i in {1..30}; do
+    if curl -sf "$url" >/dev/null 2>&1; then
+      log "$label health check OK ($url)."
+      return 0
     fi
-fi
+    sleep 2
+  done
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Restart process completed." >> "$LOG_FILE"
-echo "----------------------------------------" >> "$LOG_FILE"
+  log "WARN: $label health check failed after 60s ($url)."
+  return 1
+}
+
+main() {
+  local backend_ok=0
+  local frontend_ok=0
+
+  {
+    echo "----------------------------------------"
+    log "Starting daily service restart..."
+  } >> "$LOG_FILE" 2>&1
+
+  if restart_backend; then
+    backend_ok=1
+    wait_for_health "http://127.0.0.1:8000/health" "Backend" || true
+  fi
+
+  if restart_frontend; then
+    frontend_ok=1
+    sleep 3
+    if curl -sf -o /dev/null "http://127.0.0.1:8501" 2>/dev/null; then
+      log "Frontend health check OK (http://127.0.0.1:8501)."
+    else
+      log "WARN: Frontend may still be starting (http://127.0.0.1:8501)."
+    fi
+  fi
+
+  if [[ "$backend_ok" -eq 1 && "$frontend_ok" -eq 1 ]]; then
+    log "Daily restart completed successfully."
+    echo "----------------------------------------" >> "$LOG_FILE"
+    exit 0
+  fi
+
+  log "Daily restart completed with errors (backend=$backend_ok frontend=$frontend_ok)."
+  echo "----------------------------------------" >> "$LOG_FILE"
+  exit 1
+}
+
+main "$@"

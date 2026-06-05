@@ -26,6 +26,7 @@ ENV/
 env/
 .venv/
 .env
+mcps
 
 # IDE
 .vscode/

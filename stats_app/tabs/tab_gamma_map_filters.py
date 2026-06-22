@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from ..helpers.api_client import fetch_weekly_gex
+from ..helpers.api_client import fetch_weekly_gex, fetch_flashalpha_gex
 from ..helpers.calculations import compute_gamma_map_artifacts
 from ..helpers.ui_components import st_plot, st_df, create_top_strikes_chart
 from ..helpers.filters import plot_filters, kalman_message
@@ -163,31 +163,73 @@ def render_tab_gamma_map_filters(symbol, date, spot, gex_df_input: pd.DataFrame 
 
             st_plot(plot_net_gex_map(gex_df, spot=spot, art=art), key="gamma_map_net_gex")
 
-            st.markdown("### 🧲 Gamma Walls (Top Call/Put GEX)")
-            w1, w2, w3 = st.columns(3)
-            
+            # ── Fetch FlashAlpha data upfront so we can render side-by-side ──
+            fa_art = None
+            fa_data = None
+            with st.spinner("Fetching FlashAlpha GEX data..."):
+                fa_result = fetch_flashalpha_gex(symbol, str(date))
+            if fa_result.get("success"):
+                fa_data = fa_result["data"]
+                fa_strikes = fa_data.get("strikes", [])
+                if fa_strikes:
+                    fa_df = pd.DataFrame(fa_strikes)
+                    fa_art = compute_gamma_map_artifacts(fa_df, spot=fa_data.get("underlying_price", spot), top_n=10)
+
+            st.markdown("### 🧲 Gamma Walls — Barchart vs FlashAlpha")
+
             top_call = art["top_call"]
             top_put = art["top_put"]
             top_net = art["top_net"]
-            
-            with w1:
-                st.markdown("**Top Call GEX**")
+
+            fa_top_call = fa_art["top_call"] if fa_art else None
+            fa_top_put = fa_art["top_put"] if fa_art else None
+            fa_top_net = fa_art["top_net"] if fa_art else None
+
+            # --- Row 1: Call GEX ---
+            st.markdown("#### Call GEX")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**🧲 Our Top Call GEX**")
                 if not top_call.empty:
                     st_df(top_call)
                     if {"strike", "call_gex"}.issubset(top_call.columns):
                         st_plot(create_top_strikes_chart(top_call, "strike", "call_gex", "Top Call GEX"), key="gamma_map_top_call_gex")
                 else:
-                    st.info("Call GEX data not available.")
-            with w2:
-                st.markdown("**Top Put GEX**")
+                    st.info("No data.")
+            with c2:
+                st.markdown("**🔄 FlashAlpha Top Call GEX**")
+                if fa_top_call is not None and not fa_top_call.empty:
+                    st_df(fa_top_call)
+                    if {"strike", "call_gex"}.issubset(fa_top_call.columns):
+                        st_plot(create_top_strikes_chart(fa_top_call, "strike", "call_gex", "FA Top Call GEX"), key="fa_top_call_gex")
+                else:
+                    st.info("No data.")
+
+            # --- Row 2: Put GEX ---
+            st.markdown("#### Put GEX")
+            p1, p2 = st.columns(2)
+            with p1:
+                st.markdown("**🧲 Our Top Put GEX**")
                 if not top_put.empty:
                     st_df(top_put)
                     if {"strike", "put_gex"}.issubset(top_put.columns):
                         st_plot(create_top_strikes_chart(top_put, "strike", "put_gex", "Top Put GEX"), key="gamma_map_top_put_gex")
                 else:
-                    st.info("Put GEX data not available.")
-            with w3:
-                st.markdown("**Top Net GEX (abs)**")
+                    st.info("No data.")
+            with p2:
+                st.markdown("**🔄 FlashAlpha Top Put GEX**")
+                if fa_top_put is not None and not fa_top_put.empty:
+                    st_df(fa_top_put)
+                    if {"strike", "put_gex"}.issubset(fa_top_put.columns):
+                        st_plot(create_top_strikes_chart(fa_top_put, "strike", "put_gex", "FA Top Put GEX"), key="fa_top_put_gex")
+                else:
+                    st.info("No data.")
+
+            # --- Row 3: Net GEX ---
+            st.markdown("#### Net GEX (abs)")
+            n1, n2 = st.columns(2)
+            with n1:
+                st.markdown("**🧲 Our Top Net GEX (abs)**")
                 if not top_net.empty:
                     top_net = top_net.copy()
                     if "net_gex_abs" not in top_net.columns and "net_gex" in top_net.columns:
@@ -196,9 +238,35 @@ def render_tab_gamma_map_filters(symbol, date, spot, gex_df_input: pd.DataFrame 
                         top_net = top_net.sort_values("net_gex_abs", ascending=False)
                     st_df(top_net)
                     if {"strike", "net_gex"}.issubset(top_net.columns):
-                        st_plot(create_top_strikes_chart(top_net, "strike", "net_gex", "Top Net GEX (Directional)"), key="gamma_map_top_net_gex")
+                        st_plot(create_top_strikes_chart(top_net, "strike", "net_gex", "Top Net GEX"), key="gamma_map_top_net_gex")
                 else:
-                    st.info("Net GEX data not available.")
+                    st.info("No data.")
+            with n2:
+                st.markdown("**🔄 FlashAlpha Top Net GEX (abs)**")
+                if fa_top_net is not None and not fa_top_net.empty:
+                    fa_top_net = fa_top_net.copy()
+                    if "net_gex_abs" not in fa_top_net.columns and "net_gex" in fa_top_net.columns:
+                        fa_top_net["net_gex_abs"] = fa_top_net["net_gex"].abs()
+                    if "net_gex_abs" in fa_top_net.columns:
+                        fa_top_net = fa_top_net.sort_values("net_gex_abs", ascending=False)
+                    st_df(fa_top_net)
+                    if {"strike", "net_gex"}.issubset(fa_top_net.columns):
+                        st_plot(create_top_strikes_chart(fa_top_net, "strike", "net_gex", "FA Top Net GEX"), key="fa_top_net_gex")
+                else:
+                    st.info("No data.")
+
+            # FlashAlpha metadata
+            if fa_data:
+                st.markdown("---")
+                st.caption("FlashAlpha metadata")
+                fa_c1, fa_c2, fa_c3, fa_c4 = st.columns(4)
+                fa_c1.metric("FA Underlying", f"{fa_data.get('underlying_price', 0):,.2f}")
+                fa_c2.metric("FA Gamma Flip", f"{fa_data.get('gamma_flip', 0):,.2f}")
+                fa_c3.metric("FA Net GEX", f"{fa_data.get('net_gex', 0):,.0f}")
+                fa_c4.metric("FA As Of", fa_data.get("as_of", "N/A")[:19] if fa_data.get("as_of") else "N/A")
+            elif not fa_result.get("success"):
+                st.warning(f"FlashAlpha API unavailable: {fa_result.get('error', 'Unknown error')}")
+
     else:
         st.warning("No per-strike GEX returned from backend.")
 

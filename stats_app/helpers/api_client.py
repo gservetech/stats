@@ -2,6 +2,8 @@ import requests
 import os
 import time
 import streamlit as st
+from dotenv import load_dotenv
+load_dotenv()
 
 def safe_cache_data(*dargs, **dkwargs):
     """No-op cache wrapper: always returns the original function."""
@@ -148,6 +150,51 @@ def fetch_weekly_gex(symbol: str, date: str, spot: float, r: float = 0.05, q: fl
         return {"success": False, "error": "Timeout fetching weekly gex.", "status_code": 408}
     except requests.exceptions.ConnectionError:
         return {"success": False, "error": "Cannot connect to backend.", "status_code": 503}
+    except Exception as e:
+        return {"success": False, "error": str(e), "status_code": 500}
+
+
+@safe_cache_data(ttl=300, show_spinner=False)
+def fetch_flashalpha_gex(symbol: str, expiration: str):
+    """
+    Fetch GEX data from FlashAlpha API for comparison with scraped data.
+
+    Returns dict with keys: symbol, underlying_price, gamma_flip, net_gex, strikes[]
+    Each strike has: strike, call_gex, put_gex, net_gex, call_oi, put_oi, call_volume, put_volume
+    """
+    def _get_env(key: str, fallback: str = "") -> str:
+        try:
+            if key in st.secrets:
+                return str(st.secrets[key])
+        except Exception:
+            pass
+        return os.getenv(key, fallback)
+
+    api_key = _get_env("FLASHALPHA_API_KEY")
+    base_url = _get_env("FLASHALPHA_BASE_URL", "https://lab.flashalpha.com/v1/exposure/gex").rstrip("/")
+
+    if not api_key:
+        return {"success": False, "error": "FLASHALPHA_API_KEY not configured in .env or secrets."}
+
+    url = f"{base_url}/{symbol}"
+    try:
+        r = requests.get(
+            url,
+            params={"expiration": expiration},
+            headers={"X-Api-Key": api_key},
+            timeout=30,
+        )
+        if r.status_code == 200:
+            return {"success": True, "data": r.json()}
+        try:
+            detail = r.json().get("detail", f"HTTP {r.status_code}")
+        except Exception:
+            detail = f"HTTP {r.status_code}"
+        return {"success": False, "error": detail, "status_code": r.status_code}
+    except requests.exceptions.Timeout:
+        return {"success": False, "error": "Timeout calling FlashAlpha API.", "status_code": 408}
+    except requests.exceptions.ConnectionError:
+        return {"success": False, "error": "Cannot connect to FlashAlpha API.", "status_code": 503}
     except Exception as e:
         return {"success": False, "error": str(e), "status_code": 500}
 

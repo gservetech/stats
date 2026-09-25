@@ -120,7 +120,7 @@ OPTIONS_WAIT_SECONDS = int(os.getenv("OPTIONS_WAIT_SECONDS", "45"))
 OPTIONS_RETRY_COUNT = int(os.getenv("OPTIONS_RETRY_COUNT", "1"))
 DIRECT_AUTH_CACHE_TTL_SECONDS = int(os.getenv("DIRECT_AUTH_CACHE_TTL_SECONDS", "1800"))
 DIRECT_API_TIMEOUT_SECONDS = int(os.getenv("DIRECT_API_TIMEOUT_SECONDS", "30"))
-ENABLE_DIRECT_OPTIONS_FETCH = os.getenv("ENABLE_DIRECT_OPTIONS_FETCH", "0") == "1"
+ENABLE_DIRECT_OPTIONS_FETCH = os.getenv("ENABLE_DIRECT_OPTIONS_FETCH", "1") == "1"
 BARCHART_OPTIONS_API_URL = "https://www.barchart.com/proxies/core-api/v1/options/get"
 BARCHART_OPTIONS_FIELDS = (
     "symbol,baseSymbol,strikePrice,expirationDate,moneyness,bidPrice,midpoint,askPrice,"
@@ -136,7 +136,7 @@ DIRECT_API_HEADERS_BASE = {
     "Origin": "https://www.barchart.com",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
     ),
     "X-Requested-With": "XMLHttpRequest",
 }
@@ -224,17 +224,49 @@ def _cache_direct_auth(auth: dict | None) -> dict | None:
     return normalized
 
 
+def _get_env_direct_auth() -> dict | None:
+    cookie_input = (
+        os.getenv("BARCHART_DIRECT_COOKIE")
+        or os.getenv("BARCHART_COOKIE")
+        or os.getenv("BARCHART_CURL")
+        or ""
+    ).strip()
+    if not cookie_input:
+        return None
+    if "curl " in cookie_input:
+        m = re.search(r"""(?:^|\s)-b\s+(['"])(.*?)\1""", cookie_input, flags=re.DOTALL)
+        if m:
+            cookie_input = m.group(2).strip()
+        else:
+            m2 = re.search(r"""(?:^|\s)-H\s+(['"])cookie:\s*(.*?)\1""", cookie_input, flags=re.IGNORECASE | re.DOTALL)
+            if m2:
+                cookie_input = m2.group(2).strip()
+    xsrf = (
+        os.getenv("BARCHART_DIRECT_XSRF")
+        or os.getenv("BARCHART_XSRF_TOKEN")
+        or _extract_xsrf_from_cookie_header(cookie_input)
+    )
+    return {
+        "cookie_header": cookie_input,
+        "xsrf_token": xsrf,
+        "captured_at": datetime.now().isoformat(),
+        "source": "env_config",
+    }
+
+
 def _get_cached_direct_auth(max_age_seconds: int | None = None) -> dict | None:
     if max_age_seconds is None:
         max_age_seconds = DIRECT_AUTH_CACHE_TTL_SECONDS
     with _DIRECT_AUTH_LOCK:
         ts = float(_DIRECT_AUTH_CACHE.get("ts", 0.0) or 0.0)
         auth = _DIRECT_AUTH_CACHE.get("auth")
-    if not isinstance(auth, dict):
-        return None
-    if max_age_seconds is not None and max_age_seconds > 0 and (time() - ts) > max_age_seconds:
-        return None
-    return dict(auth)
+    if isinstance(auth, dict):
+        if max_age_seconds is None or max_age_seconds <= 0 or (time() - ts) <= max_age_seconds:
+            return dict(auth)
+    env_auth = _get_env_direct_auth()
+    if env_auth:
+        return env_auth
+    return None
 
 
 def _clear_direct_auth_cache(reason: str = "") -> None:
@@ -595,10 +627,11 @@ async def get_rows_cached_with_meta(symbol: str, date: str, force_refresh: bool 
                 if hit_auth:
                     direct_candidates.append(hit_auth)
                 cached_auth = _get_cached_direct_auth()
-                if cached_auth and (
-                    not direct_candidates or cached_auth.get("cookie_header") != direct_candidates[0].get("cookie_header")
-                ):
+                if cached_auth and not any(c.get("cookie_header") == cached_auth.get("cookie_header") for c in direct_candidates):
                     direct_candidates.append(cached_auth)
+                env_auth = _get_env_direct_auth()
+                if env_auth and not any(c.get("cookie_header") == env_auth.get("cookie_header") for c in direct_candidates):
+                    direct_candidates.append(env_auth)
 
                 direct_error = None
                 direct_status = None
@@ -1201,21 +1234,68 @@ def build_chrome_options() -> ChromiumOptions:
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-setuid-sandbox")
     opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--proxy-server='direct://'")
+    opts.add_argument("--proxy-server=direct://")
     opts.add_argument("--proxy-bypass-list=*")
     opts.add_argument("--blink-settings=imagesEnabled=false") # don't load images
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--lang=en-US,en")
 
     # DO NOT force remote debugging port (pydoll handles this)
 
     opts.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
     )
 
     return opts
 
 
 # ---------------- Scraper ----------------
+async def _safe_fetch_network_body(tab, request_id: str, retries: int = 6, delay: float = 0.5) -> str:
+    """
+    Safely retrieves the network response body from Chrome DevTools Protocol.
+    Prevents KeyError: 'result' when CDP returns an error or when the body
+    has not completely finished downloading.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            from pydoll.commands.network_commands import NetworkCommands
+            raw_resp = await tab._execute_command(NetworkCommands.get_response_body(request_id))
+            if isinstance(raw_resp, dict):
+                if "result" in raw_resp:
+                    res = raw_resp["result"]
+                    body = res.get("body", "")
+                    if res.get("base64Encoded"):
+                        body = base64.b64decode(body).decode("utf-8", errors="ignore")
+                    if body:
+                        return body
+                elif "error" in raw_resp:
+                    err_msg = raw_resp["error"].get("message", "CDP error")
+                    last_err = f"CDP error: {err_msg}"
+            elif isinstance(raw_resp, str) and raw_resp:
+                return raw_resp
+        except Exception as exc:
+            last_err = str(exc)
+            # Try native pydoll method as fallback
+            try:
+                raw_body = await tab.get_network_response_body(request_id)
+                if raw_body:
+                    decoded = _decode_network_body(raw_body)
+                    if decoded:
+                        return decoded
+            except Exception:
+                pass
+
+        if attempt < retries - 1:
+            await asyncio.sleep(delay * (attempt + 1))
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"Failed to retrieve response body from browser for request {request_id}: {last_err or 'response body not ready'}"
+    )
+
+
 async def _scrape_options_from_page(symbol: str, date: str, page_url: str):
     print(f"[INFO] Scraping: {page_url}")
 
@@ -1233,18 +1313,28 @@ async def _scrape_options_from_page(symbol: str, date: str, page_url: str):
 
     async def on_request_will_be_sent(request_log):
         params = request_log.get("params", {})
-        request_id = params.get("requestId")
+        request_id = str(params.get("requestId", ""))
         request = params.get("request", {})
         req_url = request.get("url", "")
         headers = request.get("headers", {})
 
         if request_id and req_url:
-            request_url_by_id[str(request_id)] = req_url
+            request_url_by_id[request_id] = req_url
 
         if "/proxies/core-api/v1/options/get" in req_url:
-            if "options" not in captured_requests:
-                captured_requests["options"] = (request_id, req_url)
+            entry = captured_requests.setdefault("options", {})
+            entry["request_id"] = request_id
+            entry["url"] = req_url
+            entry.setdefault("response_received", False)
+            entry.setdefault("loading_finished", False)
             _maybe_capture_direct_auth(headers)
+
+        elif "/proxies/core-api/v1/options-expirations/get" in req_url:
+            entry = captured_requests.setdefault("expirations", {})
+            entry["request_id"] = request_id
+            entry["url"] = req_url
+            entry.setdefault("response_received", False)
+            entry.setdefault("loading_finished", False)
 
     async def on_request_extra_info(extra_info_log):
         params = extra_info_log.get("params", {})
@@ -1257,13 +1347,41 @@ async def _scrape_options_from_page(symbol: str, date: str, page_url: str):
         params = response_log.get("params", {})
         response = params.get("response", {})
         resp_url = response.get("url", "")
+        request_id = str(params.get("requestId", ""))
+        status = response.get("status")
 
-        if "/proxies/core-api/v1/options/get" in resp_url and "options" not in captured_requests:
-            captured_requests["options"] = (params.get("requestId"), resp_url)
+        if "/proxies/core-api/v1/options/get" in resp_url:
+            entry = captured_requests.setdefault("options", {})
+            entry["request_id"] = request_id or entry.get("request_id")
+            entry["url"] = resp_url
+            entry["status"] = status
+            entry["response_received"] = True
             _maybe_capture_direct_auth(response.get("requestHeaders", {}))
 
-        elif "/proxies/core-api/v1/options-expirations/get" in resp_url and "expirations" not in captured_requests:
-            captured_requests["expirations"] = (params.get("requestId"), resp_url)
+        elif "/proxies/core-api/v1/options-expirations/get" in resp_url:
+            entry = captured_requests.setdefault("expirations", {})
+            entry["request_id"] = request_id or entry.get("request_id")
+            entry["url"] = resp_url
+            entry["status"] = status
+            entry["response_received"] = True
+
+    async def on_loading_finished(finish_log):
+        params = finish_log.get("params", {})
+        request_id = str(params.get("requestId", ""))
+        for key in ("options", "expirations"):
+            entry = captured_requests.get(key)
+            if entry and str(entry.get("request_id")) == request_id:
+                entry["loading_finished"] = True
+
+    async def on_loading_failed(fail_log):
+        params = fail_log.get("params", {})
+        request_id = str(params.get("requestId", ""))
+        error_text = params.get("errorText", "")
+        for key in ("options", "expirations"):
+            entry = captured_requests.get(key)
+            if entry and str(entry.get("request_id")) == request_id:
+                entry["loading_failed"] = True
+                entry["error_text"] = error_text
 
     async with _BROWSER_SEMAPHORE:
         options = build_chrome_options()
@@ -1278,6 +1396,8 @@ async def _scrape_options_from_page(symbol: str, date: str, page_url: str):
             await tab.on("Network.requestWillBeSent", on_request_will_be_sent)
             await tab.on("Network.requestWillBeSentExtraInfo", on_request_extra_info)
             await tab.on("Network.responseReceived", on_response)
+            await tab.on("Network.loadingFinished", on_loading_finished)
+            await tab.on("Network.loadingFailed", on_loading_failed)
 
             try:
                 await asyncio.wait_for(tab.go_to(page_url), timeout=OPTIONS_PAGELOAD_TIMEOUT)
@@ -1291,11 +1411,17 @@ async def _scrape_options_from_page(symbol: str, date: str, page_url: str):
             polls = max(1, int(OPTIONS_WAIT_SECONDS / poll_interval))
             for _ in range(polls):
                 await asyncio.sleep(poll_interval)
-                if "options" in captured_requests:
-                    await asyncio.sleep(0.5)
-                    break
+                opt_info = captured_requests.get("options")
+                if opt_info:
+                    if opt_info.get("loading_finished"):
+                        break
+                    if opt_info.get("response_received"):
+                        # Response received, allow brief buffer for full body payload
+                        await asyncio.sleep(1.0)
+                        break
 
-            if "options" not in captured_requests:
+            opt_info = captured_requests.get("options")
+            if not opt_info or not opt_info.get("request_id"):
                 raise HTTPException(
                     status_code=404,
                     detail=(
@@ -1304,25 +1430,30 @@ async def _scrape_options_from_page(symbol: str, date: str, page_url: str):
                     )
                 )
 
-            request_id, _api_url = captured_requests["options"]
-            print(f"[INFO] Captured options API URL: {_api_url}")
+            if opt_info.get("status") in (401, 403):
+                raise HTTPException(
+                    status_code=opt_info["status"],
+                    detail=f"Barchart returned HTTP {opt_info['status']} (access denied or bot challenge)."
+                )
+
+            request_id = opt_info["request_id"]
+            _api_url = opt_info.get("url", "")
+            print(f"[INFO] Captured options API URL: {_api_url} (status={opt_info.get('status')})")
             available_expirations = []
 
             try:
-                body_data = await tab.get_network_response_body(request_id)
-                body = _decode_network_body(body_data)
-
+                body = await _safe_fetch_network_body(tab, request_id)
                 opt_json = json.loads(body)
                 available_expirations = _extract_expiration_items_from_payload(opt_json)
                 if not available_expirations and "expirations" in captured_requests:
                     try:
-                        expirations_request_id, _ = captured_requests["expirations"]
-                        expirations_body = _decode_network_body(
-                            await tab.get_network_response_body(expirations_request_id)
-                        )
-                        available_expirations = _extract_expiration_items_from_payload(
-                            json.loads(expirations_body)
-                        )
+                        exp_info = captured_requests["expirations"]
+                        exp_req_id = exp_info.get("request_id")
+                        if exp_req_id:
+                            expirations_body = await _safe_fetch_network_body(tab, exp_req_id, retries=2, delay=0.2)
+                            available_expirations = _extract_expiration_items_from_payload(
+                                json.loads(expirations_body)
+                            )
                     except Exception:
                         available_expirations = []
                 if available_expirations:

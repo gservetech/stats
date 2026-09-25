@@ -64,7 +64,7 @@ os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
 app = FastAPI(
     title="Barchart Options API",
     description="API to scrape Barchart options data with symbol and date",
-    version="1.0.4"
+    version="1.0.5"
 )
 
 # ---------------- CORS ----------------
@@ -1591,6 +1591,41 @@ async def scrape_available_expirations(symbol: str, date_hint: str | None = None
             return cached
 
     probe_date = str(date_hint or _default_expiration_probe_date()).strip()
+
+    if ENABLE_DIRECT_OPTIONS_FETCH:
+        direct_candidates = []
+        cached_auth = _get_cached_direct_auth()
+        if cached_auth:
+            direct_candidates.append(cached_auth)
+        env_auth = _get_env_direct_auth()
+        if env_auth and not any(c.get("cookie_header") == env_auth.get("cookie_header") for c in direct_candidates):
+            direct_candidates.append(env_auth)
+
+        for auth_candidate in direct_candidates:
+            for exp_type in ("weekly", "monthly"):
+                params = _build_direct_options_params(symbol=symbol_clean, date=probe_date, expiration_type=exp_type)
+                headers = dict(DIRECT_API_HEADERS_BASE)
+                headers["Referer"] = _build_options_page_url(symbol=symbol_clean, date=probe_date, expiration_type="weekly" if exp_type == "weekly" else None)
+                headers["Cookie"] = auth_candidate["cookie_header"]
+                if auth_candidate.get("xsrf_token"):
+                    headers["X-XSRF-TOKEN"] = str(auth_candidate["xsrf_token"])
+                try:
+                    resp = await asyncio.to_thread(
+                        requests.get,
+                        BARCHART_OPTIONS_API_URL,
+                        params=params,
+                        headers=headers,
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        payload = resp.json()
+                        direct_items = _extract_expiration_items_from_payload(payload)
+                        if direct_items:
+                            print(f"[DIRECT_API] Got {len(direct_items)} expirations for {symbol_clean}")
+                            return _cache_expirations(symbol_clean, direct_items)
+                except Exception:
+                    pass
+
     last_error = None
     for page_url, _expiration_type in _build_browser_page_candidates(symbol=symbol_clean, date=probe_date):
         try:
@@ -1835,7 +1870,7 @@ def _compute_weekly_gex(rows, spot: float, date: str, r: float = 0.05, q: float 
 async def root():
     return {
         "service": "Barchart Options API",
-        "version": "1.0.4",
+        "version": "1.0.5",
         "endpoints": {
             "/options": "GET - JSON options data (params: symbol, date)",
             "/options/csv": "GET - CSV download (params: symbol, date)",
@@ -1853,6 +1888,7 @@ async def root():
 async def health():
     return {
         "status": "ok",
+        "version": "1.0.5",
         "timestamp": datetime.now().isoformat(),
         "platform": sys.platform,
         "chrome_binary": os.getenv("CHROME_BINARY", ""),
